@@ -90,6 +90,44 @@ func NewManager(root string, maxRead int, bashTimeout time.Duration, st *store.S
 	return &Manager{Root: abs, MaxRead: maxRead, BashTimeout: bashTimeout, Store: st, SessionID: sessionID}, nil
 }
 
+var (
+	readOnlyTools = map[string]bool{
+		"read_file":        true,
+		"grep_search":      true,
+		"list_directory":   true,
+		"git_diff":         true,
+		"update_checklist": true,
+	}
+	buildOnlyTools = map[string]bool{
+		"patch_file": true,
+		"write_file": true,
+		"bash":       true,
+	}
+)
+
+// Allowed reports whether a tool may run in the given mode. This is the single
+// source of truth used both to advertise tools and to gate execution.
+func Allowed(mode, name string) bool {
+	if readOnlyTools[name] {
+		return true
+	}
+	if buildOnlyTools[name] {
+		return strings.EqualFold(mode, "BUILD")
+	}
+	return false
+}
+
+// ModeBlockReason explains why a tool cannot run in the current mode.
+func ModeBlockReason(mode, name string) string {
+	if buildOnlyTools[name] && !strings.EqualFold(mode, "BUILD") {
+		return name + " is blocked in PLAN mode: PLAN is read-only. Switch to BUILD to modify files or run commands."
+	}
+	if !Allowed(mode, name) {
+		return "unknown tool: " + name
+	}
+	return ""
+}
+
 // Specs returns the tool definitions available in a mode.
 func Specs(mode string) []llm.Tool {
 	tools := []llm.Tool{
@@ -214,11 +252,8 @@ func (m *Manager) Execute(ctx context.Context, name string, rawArgs json.RawMess
 	if len(bytes.TrimSpace(rawArgs)) == 0 {
 		rawArgs = json.RawMessage("{}")
 	}
-	if !strings.EqualFold(m.Mode, "BUILD") {
-		switch name {
-		case "patch_file", "write_file", "bash":
-			return fail(name + " is unavailable in PLAN mode; switch to BUILD to modify files or run commands")
-		}
+	if !Allowed(m.Mode, name) {
+		return fail(ModeBlockReason(m.Mode, name))
 	}
 	switch name {
 	case "read_file":

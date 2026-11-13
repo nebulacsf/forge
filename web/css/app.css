@@ -363,6 +363,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .msg { animation: rise .18s ease both; }
+.msg-focus {
+  outline: 1px solid rgba(111,140,255,.45);
+  outline-offset: 4px;
+  border-radius: 10px;
+}
 @keyframes rise {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
@@ -478,10 +483,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .event-body .tool-output.error, .event-card.is-error .event-title { color: #ff9f9f; }
 .event-card.is-error { border-color: rgba(240,100,100,.25); }
 .event-card.is-running > summary { color: var(--accent-2); }
+.event-card.is-blocked { border-color: rgba(242,184,75,.28); }
+.event-card.is-blocked > summary { color: #e8bf74; }
+.event-body .tool-output.blocked { color: #d8b878; }
 
 .tool-state { flex: 0 0 auto; color: var(--green); font-size: 10px; }
 .tool-state.running { color: var(--accent); animation: spin 1s linear infinite; display: inline-block; }
 .tool-state.error { color: var(--red); }
+.tool-state.blocked { color: #e8bf74; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .reasoning-card .event-body pre { color: #94a1b4; font-family: inherit; font-size: 12px; }
@@ -660,6 +669,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   color: var(--muted);
   font-size: 10.5px;
 }
+.empty-shortcuts {
+  max-width: 460px;
+  margin-top: 14px;
+  color: var(--muted-2);
+  font-size: 10px;
+  line-height: 1.9;
+}
+.empty-shortcuts kbd { font-size: 9px; }
 kbd {
   padding: 1px 5px;
   border-radius: 4px;

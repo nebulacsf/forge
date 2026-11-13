@@ -472,6 +472,37 @@ func (s *Store) ListMessages(sessionID int64) ([]Message, error) {
 	return out, rows.Err()
 }
 
+// ReplaceMessages replaces a session's transcript with a summary message
+// followed by the kept messages. Used by /compact.
+func (s *Store) ReplaceMessages(sessionID int64, summary string, keep []Message) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+	ts := now()
+	if _, err := tx.Exec(`
+		INSERT INTO messages (session_id, role, reasoning, content, tool_calls, created_at)
+		VALUES (?, 'assistant', '', ?, '', ?)`, sessionID, summary, ts); err != nil {
+		return err
+	}
+	for _, m := range keep {
+		if strings.TrimSpace(m.Content) == "" && strings.TrimSpace(m.ToolCalls) == "" {
+			continue
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO messages (session_id, role, reasoning, content, tool_calls, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			sessionID, m.Role, m.Reasoning, m.Content, m.ToolCalls, ts); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // ---------------------------------------------------------------------------
 // Checklists
 

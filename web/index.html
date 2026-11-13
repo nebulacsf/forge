@@ -22,7 +22,7 @@
       <button id="addProjectBtn" class="rail-btn" type="button" title="Register a local project">
         <i class="bi bi-plus-lg"></i>
       </button>
-      <button id="settingsBtn" class="rail-btn" type="button" title="Settings">
+      <button id="settingsBtn" class="rail-btn" type="button" title="Settings (Ctrl+,)">
         <i class="bi bi-gear"></i>
       </button>
     </div>
@@ -48,7 +48,8 @@
           <div class="model-control">
             <i class="bi bi-cpu"></i>
             <input id="modelInput" class="model-input" list="modelOptions" spellcheck="false"
-                   autocomplete="off" placeholder="model id" aria-label="Model">
+                   autocomplete="off" placeholder="model id" aria-label="Model"
+                   title="Model (Ctrl+/)">
             <datalist id="modelOptions">
               <option value="qwen/qwen-2.5-coder-32b-instruct"></option>
               <option value="anthropic/claude-sonnet-4.5"></option>
@@ -60,7 +61,8 @@
             </datalist>
           </div>
 
-          <div id="modeToggle" class="mode-toggle flex-shrink-0" role="group" aria-label="Operating mode">
+          <div id="modeToggle" class="mode-toggle flex-shrink-0" role="group" aria-label="Operating mode"
+               title="Toggle PLAN / BUILD (Ctrl+.)">
             <button type="button" data-mode="PLAN">PLAN</button>
             <button type="button" data-mode="BUILD">BUILD</button>
           </div>
@@ -81,6 +83,14 @@
             <div class="empty-hints">
               <span><kbd>PLAN</kbd> reads and reasons</span>
               <span><kbd>BUILD</kbd> edits and executes</span>
+              <span><kbd>/compact</kbd> summarizes the conversation</span>
+            </div>
+            <div class="empty-shortcuts">
+              <kbd>Ctrl</kbd>+<kbd>,</kbd> settings ·
+              <kbd>Ctrl</kbd>+<kbd>.</kbd> mode ·
+              <kbd>Ctrl</kbd>+<kbd>/</kbd> model ·
+              <kbd>Ctrl</kbd>+<kbd>L</kbd> chat ·
+              <kbd>Ctrl</kbd>+<kbd>P</kbd>/<kbd>N</kbd> messages
             </div>
           </div>
         </div>

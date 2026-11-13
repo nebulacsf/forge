@@ -303,6 +303,23 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			if call.Type == "" {
 				call.Type = "function"
 			}
+			// Validate the mode before announcing or executing anything, so the
+			// UI never shows a tool starting only to have it denied afterwards.
+			if !tools.Allowed(session.Mode, call.Function.Name) {
+				reason := tools.ModeBlockReason(session.Mode, call.Function.Name)
+				call.Result = reason
+				call.Status = "blocked"
+				logx.Warn("tool blocked by mode", "session", session.ID, "round", round,
+					"tool", call.Function.Name, "mode", session.Mode)
+				if err := stream.send(chatEvent{
+					Type: "tool_blocked", Round: round, ID: call.ID, Name: call.Function.Name,
+					Message: reason, Status: "blocked",
+				}); err != nil {
+					s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
+					return
+				}
+				continue
+			}
 			if err := stream.send(chatEvent{
 				Type: "tool_start", Round: round, ID: call.ID, Name: call.Function.Name,
 				Arguments: call.Function.Arguments, Status: "running",
@@ -466,8 +483,15 @@ func buildSystemPrompt(project store.Project, session store.Session, checklist [
 	} else {
 		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them.\n")
 	}
+	allowed := make([]string, 0, 8)
+	for _, spec := range tools.Specs(session.Mode) {
+		allowed = append(allowed, spec.Function.Name)
+	}
+	fmt.Fprintf(&b, "\nAllowed tools in %s mode: %s\n", session.Mode, strings.Join(allowed, ", "))
+	b.WriteString("Never call a tool outside this list. Disallowed calls are blocked before execution and reported back to you.\n")
 	b.WriteString(`
 Operating rules:
+- At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
 - Stay strictly inside the project directory. Never attempt to access paths outside it.
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
 - Read both the surrounding code and existing patterns before making changes; match local style.

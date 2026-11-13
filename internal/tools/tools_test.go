@@ -155,6 +155,32 @@ func TestGrepListAndBash(t *testing.T) {
 	}
 }
 
+func TestAllowedByMode(t *testing.T) {
+	readOnly := []string{"read_file", "grep_search", "list_directory", "git_diff", "update_checklist"}
+	for _, name := range readOnly {
+		if !Allowed("PLAN", name) || !Allowed("BUILD", name) {
+			t.Errorf("%s should be allowed in both modes", name)
+		}
+	}
+	for _, name := range []string{"patch_file", "write_file", "bash"} {
+		if Allowed("PLAN", name) {
+			t.Errorf("%s must not be allowed in PLAN", name)
+		}
+		if !Allowed("BUILD", name) {
+			t.Errorf("%s should be allowed in BUILD", name)
+		}
+		if Allowed("build", name) != true {
+			t.Errorf("%s should match BUILD case-insensitively", name)
+		}
+	}
+	if Allowed("PLAN", "made_up_tool") {
+		t.Error("unknown tools must not be allowed")
+	}
+	if !strings.Contains(strings.ToLower(ModeBlockReason("PLAN", "write_file")), "switch to build") {
+		t.Errorf("block reason should mention BUILD: %q", ModeBlockReason("PLAN", "write_file"))
+	}
+}
+
 func TestInvalidRegex(t *testing.T) {
 	m, _ := newTestManager(t, "PLAN", 25000)
 	res := run(t, m, "grep_search", map[string]any{"pattern": "("})

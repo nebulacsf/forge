@@ -57,6 +57,9 @@ Sessions are stored per project; open tabs are restored after a reload.
 | **PLAN** (read-only) | `read_file`, `grep_search`, `list_directory`, `git_diff`, `update_checklist` |
 | **BUILD** | all of the above, plus `patch_file`, `write_file`, `bash` |
 
+At the start of a new task the agent records it in the checklist before reading
+files or running any other tool, and keeps the list updated as it works.
+
 In PLAN mode a completed turn ends with a **Plan ready — Switch to BUILD** card
 so it is always clear that files cannot change until you switch modes. If a
 model returns only reasoning and no final answer, Forge expands the reasoning
@@ -78,6 +81,32 @@ Every reasoning step and tool call is a collapsed accordion by default
 (`🧠 Thinking…`, `📄 Reading main.go`, `⚡ Running: go test ./...`). Click to
 expand inputs and outputs. Stop aborts the stream and keeps whatever text had
 already arrived.
+
+In PLAN mode, tools that write files or run commands are rejected **before
+execution** and rendered as a `🚫 … blocked` card, so you never see a tool start
+only to fail because of the mode.
+
+### Slash commands
+
+| Command | Action |
+| --- | --- |
+| `/compact` | Summarize older messages into one summary and keep the last exchange, freeing context |
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Enter` | Send message |
+| `Shift+Enter` | Newline |
+| `Ctrl+,` | Open Settings |
+| `Ctrl+.` | Toggle PLAN / BUILD |
+| `Ctrl+/` | Focus the model picker |
+| `Ctrl+L` | Focus the chat composer |
+| `Ctrl+P` / `Ctrl+N` | Previous / next message |
+| `Alt+L` / `Alt+N` | Focus chat / next message (fallback where the browser reserves `Ctrl+L`/`Ctrl+N`) |
+
+Chrome and Firefox reserve `Ctrl+L` (address bar) and `Ctrl+N` (new window) at
+the browser level; the `Alt` variants always work.
 
 ## Config
 
@@ -144,6 +173,7 @@ built-in table and a heuristic (and keeps working offline).
 | `GET/POST /api/projects` | List/register projects |
 | `GET/POST /api/projects/{id}/sessions` | List/create sessions |
 | `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/close |
+| `POST /api/sessions/{id}/compact` | Summarize the transcript and keep the last exchange |
 | `POST /api/chat/stream` | SSE agent turn (reasoning, content, tool, usage, checklist, done) |
 | `GET/POST/PATCH/DELETE` on checklist routes | Manual checklist edits |
 

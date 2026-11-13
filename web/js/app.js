@@ -36,6 +36,7 @@ const state = {
   sawCancelled: false,
   turnHadContent: false,
   turnHadError: false,
+  messageIndex: -1,
 };
 
 let projectModal = null;
@@ -377,6 +378,9 @@ async function patchSession(payload) {
 
 function renderSession(messages) {
   const container = $('messages');
+  state.currentRound = null;
+  state.toolCards = new Map();
+  state.messageIndex = -1;
   container.innerHTML = '';
   let hasContent = false;
   for (const msg of messages) {
@@ -513,12 +517,18 @@ async function sendMessage() {
     if (!created) return;
   }
 
+  if (text.toLowerCase() === '/compact') {
+    await compactConversation();
+    return;
+  }
+
   removePlanReadyCard();
   prompt.value = '';
   resizePrompt();
   updateSendState();
   appendUserMessage(text);
   hideEmpty();
+  state.messageIndex = -1;
   maybeScroll(true);
 
   state.streaming = true;
@@ -579,6 +589,52 @@ async function sendMessage() {
     }
     maybeScroll(true);
     updateSessionTabCosts();
+  }
+}
+
+async function compactConversation() {
+  if (state.streaming || !state.session) return;
+  const prompt = $('promptInput');
+  prompt.value = '';
+  resizePrompt();
+  updateSendState();
+
+  state.streaming = true;
+  state.abort = new AbortController();
+  setStreamingUI(true);
+  try {
+    const res = await fetch(`/api/sessions/${state.session.id}/compact`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: state.abort.signal,
+    });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch { /* ignore */ }
+    if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status})`);
+
+    syncSession(data.session);
+    state.currentRound = null;
+    state.toolCards = new Map();
+    state.messageIndex = -1;
+    renderSession(data.messages || []);
+    state.usage.contextTokens = estimateContext(data.messages || []);
+    state.usage.contextExact = false;
+    updateUsageUI();
+    toast(`Context compacted — ${data.removed} earlier messages summarized`, 'success');
+    addNotice('Conversation compacted. Older messages were replaced by a summary; the recent exchange was kept.', 'stopped');
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      addNotice('Stopped', 'stopped');
+    } else {
+      toast(err.message || 'Could not compact the conversation', 'error');
+    }
+  } finally {
+    state.streaming = false;
+    state.abort = null;
+    setStreamingUI(false);
+    updateControls();
   }
 }
 
@@ -647,6 +703,14 @@ function handleEvent(ev) {
       removeThinking(round);
       const card = addToolCard(round, ev);
       state.toolCards.set(ev.id, card);
+      round.hasEvents = true;
+      maybeScroll();
+      break;
+    }
+    case 'tool_blocked': {
+      const round = ensureRound();
+      removeThinking(round);
+      addBlockedToolCard(round, ev);
       round.hasEvents = true;
       maybeScroll();
       break;
@@ -853,6 +917,36 @@ function addToolCard(round, ev) {
     outLabel,
     outPre,
   };
+}
+
+function addBlockedToolCard(round, ev) {
+  const details = document.createElement('details');
+  details.className = 'event-card tool-card is-blocked';
+
+  const summary = document.createElement('summary');
+  summary.innerHTML =
+    '<span class="chev">▶</span>' +
+    '<span class="event-icon">🚫</span>' +
+    '<span class="event-title"></span>' +
+    '<span class="event-meta"></span>' +
+    '<span class="tool-state blocked"><i class="bi bi-slash-circle"></i></span>';
+  summary.querySelector('.event-title').textContent = `${ev.name} blocked`;
+  summary.querySelector('.event-meta').textContent = 'mode check';
+
+  const body = document.createElement('div');
+  body.className = 'event-body';
+  const label = document.createElement('span');
+  label.className = 'tool-label';
+  label.textContent = 'blocked before execution';
+  const pre = document.createElement('pre');
+  pre.className = 'tool-output blocked';
+  pre.textContent = ev.message || 'This tool is unavailable in the current mode.';
+  body.appendChild(label);
+  body.appendChild(pre);
+
+  details.appendChild(summary);
+  details.appendChild(body);
+  round.events.appendChild(details);
 }
 
 function finishToolCard(card, ev) {
@@ -1596,6 +1690,104 @@ function bindEvents() {
   $('promptInput').addEventListener('focus', () => {
     setTimeout(resizePrompt, 0);
   });
+
+  document.addEventListener('keydown', handleShortcut);
+}
+
+function handleShortcut(e) {
+  if (e.isComposing) return;
+  const mod = e.ctrlKey || e.metaKey;
+  const alt = e.altKey;
+  if (!mod && !alt) return;
+  if (e.shiftKey) return;
+
+  const key = e.key.toLowerCase();
+  const modalOpen = !!document.querySelector('.modal.show');
+
+  // Alt+L / Alt+N work where browsers reserve Ctrl+L / Ctrl+N.
+  if (alt) {
+    if (key === 'l') {
+      e.preventDefault();
+      focusChat();
+    } else if (key === 'n') {
+      e.preventDefault();
+      navigateMessage(1);
+    }
+    return;
+  }
+
+  switch (key) {
+    case ',':
+      e.preventDefault();
+      openSettings();
+      break;
+    case '.':
+      e.preventDefault();
+      if (!modalOpen) toggleMode();
+      break;
+    case '/':
+      e.preventDefault();
+      if (!modalOpen) {
+        $('modelInput').focus();
+        $('modelInput').select();
+      }
+      break;
+    case 'l':
+      e.preventDefault();
+      focusChat();
+      break;
+    case 'p':
+      e.preventDefault();
+      if (!modalOpen) navigateMessage(-1);
+      break;
+    case 'n':
+      e.preventDefault();
+      if (!modalOpen) navigateMessage(1);
+      break;
+    default:
+      break;
+  }
+}
+
+function focusChat() {
+  const prompt = $('promptInput');
+  if (!prompt || prompt.disabled) return;
+  prompt.focus();
+  const end = prompt.value.length;
+  try {
+    prompt.setSelectionRange(end, end);
+  } catch { /* ignore */ }
+}
+
+async function toggleMode() {
+  if (!state.session) {
+    toast('Select a project first', 'error');
+    return;
+  }
+  if (state.streaming) {
+    toast('Stop the current turn before changing mode', 'error');
+    return;
+  }
+  const next = state.session.mode === 'BUILD' ? 'PLAN' : 'BUILD';
+  const updated = await patchSession({ mode: next });
+  if (updated) setModeUI(updated.mode);
+}
+
+function navigateMessage(dir) {
+  const items = [...$('messages').querySelectorAll('.msg')];
+  if (!items.length) return;
+  let idx = state.messageIndex;
+  if (idx < 0 || idx >= items.length) {
+    idx = dir > 0 ? -1 : items.length;
+  }
+  idx += dir;
+  if (idx < 0) idx = 0;
+  if (idx >= items.length) idx = items.length - 1;
+  state.messageIndex = idx;
+  for (let i = 0; i < items.length; i++) {
+    items[i].classList.toggle('msg-focus', i === idx);
+  }
+  items[idx].scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
 function stopStream() {

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -48,8 +49,9 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Messages) == 0 || req.Messages[0].Role != "system" ||
-		!strings.Contains(req.Messages[0].Content, "switch to BUILD") {
-		http.Error(w, "PLAN system prompt missing switch-to-BUILD guidance", http.StatusBadRequest)
+		!strings.Contains(req.Messages[0].Content, "switch to BUILD") ||
+		!strings.Contains(req.Messages[0].Content, "FIRST action must be update_checklist") {
+		http.Error(w, "PLAN system prompt missing required guidance", http.StatusBadRequest)
 		return
 	}
 	for _, msg := range req.Messages {
@@ -482,6 +484,260 @@ func TestChatStreamBuildTools(t *testing.T) {
 	final, _ := st.GetSession(session.ID)
 	if final.Mode != "BUILD" || final.TokensIn != 90 {
 		t.Errorf("session state = %+v", final)
+	}
+}
+
+// blockedToolMock asks for write_file in PLAN mode, then answers.
+type blockedToolMock struct {
+	requests atomic.Int32
+}
+
+func (m *blockedToolMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n := m.requests.Add(1)
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Messages) == 0 || !strings.Contains(req.Messages[0].Content, "Allowed tools in PLAN mode") {
+		http.Error(w, "system prompt missing allowed tools", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	if n == 1 {
+		send(map[string]any{"id": "gen-x1", "choices": []any{
+			map[string]any{"delta": map[string]any{"tool_calls": []any{
+				map[string]any{"index": 0, "id": "call_write", "type": "function", "function": map[string]any{
+					"name": "write_file", "arguments": `{"path":"blocked.txt","content":"nope"}`,
+				}},
+			}}},
+		}})
+		send(map[string]any{"id": "gen-x1", "choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+		}})
+		send(map[string]any{"id": "gen-x1", "choices": []any{}, "usage": map[string]any{
+			"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25, "cost": 0.0001,
+		}})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+	send(map[string]any{"id": "gen-x2", "choices": []any{
+		map[string]any{"delta": map[string]any{"content": "PLAN is read-only; switch to BUILD to write files."}},
+	}})
+	send(map[string]any{"id": "gen-x2", "choices": []any{
+		map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+	}})
+	send(map[string]any{"id": "gen-x2", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40, "cost": 0.0001,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func TestChatStreamBlocksToolBeforeExecution(t *testing.T) {
+	cfg, st, _ := modelsFixture(t)
+	projectDir := t.TempDir()
+	upstream := httptest.NewServer(&blockedToolMock{})
+	defer upstream.Close()
+
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = upstream.URL
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	project, err := st.CreateProject("Blocked", projectDir, "#22c55e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", "PLAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+
+	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Create a file"})
+	resp, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	events := readEvents(t, resp.Body)
+
+	var blocked, started, ended int
+	var reason string
+	for _, ev := range events {
+		switch ev["type"] {
+		case "tool_blocked":
+			blocked++
+			reason, _ = ev["message"].(string)
+			if ev["name"] != "write_file" {
+				t.Errorf("blocked tool = %v, want write_file", ev["name"])
+			}
+		case "tool_start":
+			started++
+		case "tool_end":
+			ended++
+		}
+	}
+	if blocked != 1 || started != 0 || ended != 0 {
+		t.Errorf("blocked/started/ended = %d/%d/%d, want 1/0/0", blocked, started, ended)
+	}
+	if !strings.Contains(reason, "PLAN") || !strings.Contains(reason, "BUILD") {
+		t.Errorf("block reason = %q", reason)
+	}
+	if _, err := os.Stat(filepath.Join(projectDir, "blocked.txt")); !os.IsNotExist(err) {
+		t.Error("blocked write_file still created the file")
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %d, want 3", len(msgs))
+	}
+	if !strings.Contains(msgs[1].ToolCalls, `"status":"blocked"`) {
+		t.Errorf("blocked status not persisted: %s", msgs[1].ToolCalls)
+	}
+}
+
+// summaryMock answers /compact with a fixed summary.
+type summaryMock struct {
+	requests atomic.Int32
+	sawTools atomic.Bool
+}
+
+func (m *summaryMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.requests.Add(1)
+	var req struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+		Tools []any `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Tools) > 0 {
+		m.sawTools.Store(true)
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	send(map[string]any{"id": "gen-c1", "choices": []any{
+		map[string]any{"delta": map[string]any{"content": "Goals: add health endpoint. Files: main.go. Next: implement handler."}},
+	}})
+	send(map[string]any{"id": "gen-c1", "choices": []any{
+		map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+	}})
+	send(map[string]any{"id": "gen-c1", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 500, "completion_tokens": 60, "total_tokens": 560, "cost": 0.002,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func TestCompactSession(t *testing.T) {
+	cfg, st, _ := modelsFixture(t)
+	mock := &summaryMock{}
+	upstream := httptest.NewServer(mock)
+	defer upstream.Close()
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = upstream.URL
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	project, err := st.CreateProject("Compact", t.TempDir(), "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", "PLAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []struct{ role, text string }{
+		{"user", "First question"},
+		{"assistant", "First answer"},
+		{"user", "Second question"},
+		{"assistant", "Second answer"},
+		{"user", "Latest question"},
+		{"assistant", "Latest answer"},
+	} {
+		if _, err := st.AddMessage(session.ID, m.role, "", m.text, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+
+	resp, err := http.Post(app.URL+"/api/sessions/"+strconv.FormatInt(session.ID, 10)+"/compact", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Removed int    `json:"removed"`
+		Summary string `json:"summary"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Removed != 4 {
+		t.Errorf("removed = %d, want 4", payload.Removed)
+	}
+	if len(payload.Messages) != 3 {
+		t.Fatalf("messages = %d, want 3 (summary + kept pair)", len(payload.Messages))
+	}
+	if payload.Messages[0].Role != "assistant" || !strings.HasPrefix(payload.Messages[0].Content, "Conversation summary") {
+		t.Errorf("first message is not the summary: %+v", payload.Messages[0])
+	}
+	if payload.Messages[1].Content != "Latest question" || payload.Messages[2].Content != "Latest answer" {
+		t.Errorf("kept exchange wrong: %+v", payload.Messages[1:])
+	}
+	if !strings.Contains(payload.Summary, "health endpoint") {
+		t.Errorf("summary content missing: %q", payload.Summary)
+	}
+	final, err := st.GetSession(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.TokensIn != 500 || final.TokensOut != 60 {
+		t.Errorf("compact usage not recorded: %+v", final)
+	}
+	if saw, _ := st.ListMessages(session.ID); len(saw) != 3 {
+		t.Errorf("stored messages = %d, want 3", len(saw))
+	}
+	if mock.sawTools.Load() {
+		t.Error("compaction request should not expose tools")
 	}
 }
 
