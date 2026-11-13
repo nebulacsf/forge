@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"forge/internal/llm"
+	"forge/internal/logx"
 	"forge/internal/store"
 	"forge/internal/tools"
 )
@@ -45,9 +45,10 @@ type chatEvent struct {
 	SessionCostUSD   float64 `json:"session_cost_usd,omitempty"`
 	ProjectCostUSD   float64 `json:"project_cost_usd,omitempty"`
 
-	Checklist *[]store.ChecklistItem `json:"checklist,omitempty"`
-	Files     []tools.FileAction     `json:"files,omitempty"`
-	Session   *store.Session         `json:"session,omitempty"`
+	Checklist     *[]store.ChecklistItem `json:"checklist,omitempty"`
+	Files         []tools.FileAction     `json:"files,omitempty"`
+	Session       *store.Session         `json:"session,omitempty"`
+	ReasoningOnly bool                   `json:"reasoning_only,omitempty"`
 }
 
 type sseWriter struct {
@@ -140,6 +141,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	stream := &sseWriter{w: w, rc: rc}
 	ctx := r.Context()
+	turnStart := time.Now()
+	logx.Info("turn start", "session", session.ID, "project", project.ID, "model", session.Model, "mode", session.Mode)
 
 	// Persist the user message first.
 	if _, err := s.store.AddMessage(session.ID, "user", "", body.Content, ""); err != nil {
@@ -189,6 +192,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			Messages: history,
 			Tools:    specs,
 		}
+		logx.Debug("round request", "session", session.ID, "round", round,
+			"messages", len(history), "tools", len(specs))
 
 		result, streamErr := client.StreamChat(ctx, req, func(d llm.Delta) error {
 			kind := d.Kind
@@ -203,6 +208,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				if result != nil {
 					s.persistPartial(session.ID, result.Reasoning, result.Content)
 				}
+				logx.Info("turn cancelled", "session", session.ID, "round", round,
+					"duration", time.Since(turnStart).Round(time.Millisecond).String())
 				s.finishCancelled(stream, session.ID, "", "")
 				return
 			}
@@ -213,22 +220,28 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(streamErr, context.DeadlineExceeded) {
 				msg = "The model request timed out."
 			}
+			logx.Warn("provider stream failed", "session", session.ID, "round", round, "error", msg)
 			stream.fail(msg)
-			s.sendDone(stream, session.ID)
+			s.sendDone(stream, session.ID, false)
 			return
 		}
 		if result == nil {
+			logx.Warn("provider returned no result", "session", session.ID, "round", round)
 			stream.fail("The provider returned an empty response.")
-			s.sendDone(stream, session.ID)
+			s.sendDone(stream, session.ID, false)
 			return
 		}
 
 		if result.Usage.PromptTokens > 0 || result.Usage.CompletionTokens > 0 || result.Usage.Cost > 0 {
 			if err := s.store.AddUsage(session.ID,
 				result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.Cost); err != nil {
-				log.Printf("add usage: %v", err)
+				logx.Error("persist usage failed", "session", session.ID, "error", err)
 			}
 		}
+		logx.Debug("round finished", "session", session.ID, "round", round,
+			"content_chars", len(result.Content), "reasoning_chars", len(result.Reasoning),
+			"tool_calls", len(result.ToolCalls), "prompt_tokens", result.Usage.PromptTokens,
+			"completion_tokens", result.Usage.CompletionTokens, "cost", result.Usage.Cost)
 		if fresh, err := s.store.GetSession(session.ID); err == nil {
 			session = fresh
 		}
@@ -245,7 +258,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			CachedTokens:     result.Usage.PromptTokensDetails.CachedTokens,
 			ReasoningTokens:  result.Usage.CompletionTokensDetails.ReasoningTokens,
 			CostUSD:          result.Usage.Cost,
-			ContextTokens:    result.Usage.PromptTokens,
+			ContextTokens:    result.Usage.PromptTokens + result.Usage.CompletionTokens,
 			SessionTokensIn:  session.TokensIn,
 			SessionTokensOut: session.TokensOut,
 			SessionCostUSD:   session.CostUSD,
@@ -256,16 +269,28 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if len(result.ToolCalls) == 0 {
-			if strings.TrimSpace(result.Content) == "" && strings.TrimSpace(result.Reasoning) == "" {
+			hasContent := strings.TrimSpace(result.Content) != ""
+			hasReasoning := strings.TrimSpace(result.Reasoning) != ""
+			if !hasContent && !hasReasoning {
+				logx.Warn("empty completion", "session", session.ID, "round", round, "model", session.Model)
 				stream.fail("The model returned an empty response. Try another model or send the message again.")
-				s.sendDone(stream, session.ID)
+				s.sendDone(stream, session.ID, false)
 				return
 			}
 			if _, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, ""); err != nil {
+				logx.Error("persist assistant response failed", "session", session.ID, "error", err)
 				stream.fail("Could not save response: " + err.Error())
 				return
 			}
-			s.sendDone(stream, session.ID)
+			if !hasContent && hasReasoning {
+				logx.Warn("model returned reasoning without a final answer",
+					"session", session.ID, "round", round, "model", session.Model)
+			}
+			logx.Info("turn done", "session", session.ID, "rounds", round,
+				"reasoning_only", !hasContent && hasReasoning,
+				"duration", time.Since(turnStart).Round(time.Millisecond).String(),
+				"tokens_in", session.TokensIn, "tokens_out", session.TokensOut, "cost", session.CostUSD)
+			s.sendDone(stream, session.ID, !hasContent && hasReasoning)
 			return
 		}
 
@@ -288,6 +313,13 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			started := time.Now()
 			toolResult := mgr.Execute(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments))
 			elapsed := time.Since(started).Milliseconds()
+			if toolResult.IsError {
+				logx.Warn("tool failed", "session", session.ID, "round", round, "tool", call.Function.Name,
+					"duration_ms", elapsed, "error", logx.Preview(toolResult.Content, 200))
+			} else {
+				logx.Debug("tool finished", "session", session.ID, "round", round, "tool", call.Function.Name,
+					"duration_ms", elapsed, "result_chars", len(toolResult.Content))
+			}
 			call.Result = toolResult.Content
 			call.Status = "done"
 			if toolResult.IsError {
@@ -319,8 +351,9 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	logx.Warn("tool round limit reached", "session", session.ID, "limit", maxToolRounds)
 	stream.fail(fmt.Sprintf("Stopped after %d tool-call rounds. Send another message to continue.", maxToolRounds))
-	s.sendDone(stream, session.ID)
+	s.sendDone(stream, session.ID, false)
 }
 
 func (s *Server) persistPartial(sessionID int64, reasoning, content string) {
@@ -328,7 +361,7 @@ func (s *Server) persistPartial(sessionID int64, reasoning, content string) {
 		return
 	}
 	if _, err := s.store.AddMessage(sessionID, "assistant", reasoning, content, ""); err != nil {
-		log.Printf("persist partial response: %v", err)
+		logx.Error("persist partial response failed", "session", sessionID, "error", err)
 	}
 }
 
@@ -347,15 +380,15 @@ func (s *Server) persistToolCalls(sessionID int64, reasoning, content string, ca
 func (s *Server) finishCancelled(stream *sseWriter, sessionID int64, reasoning, content string) {
 	s.persistPartial(sessionID, reasoning, content)
 	_ = stream.send(chatEvent{Type: "cancelled", Message: "Stopped"})
-	s.sendDone(stream, sessionID)
+	s.sendDone(stream, sessionID, false)
 }
 
-func (s *Server) sendDone(stream *sseWriter, sessionID int64) {
+func (s *Server) sendDone(stream *sseWriter, sessionID int64, reasoningOnly bool) {
 	var ptr *store.Session
 	if sess, err := s.store.GetSession(sessionID); err == nil {
 		ptr = &sess
 	}
-	_ = stream.send(chatEvent{Type: "done", Session: ptr})
+	_ = stream.send(chatEvent{Type: "done", Session: ptr, ReasoningOnly: reasoningOnly})
 }
 
 func statDir(path string) (bool, error) {
@@ -428,7 +461,8 @@ func buildSystemPrompt(project store.Project, session store.Session, checklist [
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
 	if session.Mode == "PLAN" {
-		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands. When implementation is needed, present a clear plan and tell the user to switch to BUILD.\n")
+		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
+		b.WriteString("When you have enough information, finish with a concise numbered plan of the exact changes needed. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
 	} else {
 		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them.\n")
 	}

@@ -7,7 +7,11 @@ const $ = (id) => document.getElementById(id);
 const state = {
   config: null,
   configPath: '',
+  logPath: '',
+  debugActive: false,
   apiKeySet: false,
+  models: new Map(),
+  modelsSource: '',
   projects: [],
   activeProjectId: null,
   activeProject: null,
@@ -30,6 +34,8 @@ const state = {
   currentRound: null,
   toolCards: new Map(),
   sawCancelled: false,
+  turnHadContent: false,
+  turnHadError: false,
 };
 
 let projectModal = null;
@@ -54,6 +60,7 @@ async function init() {
   try {
     await loadConfig();
     $('modelInput').value = state.config?.defaults?.model || '';
+    loadModels();
     await loadProjects();
     if (!state.projects.length) {
       showEmpty('project');
@@ -93,7 +100,40 @@ async function loadConfig() {
   const data = await api('/api/config');
   state.config = data.config;
   state.configPath = data.path;
+  state.logPath = data.log_path || '';
+  state.debugActive = !!data.debug;
   state.apiKeySet = !!data.api_key_set;
+}
+
+async function loadModels() {
+  try {
+    const data = await api('/api/models');
+    const list = Array.isArray(data.models) ? data.models : [];
+    state.models = new Map(list.map((m) => [String(m.id), m]));
+    state.modelsSource = data.source || '';
+    renderModelOptions(list);
+    updateUsageUI();
+  } catch {
+    /* Keep the built-in heuristics when the catalog is unavailable. */
+  }
+}
+
+function renderModelOptions(list) {
+  const datalist = $('modelOptions');
+  if (!datalist) return;
+  datalist.innerHTML = '';
+  const seen = new Set();
+  for (const model of list) {
+    const id = String(model.id || '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const option = document.createElement('option');
+    option.value = id;
+    const name = model.name && model.name !== id ? `${model.name} · ` : '';
+    const ctx = model.context_length > 0 ? ` (${formatLimit(model.context_length)} ctx)` : '';
+    option.label = `${name}${id}${ctx}`;
+    datalist.appendChild(option);
+  }
 }
 
 async function loadProjects() {
@@ -356,7 +396,47 @@ function renderSession(messages) {
   if (hasContent) hideEmpty();
   else showEmpty('chat');
   document.title = `${state.session?.title || 'Forge'} · Forge`;
+  const last = messages[messages.length - 1];
+  if (state.session?.mode === 'PLAN' && last?.role === 'assistant' && (last.content || '').trim()) {
+    addPlanReadyCard();
+  }
   maybeScroll(true);
+}
+
+function removePlanReadyCard() {
+  const existing = $('messages').querySelector('.plan-ready');
+  if (existing) existing.remove();
+}
+
+function addPlanReadyCard() {
+  removePlanReadyCard();
+  const card = document.createElement('div');
+  card.className = 'plan-ready';
+  card.innerHTML = `
+    <div class="plan-ready-icon"><i class="bi bi-map"></i></div>
+    <div class="plan-ready-body">
+      <strong>Plan ready</strong>
+      <span>PLAN mode is read-only. Switch to BUILD to apply these changes.</span>
+    </div>
+    <div class="plan-ready-actions">
+      <button type="button" class="btn btn-accent" data-action="build">Switch to BUILD</button>
+      <button type="button" class="plan-ready-close" title="Dismiss" aria-label="Dismiss">&times;</button>
+    </div>`;
+  const build = card.querySelector('[data-action="build"]');
+  build.addEventListener('click', async () => {
+    build.disabled = true;
+    const updated = await patchSession({ mode: 'BUILD' });
+    if (!updated) {
+      build.disabled = false;
+      return;
+    }
+    setModeUI(updated.mode);
+    card.remove();
+    toast('BUILD mode enabled — describe the change you want to apply', 'success');
+    $('promptInput').focus();
+  });
+  card.querySelector('.plan-ready-close').addEventListener('click', () => card.remove());
+  $('messages').appendChild(card);
 }
 
 function appendUserMessage(text) {
@@ -385,6 +465,8 @@ function renderAssistantHistory(msg) {
   if (hasReasoning) {
     const card = addReasoningCard(round, msg.reasoning);
     card.title.textContent = 'Thought process';
+    // A reasoning-only turn has no visible answer, so surface it.
+    if (!hasContent) card.el.open = true;
   }
   for (const call of calls) {
     addHistoricalToolCall(round, call);
@@ -431,6 +513,7 @@ async function sendMessage() {
     if (!created) return;
   }
 
+  removePlanReadyCard();
   prompt.value = '';
   resizePrompt();
   updateSendState();
@@ -440,6 +523,9 @@ async function sendMessage() {
 
   state.streaming = true;
   state.sawCancelled = false;
+  state.turnHadContent = false;
+  state.turnHadError = false;
+  const modeAtSend = state.session?.mode === 'BUILD' ? 'BUILD' : 'PLAN';
   setStreamingUI(true);
   const round = beginRound(0);
   const controller = new AbortController();
@@ -478,6 +564,7 @@ async function sendMessage() {
     } else if (err.name === 'AbortError' || controller.signal.aborted) {
       if (!state.sawCancelled) addNotice('Stopped', 'stopped');
     } else {
+      state.turnHadError = true;
       addNotice(err.message || 'Request failed', 'error');
       toast(err.message || 'Request failed', 'error');
     }
@@ -487,6 +574,9 @@ async function sendMessage() {
     state.abort = null;
     setStreamingUI(false);
     updateControls();
+    if (!state.sawCancelled && !state.turnHadError && modeAtSend === 'PLAN' && state.turnHadContent) {
+      addPlanReadyCard();
+    }
     maybeScroll(true);
     updateSessionTabCosts();
   }
@@ -547,6 +637,7 @@ function handleEvent(ev) {
       removeThinking(round);
       round.rawContent += ev.content || '';
       round.hasEvents = true;
+      if ((ev.content || '').trim()) state.turnHadContent = true;
       ensureContentEl(round);
       scheduleContentRender(round);
       break;
@@ -591,12 +682,21 @@ function handleEvent(ev) {
     case 'done':
       if (ev.session) syncSession(ev.session);
       if (state.currentRound) removeThinking(state.currentRound);
+      if (ev.reasoning_only) {
+        const round = state.currentRound;
+        if (round && round.reasoning) round.reasoning.el.open = true;
+        addNotice(
+          'The model returned reasoning but no final answer. Ask it to summarize the plan, or switch to another model.',
+          'error'
+        );
+      }
       break;
     case 'cancelled':
       state.sawCancelled = true;
       addNotice('Stopped', 'stopped');
       break;
     case 'error':
+      state.turnHadError = true;
       addNotice(ev.message || 'The provider returned an error.', 'error');
       break;
     default:
@@ -910,7 +1010,17 @@ function applyUsage(ev) {
 }
 
 function contextLimit(model) {
-  const m = String(model || '').toLowerCase();
+  const id = String(model || '');
+  const exact = state.models.get(id);
+  if (exact && exact.context_length > 0) return exact.context_length;
+  if (id) {
+    for (const [key, value] of state.models) {
+      if (key.toLowerCase() === id.toLowerCase() && value.context_length > 0) {
+        return value.context_length;
+      }
+    }
+  }
+  const m = id.toLowerCase();
   if (m.includes('claude')) return 200000;
   if (m.includes('gemini')) return 1000000;
   if (m.includes('llama-4') || m.includes('maverick')) return 1000000;
@@ -929,6 +1039,7 @@ function updateUsageUI() {
   $('contextPct').textContent = (pct < 1 && pct > 0 ? '<1' : Math.round(pct)) + '%';
   $('contextMeta').textContent =
     `${state.usage.contextExact ? '' : 'est. '}${formatNum(used)} / ${formatLimit(limit)} tokens`;
+  $('contextMeta').title = `${used} / ${limit} tokens`;
   $('tokensIn').textContent = formatNum(state.usage.sessionIn);
   $('tokensOut').textContent = formatNum(state.usage.sessionOut);
   $('cachedTokens').textContent = formatNum(state.usage.cached);
@@ -1319,6 +1430,8 @@ function openSettings() {
   $('serverHost').value = cfg.server.host || '127.0.0.1';
   $('serverPort').value = cfg.server.port || 7890;
   $('autoBrowser').checked = !!cfg.server.auto_open_browser;
+  $('debugToggle').checked = !!cfg.server.debug || !!state.debugActive;
+  $('logPath').textContent = state.logPath || '~/.forge/forge.log';
   $('configPath').textContent = state.configPath || '~/.forge/config.json';
   if (settingsModal) settingsModal.show();
 }
@@ -1337,15 +1450,21 @@ async function saveSettings(e) {
   cfg.server.host = $('serverHost').value.trim();
   cfg.server.port = Number($('serverPort').value) || 7890;
   cfg.server.auto_open_browser = $('autoBrowser').checked;
+  cfg.server.debug = $('debugToggle').checked;
 
   const before = state.config;
   try {
     const data = await api('/api/config', { method: 'PUT', body: JSON.stringify(cfg) });
     state.config = data.config;
     state.configPath = data.path;
+    state.logPath = data.log_path || state.logPath;
+    state.debugActive = !!data.debug;
     state.apiKeySet = !!data.api_key_set;
     if (settingsModal) settingsModal.hide();
     toast('Settings saved', 'success');
+    if (before.server.debug !== state.config.server.debug) {
+      toast(state.config.server.debug ? 'Debug logging enabled' : 'Debug logging disabled', 'success');
+    }
     if (before.server.port !== state.config.server.port || before.server.host !== state.config.server.host) {
       toast('Host/port will apply after restarting Forge', 'success');
     }

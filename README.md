@@ -24,8 +24,8 @@ Or directly:
 ./forge --port 7890 --no-browser
 ```
 
-Flags: `--host`, `--port`, `--no-browser`, `--version`. Configured host/port are
-used when the flags are omitted.
+Flags: `--host`, `--port`, `--no-browser`, `--debug`, `--log-file`, `--version`.
+Configured host/port are used when the flags are omitted.
 
 ## Files
 
@@ -33,6 +33,7 @@ used when the flags are omitted.
 | --- | --- |
 | `${FORGE_HOME:-~/.forge}/config.json` | Configuration (created on first run) |
 | `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists) |
+| `${FORGE_HOME:-~/.forge}/forge.log` | Application log (rotated to `forge.log.1` at 10 MB) |
 
 Both the directory (0700) and the files are created automatically. `FORGE_HOME`
 overrides the directory, which is handy for testing without touching real data.
@@ -55,6 +56,11 @@ Sessions are stored per project; open tabs are restored after a reload.
 | --- | --- |
 | **PLAN** (read-only) | `read_file`, `grep_search`, `list_directory`, `git_diff`, `update_checklist` |
 | **BUILD** | all of the above, plus `patch_file`, `write_file`, `bash` |
+
+In PLAN mode a completed turn ends with a **Plan ready — Switch to BUILD** card
+so it is always clear that files cannot change until you switch modes. If a
+model returns only reasoning and no final answer, Forge expands the reasoning
+card and warns you instead of leaving an apparently empty turn.
 
 `bash` runs in the project root with a timeout (default 30 s, capped at 600 s)
 and is killed as a process group on timeout or cancellation. All file tools are
@@ -79,7 +85,13 @@ already arrived.
 
 ```json
 {
-  "server": { "host": "127.0.0.1", "port": 7890, "auto_open_browser": true },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 7890,
+    "auto_open_browser": true,
+    "debug": false,
+    "log_file": ""
+  },
   "providers": {
     "openrouter": { "api_key": "sk-or-v1-…", "base_url": "https://openrouter.ai/api/v1" }
   },
@@ -93,7 +105,34 @@ already arrived.
 ```
 
 `base_url` can point at any OpenAI-compatible streaming endpoint, which is how
-the test suite and local mocks are wired up.
+the test suite and local mocks are wired up. `log_file` defaults to
+`<forge home>/forge.log`; set it to an absolute path to move the log.
+
+## Logging
+
+Forge logs to stderr and to the log file at `INFO` and above by default. With
+debug enabled it also records every HTTP request, model round, tool execution,
+provider latency, and stream summary.
+
+Enable it with any of:
+
+- Settings → **Logging → Debug logging** (applies immediately, saved to config)
+- `./forge --debug`
+- `FORGE_DEBUG=1 ./forge`
+- `"debug": true` in `config.json`
+
+`--debug` and `FORGE_DEBUG=1` win over the config file, so turning the switch
+off in the UI will not silence a forced debug session. The log rotates to
+`forge.log.1` at 10 MB. API keys are never written to the log; message content
+is not logged, only sizes and metadata.
+
+## Model context windows
+
+`GET /api/models` proxies the provider's model catalog and caches it for six
+hours. The UI uses the real `context_length` for the context-window gauge and
+the model picker labels, so switching models updates the denominator
+immediately. If the provider catalog is unreachable, Forge falls back to a
+built-in table and a heuristic (and keeps working offline).
 
 ## HTTP API
 
@@ -101,6 +140,7 @@ the test suite and local mocks are wired up.
 | --- | --- |
 | `GET /api/health` | Liveness probe |
 | `GET/PUT /api/config` | Read/update config (API key is masked on read) |
+| `GET /api/models` | Provider model catalog with real context lengths (`?refresh=1` bypasses the cache) |
 | `GET/POST /api/projects` | List/register projects |
 | `GET/POST /api/projects/{id}/sessions` | List/create sessions |
 | `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/close |

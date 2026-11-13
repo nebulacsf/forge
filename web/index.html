@@ -174,44 +174,41 @@
 
 <!-- ── Add project modal ───────────────────────────────────────────── -->
 <div class="modal fade" id="projectModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-dialog-centered">
+  <form id="projectForm" class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
     <div class="modal-content">
-      <form id="projectForm">
-        <div class="modal-header">
-          <h5 class="modal-title"><i class="bi bi-folder-plus me-2"></i>Register a project</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-folder-plus me-2"></i>Register a project</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label for="projectPath" class="form-label">Local directory</label>
+          <input id="projectPath" class="form-control" placeholder="/home/you/code/my-project" required>
+          <div class="form-text">Forge is scoped to this working directory. Absolute paths or <code>~/…</code>.</div>
         </div>
-        <div class="modal-body">
-          <div class="mb-3">
-            <label for="projectPath" class="form-label">Local directory</label>
-            <input id="projectPath" class="form-control" placeholder="/home/you/code/my-project" required>
-            <div class="form-text">Forge is scoped to this working directory. Absolute paths or <code>~/…</code>.</div>
+        <div class="row g-3">
+          <div class="col-8">
+            <label for="projectName" class="form-label">Display name <span class="text-secondary">(optional)</span></label>
+            <input id="projectName" class="form-control" placeholder="my-project" autocomplete="off">
           </div>
-          <div class="row g-3">
-            <div class="col-8">
-              <label for="projectName" class="form-label">Display name <span class="text-secondary">(optional)</span></label>
-              <input id="projectName" class="form-control" placeholder="my-project" autocomplete="off">
-            </div>
-            <div class="col-4">
-              <label for="projectColor" class="form-label">Color</label>
-              <input id="projectColor" type="color" class="form-control form-control-color w-100" value="#6c8cff">
-            </div>
+          <div class="col-4">
+            <label for="projectColor" class="form-label">Color</label>
+            <input id="projectColor" type="color" class="form-control form-control-color w-100" value="#6c8cff">
           </div>
         </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
-          <button type="submit" class="btn btn-accent">Register project</button>
-        </div>
-      </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-accent">Register project</button>
+      </div>
     </div>
-  </div>
+  </form>
 </div>
 
 <!-- ── Settings modal ──────────────────────────────────────────────── -->
 <div class="modal fade" id="settingsModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+  <form id="settingsForm" class="modal-dialog modal-lg modal-dialog-scrollable">
     <div class="modal-content">
-      <form id="settingsForm">
         <div class="modal-header">
           <h5 class="modal-title"><i class="bi bi-gear me-2"></i>Settings</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -282,6 +279,19 @@
             </div>
           </div>
 
+          <div class="settings-section">
+            <div class="settings-section-title">Logging</div>
+            <div class="form-check form-switch">
+              <input id="debugToggle" class="form-check-input" type="checkbox">
+              <label class="form-check-label" for="debugToggle">Debug logging</label>
+            </div>
+            <div class="form-text">
+              Records every request, model round, and tool call. Applies immediately.
+              Also available as <code>--debug</code> or <code>FORGE_DEBUG=1</code>.
+            </div>
+            <div class="settings-path">Log file: <code id="logPath">~/.forge/forge.log</code></div>
+          </div>
+
           <div class="settings-path">
             Config file: <code id="configPath">~/.forge/config.json</code>
           </div>
@@ -290,9 +300,8 @@
           <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
           <button type="submit" class="btn btn-accent">Save settings</button>
         </div>
-      </form>
     </div>
-  </div>
+  </form>
 </div>
 
 <div id="toasts" class="toast-container position-fixed bottom-0 end-0 p-3"></div>

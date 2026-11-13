@@ -2,21 +2,24 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"io/fs"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"forge/internal/config"
+	"forge/internal/llm"
+	"forge/internal/logx"
 	"forge/internal/store"
 )
 
@@ -27,10 +30,19 @@ var projectPalette = []string{
 	"#06b6d4", "#a855f7", "#ef4444", "#14b8a6",
 }
 
+// modelsTTL controls how long a successful provider model catalog is cached.
+const modelsTTL = 6 * time.Hour
+
 type Server struct {
 	cfg   *config.Manager
 	store *store.Store
 	web   fs.FS
+
+	modelsMu     sync.Mutex
+	modelsList   []llm.ModelInfo
+	modelsSource string
+	modelsWarn   string
+	modelsAt     time.Time
 }
 
 func New(cfg *config.Manager, st *store.Store, web fs.FS) *Server {
@@ -44,6 +56,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
+	mux.HandleFunc("GET /api/models", s.handleListModels)
 
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
@@ -69,7 +82,68 @@ func (s *Server) Handler() http.Handler {
 		fileServer.ServeHTTP(w, r)
 	}))
 
-	return recoverMiddleware(securityHeaders(mux))
+	return loggingMiddleware(recoverMiddleware(securityHeaders(mux)))
+}
+
+// statusRecorder captures the response status and size for request logging.
+// Flush/Unwrap keep SSE streaming working through the wrapper.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += int64(n)
+	return n, err
+}
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		attrs := []any{
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"duration", time.Since(start).Round(time.Millisecond).String(),
+			"bytes", rec.bytes,
+		}
+		switch {
+		case status >= 500:
+			logx.Error("http request", attrs...)
+		case status >= 400:
+			logx.Warn("http request", attrs...)
+		default:
+			logx.Debug("http request", attrs...)
+		}
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -85,7 +159,7 @@ func recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("panic serving %s %s: %v", r.Method, r.URL.Path, rec)
+				logx.Error("panic serving request", "method", r.Method, "path", r.URL.Path, "panic", rec)
 				if strings.HasPrefix(r.URL.Path, "/api/") {
 					apiError(w, http.StatusInternalServerError, "internal server error")
 					return
@@ -104,7 +178,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("write json: %v", err)
+		logx.Error("write json response", "error", err)
 	}
 }
 
@@ -144,11 +218,57 @@ func (s *Server) publicConfig() map[string]any {
 	cfg := s.cfg.Get()
 	set := cfg.Providers.OpenRouter.APIKey != ""
 	cfg.Providers.OpenRouter.APIKey = maskAPIKey(cfg.Providers.OpenRouter.APIKey)
+	logPath, _ := config.LogPath(cfg)
 	return map[string]any{
 		"config":      cfg,
 		"path":        s.cfg.Path(),
 		"api_key_set": set,
+		"log_path":    logPath,
+		"debug":       logx.DebugEnabled(),
 	}
+}
+
+// handleListModels proxies the provider's model catalog so the UI can use real
+// context-window sizes. It always succeeds, falling back to a built-in list.
+func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	models, source, warning := s.modelCatalog(r.Context(), r.URL.Query().Get("refresh") == "1")
+	resp := map[string]any{"models": models, "source": source}
+	if warning != "" {
+		resp["warning"] = warning
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) modelCatalog(ctx context.Context, refresh bool) ([]llm.ModelInfo, string, string) {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+
+	ttl := modelsTTL
+	if s.modelsSource == "builtin" {
+		ttl = 2 * time.Minute
+	}
+	if !refresh && len(s.modelsList) > 0 && time.Since(s.modelsAt) < ttl {
+		return s.modelsList, s.modelsSource, s.modelsWarn
+	}
+
+	cfg := s.cfg.Get()
+	client := llm.New(cfg.Providers.OpenRouter.APIKey, cfg.Providers.OpenRouter.BaseURL)
+	models, err := client.FetchModels(ctx)
+	if err != nil {
+		if len(s.modelsList) == 0 || s.modelsSource != "builtin" {
+			logx.Warn("model catalog unavailable, using built-in list", "error", err)
+		}
+		s.modelsList = llm.BuiltinModels()
+		s.modelsSource = "builtin"
+		s.modelsWarn = err.Error()
+	} else {
+		logx.Debug("model catalog refreshed", "models", len(models))
+		s.modelsList = models
+		s.modelsSource = "openrouter"
+		s.modelsWarn = ""
+	}
+	s.modelsAt = time.Now()
+	return s.modelsList, s.modelsSource, s.modelsWarn
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +298,16 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	next := s.cfg.Get()
+	logx.ApplyDebug(next.Server.Debug)
+	if current.Providers.OpenRouter.BaseURL != next.Providers.OpenRouter.BaseURL ||
+		current.Providers.OpenRouter.APIKey != next.Providers.OpenRouter.APIKey {
+		s.modelsMu.Lock()
+		s.modelsList = nil
+		s.modelsAt = time.Time{}
+		s.modelsMu.Unlock()
+	}
+	logx.Info("configuration updated", "debug", logx.DebugEnabled(), "model", next.Defaults.Model)
 	writeJSON(w, http.StatusOK, s.publicConfig())
 }
 

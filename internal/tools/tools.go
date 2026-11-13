@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"forge/internal/llm"
+	"forge/internal/logx"
 	"forge/internal/store"
 )
 
@@ -908,6 +909,8 @@ func (m *Manager) bash(parent context.Context, command string, timeoutSec int) R
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
+	logx.Debug("bash exec", "session", m.SessionID, "timeout", timeout.String(),
+		"command", logx.Preview(command, 300))
 	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
 	cmd.Dir = m.Root
 	cmd.Env = append(os.Environ(),

@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"forge/internal/config"
+	"forge/internal/logx"
 	"forge/internal/server"
 	"forge/internal/store"
 )
@@ -35,11 +35,15 @@ func main() {
 		host      string
 		port      int
 		noBrowser bool
+		debug     bool
+		logFile   string
 		showVer   bool
 	)
 	flag.StringVar(&host, "host", "", "override the configured listen host")
 	flag.IntVar(&port, "port", 0, "override the configured HTTP port")
 	flag.BoolVar(&noBrowser, "no-browser", false, "do not open the browser on startup")
+	flag.BoolVar(&debug, "debug", false, "enable verbose DEBUG logging")
+	flag.StringVar(&logFile, "log-file", "", "write logs to this file (default: <forge home>/forge.log)")
 	flag.BoolVar(&showVer, "version", false, "print the version and exit")
 	flag.Parse()
 
@@ -48,12 +52,36 @@ func main() {
 		return
 	}
 
-	log.SetFlags(log.Ltime)
 	cfgMgr, err := config.Load()
 	if err != nil {
-		log.Fatalf("forge: %v", err)
+		fmt.Fprintf(os.Stderr, "forge: %v\n", err)
+		os.Exit(1)
 	}
 	cfg := cfgMgr.Get()
+
+	envDebug := envBool("FORGE_DEBUG")
+	debug = debug || envDebug || cfg.Server.Debug
+	debugForced := debug && (flagDebugSet() || envDebug)
+
+	path := logFile
+	if path == "" {
+		path, err = config.LogPath(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "forge: resolve log path: %v\n", err)
+			path = ""
+		}
+	}
+	if err := logx.Init(logx.Options{
+		Debug:      debug,
+		ForceDebug: debugForced,
+		FilePath:   path,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "forge: %v (continuing with stderr only)\n", err)
+	}
+	defer logx.Close()
+
+	logx.Info("starting forge", "version", version, "debug", logx.DebugEnabled(), "log", path)
+
 	if host == "" {
 		host = cfg.Server.Host
 	}
@@ -61,32 +89,32 @@ func main() {
 		port = cfg.Server.Port
 	}
 	if port < 1 || port > 65535 {
-		log.Fatalf("forge: invalid port %d", port)
+		logx.Fatalf("invalid port %d", port)
 	}
 
 	dbPath, err := config.DBPath()
 	if err != nil {
-		log.Fatalf("forge: %v", err)
+		logx.Fatalf("%v", err)
 	}
 	st, err := store.Open(dbPath)
 	if err != nil {
-		log.Fatalf("forge: open database: %v", err)
+		logx.Fatalf("open database: %v", err)
 	}
 	defer st.Close()
 	if st.LegacyBackupPath != "" {
-		log.Printf("incompatible legacy database moved to %s", st.LegacyBackupPath)
+		logx.Warn("incompatible legacy database moved aside", "backup", st.LegacyBackupPath)
 	}
 
 	webRoot, err := fs.Sub(webFiles, "web")
 	if err != nil {
-		log.Fatalf("forge: embedded web assets: %v", err)
+		logx.Fatalf("embedded web assets: %v", err)
 	}
 	handler := server.New(cfgMgr, st, webRoot).Handler()
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("forge: listen on %s: %v", addr, err)
+		logx.Fatalf("listen on %s: %v", addr, err)
 	}
 
 	displayHost := host
@@ -94,10 +122,9 @@ func main() {
 		displayHost = "127.0.0.1"
 	}
 	url := "http://" + net.JoinHostPort(displayHost, strconv.Itoa(port))
-	log.Printf("Forge %s ready at %s", version, url)
-	log.Printf("data: %s", dbPath)
+	logx.Info("forge ready", "url", url, "config", cfgMgr.Path(), "db", dbPath)
 	if !isLoopback(host) {
-		log.Printf("warning: Forge is bound to %s with no authentication; only expose it on trusted networks", host)
+		logx.Warn("bound to a non-loopback address with no authentication; only expose Forge on trusted networks", "host", host)
 	}
 
 	srv := &http.Server{
@@ -111,7 +138,7 @@ func main() {
 			go func() {
 				time.Sleep(350 * time.Millisecond)
 				if err := openBrowser(url); err != nil {
-					log.Printf("could not open browser: %v", err)
+					logx.Warn("could not open browser", "error", err)
 				}
 			}()
 		}
@@ -126,15 +153,15 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	select {
 	case sig := <-sigCh:
-		log.Printf("received %s, shutting down", sig)
+		logx.Info("shutting down", "signal", sig.String())
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("shutdown: %v", err)
+			logx.Error("shutdown failed", "error", err)
 		}
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("forge: %v", err)
+			logx.Fatalf("%v", err)
 		}
 	}
 }
@@ -142,6 +169,26 @@ func main() {
 func isLoopback(host string) bool {
 	h := strings.TrimSpace(host)
 	return h == "" || h == "localhost" || h == "127.0.0.1" || h == "::1" || strings.HasPrefix(h, "127.")
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on", "debug":
+		return true
+	default:
+		return false
+	}
+}
+
+// flagDebugSet reports whether --debug was passed explicitly.
+func flagDebugSet() bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "debug" {
+			set = true
+		}
+	})
+	return set
 }
 
 func openBrowser(url string) error {

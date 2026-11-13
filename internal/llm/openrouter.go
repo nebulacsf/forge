@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"forge/internal/logx"
 )
 
 // ToolCall is both the wire representation and Forge's persisted form. Result,
@@ -171,6 +173,10 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 	httpReq.Header.Set("HTTP-Referer", "https://github.com/forge-harness/forge")
 	httpReq.Header.Set("X-Title", "Forge")
 
+	logx.Debug("provider request", "url", c.BaseURL+"/chat/completions", "model", req.Model,
+		"messages", len(req.Messages), "tools", len(req.Tools))
+
+	started := time.Now()
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("connect to OpenRouter: %w", err)
@@ -181,8 +187,10 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		return nil, providerError(resp.StatusCode, data)
 	}
+	logx.Debug("provider response", "status", resp.StatusCode, "latency", time.Since(started).Round(time.Millisecond).String())
 
 	result := &StreamResult{}
+	chunks := 0
 	type partialTool struct {
 		call ToolCall
 	}
@@ -212,6 +220,7 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 			if chunk.Error != nil && chunk.Error.Message != "" {
 				return fmt.Errorf("OpenRouter: %s", chunk.Error.Message)
 			}
+			chunks++
 			if chunk.ID != "" {
 				result.ID = chunk.ID
 			}
@@ -323,6 +332,12 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 		}
 		result.ToolCalls = append(result.ToolCalls, call)
 	}
+	logx.Debug("provider stream complete", "model", result.Model, "chunks", chunks,
+		"content_chars", len(result.Content), "reasoning_chars", len(result.Reasoning),
+		"tool_calls", len(result.ToolCalls), "prompt_tokens", result.Usage.PromptTokens,
+		"completion_tokens", result.Usage.CompletionTokens, "cost", result.Usage.Cost,
+		"duration", time.Since(started).Round(time.Millisecond).String(),
+		"error", streamErr)
 	return result, streamErr
 }
 

@@ -28,6 +28,8 @@ type ServerConfig struct {
 	Host            string `json:"host"`
 	Port            int    `json:"port"`
 	AutoOpenBrowser bool   `json:"auto_open_browser"`
+	Debug           bool   `json:"debug"`
+	LogFile         string `json:"log_file"`
 }
 
 type ProvidersConfig struct {
@@ -95,6 +97,18 @@ func DBPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "forge.db"), nil
+}
+
+// LogPath resolves the configured log file, defaulting to <forge home>/forge.log.
+func LogPath(cfg Config) (string, error) {
+	if p := strings.TrimSpace(cfg.Server.LogFile); p != "" {
+		return filepath.Abs(expandHome(p))
+	}
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "forge.log"), nil
 }
 
 // Load opens (creating when missing) the configuration file.
@@ -198,6 +212,7 @@ func normalize(c Config) Config {
 	}
 	c.Providers.OpenRouter.BaseURL = strings.TrimRight(strings.TrimSpace(c.Providers.OpenRouter.BaseURL), "/")
 	c.Providers.OpenRouter.APIKey = strings.TrimSpace(c.Providers.OpenRouter.APIKey)
+	c.Server.LogFile = strings.TrimSpace(c.Server.LogFile)
 
 	if strings.TrimSpace(c.Defaults.Model) == "" {
 		c.Defaults.Model = d.Defaults.Model

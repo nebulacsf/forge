@@ -558,6 +558,58 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .notice.error { border-color: rgba(240,100,100,.3); background: rgba(240,100,100,.07); color: #ffaaaa; }
 .notice.stopped { border-color: rgba(242,184,75,.25); background: rgba(242,184,75,.06); color: #f3c676; }
 
+/* PLAN → BUILD call to action */
+.plan-ready {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin: 2px 0 22px;
+  padding: 11px 13px;
+  border: 1px solid rgba(111,140,255,.34);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(111,140,255,.10), rgba(111,140,255,.03));
+}
+.plan-ready-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: rgba(111,140,255,.16);
+  color: var(--accent);
+  font-size: 13px;
+}
+.plan-ready-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.plan-ready-body strong { font-size: 12px; font-weight: 650; color: var(--text); }
+.plan-ready-body span { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.plan-ready-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.plan-ready-close {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-2);
+  font-size: 15px;
+  line-height: 1;
+}
+.plan-ready-close:hover { background: var(--panel-2); color: var(--text); }
+@media (max-width: 640px) {
+  .plan-ready { flex-wrap: wrap; }
+  .plan-ready-body { flex-basis: calc(100% - 80px); }
+  .plan-ready-actions { width: 100%; justify-content: flex-end; }
+}
+
 .thinking-row { display: flex; gap: 5px; align-items: center; padding: 8px 2px; }
 .thinking-row span {
   width: 5px; height: 5px; border-radius: 50%; background: var(--muted-2);
@@ -855,6 +907,19 @@ kbd {
 }
 .modal-header, .modal-footer { border-color: var(--border-soft); padding: 13px 17px; }
 .modal-body { padding: 17px; }
+/* Scrollable modals: .modal-body must be able to shrink inside the flex
+   content column, otherwise tall forms get clipped without a scrollbar. */
+.modal-dialog-scrollable .modal-body { min-height: 0; }
+@media (max-height: 640px) {
+  .modal-dialog-scrollable { --bs-modal-margin: 0.5rem; }
+  .modal-header, .modal-footer { padding: 10px 14px; }
+  .modal-body { padding: 14px; }
+  .settings-section { padding-bottom: 11px; margin-bottom: 11px; }
+}
+@media (max-width: 575.98px) {
+  .modal-header, .modal-footer { padding: 11px 14px; }
+  .modal-body { padding: 14px; }
+}
 .modal-title { font-size: 14px; font-weight: 650; }
 .modal-backdrop.show { opacity: .62; }
 

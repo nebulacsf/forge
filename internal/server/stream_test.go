@@ -29,7 +29,8 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	n := m.requests.Add(1)
 	var req struct {
 		Messages []struct {
-			Role string `json:"role"`
+			Role    string `json:"role"`
+			Content string `json:"content"`
 		} `json:"messages"`
 		Tools []struct {
 			Function struct {
@@ -44,6 +45,11 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.StreamOptions["include_usage"] != true {
 		http.Error(w, "missing stream_options.include_usage", http.StatusBadRequest)
+		return
+	}
+	if len(req.Messages) == 0 || req.Messages[0].Role != "system" ||
+		!strings.Contains(req.Messages[0].Content, "switch to BUILD") {
+		http.Error(w, "PLAN system prompt missing switch-to-BUILD guidance", http.StatusBadRequest)
 		return
 	}
 	for _, msg := range req.Messages {
@@ -476,6 +482,110 @@ func TestChatStreamBuildTools(t *testing.T) {
 	final, _ := st.GetSession(session.ID)
 	if final.Mode != "BUILD" || final.TokensIn != 90 {
 		t.Errorf("session state = %+v", final)
+	}
+}
+
+// reasoningOnlyMock returns reasoning but no content, like some models do.
+type reasoningOnlyMock struct {
+	requests atomic.Int32
+}
+
+func (m *reasoningOnlyMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.requests.Add(1)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	send(map[string]any{"id": "gen-r1", "choices": []any{
+		map[string]any{"delta": map[string]any{"reasoning": "First read the file, then plan."}},
+	}})
+	send(map[string]any{"id": "gen-r1", "choices": []any{
+		map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+	}})
+	send(map[string]any{"id": "gen-r1", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 70, "completion_tokens": 30, "total_tokens": 100, "cost": 0.0003,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func TestChatStreamReasoningOnly(t *testing.T) {
+	cfg, st, _ := modelsFixture(t)
+	projectDir := t.TempDir()
+	upstream := httptest.NewServer(&reasoningOnlyMock{})
+	defer upstream.Close()
+
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = upstream.URL
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+
+	project, err := st.CreateProject("Reasoning", projectDir, "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", "PLAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+
+	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Plan the change"})
+	resp, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	events := readEvents(t, resp.Body)
+	var reasoningOnly bool
+	var doneSeen bool
+	var contextTokens int
+	for _, ev := range events {
+		switch ev["type"] {
+		case "done":
+			doneSeen = true
+			reasoningOnly, _ = ev["reasoning_only"].(bool)
+		case "usage":
+			if n, ok := ev["context_tokens"].(float64); ok {
+				contextTokens = int(n)
+			}
+			if n, ok := ev["completion_tokens"].(float64); ok && n != 30 {
+				t.Errorf("completion tokens = %v", n)
+			}
+		}
+	}
+	if !doneSeen {
+		t.Fatal("no done event")
+	}
+	if !reasoningOnly {
+		t.Error("done.reasoning_only = false, want true")
+	}
+	if contextTokens != 100 {
+		t.Errorf("context_tokens = %d, want 100 (prompt+completion)", contextTokens)
+	}
+
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[1].Role != "assistant" {
+		t.Fatalf("unexpected messages: %+v", msgs)
+	}
+	if !strings.Contains(msgs[1].Reasoning, "plan") || strings.TrimSpace(msgs[1].Content) != "" {
+		t.Errorf("reasoning-only message persisted incorrectly: %+v", msgs[1])
 	}
 }
 
