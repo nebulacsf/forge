@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Forge</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css" rel="stylesheet">
+  <link href="css/app.css" rel="stylesheet">
+</head>
+<body class="vh-100 overflow-hidden">
+<div class="workspace d-flex vh-100">
+
+  <!-- ── Project rail ─────────────────────────────────────────────── -->
+  <aside class="project-rail d-flex flex-column align-items-center flex-shrink-0">
+    <div class="forge-mark" title="Forge">F</div>
+    <div id="projectList" class="project-list d-flex flex-column align-items-center flex-grow-1 w-100"></div>
+    <div class="rail-actions d-flex flex-column align-items-center gap-2">
+      <button id="addProjectBtn" class="rail-btn" type="button" title="Register a local project">
+        <i class="bi bi-plus-lg"></i>
+      </button>
+      <button id="settingsBtn" class="rail-btn" type="button" title="Settings">
+        <i class="bi bi-gear"></i>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ── Main column ──────────────────────────────────────────────── -->
+  <div class="main-col d-flex flex-column flex-grow-1 min-w-0">
+
+    <!-- Session tabs -->
+    <header class="session-bar d-flex align-items-center flex-shrink-0">
+      <div id="sessionTabs" class="session-tabs d-flex align-items-center flex-grow-1 min-w-0"></div>
+      <button id="newSessionBtn" class="tabs-add flex-shrink-0" type="button" title="New chat">
+        <i class="bi bi-plus-lg"></i>
+      </button>
+      <div id="projectPathLabel" class="project-path-label flex-shrink-0" title="Active project path"></div>
+    </header>
+
+    <div class="workspace-body d-flex flex-grow-1 min-h-0">
+
+      <!-- Chat -->
+      <main class="chat-panel d-flex flex-column flex-grow-1 min-w-0">
+        <div class="chat-controls d-flex align-items-center flex-shrink-0">
+          <div class="model-control">
+            <i class="bi bi-cpu"></i>
+            <input id="modelInput" class="model-input" list="modelOptions" spellcheck="false"
+                   autocomplete="off" placeholder="model id" aria-label="Model">
+            <datalist id="modelOptions">
+              <option value="qwen/qwen-2.5-coder-32b-instruct"></option>
+              <option value="anthropic/claude-sonnet-4.5"></option>
+              <option value="openai/gpt-5"></option>
+              <option value="google/gemini-2.5-pro"></option>
+              <option value="deepseek/deepseek-chat-v3.1"></option>
+              <option value="x-ai/grok-4"></option>
+              <option value="meta-llama/llama-4-maverick"></option>
+            </datalist>
+          </div>
+
+          <div id="modeToggle" class="mode-toggle flex-shrink-0" role="group" aria-label="Operating mode">
+            <button type="button" data-mode="PLAN">PLAN</button>
+            <button type="button" data-mode="BUILD">BUILD</button>
+          </div>
+
+          <div class="ms-auto d-flex align-items-center gap-2">
+            <span id="streamIndicator" class="stream-indicator d-none">
+              <span class="pulse-dot"></span> working
+            </span>
+          </div>
+        </div>
+
+        <div id="chatScroll" class="chat-scroll flex-grow-1 overflow-auto">
+          <div id="messages" class="messages mx-auto"></div>
+          <div id="emptyState" class="empty-state">
+            <div class="empty-mark">F</div>
+            <h1>Forge</h1>
+            <p>A local coding agent. Pick a project, choose a mode, and start.</p>
+            <div class="empty-hints">
+              <span><kbd>PLAN</kbd> reads and reasons</span>
+              <span><kbd>BUILD</kbd> edits and executes</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer-wrap flex-shrink-0">
+          <div class="composer mx-auto">
+            <textarea id="promptInput" rows="1" placeholder="Ask Forge to explore, explain, or build…"
+                      aria-label="Message"></textarea>
+            <div class="composer-actions">
+              <span class="composer-hint">Enter to send · Shift+Enter for newline</span>
+              <button id="stopBtn" class="btn btn-stop d-none" type="button" title="Stop generation">
+                <i class="bi bi-stop-fill"></i> Stop
+              </button>
+              <button id="sendBtn" class="btn btn-send" type="button" title="Send (Enter)">
+                <i class="bi bi-arrow-up"></i>
+              </button>
+            </div>
+          </div>
+          <div id="modeHint" class="composer-foot mx-auto">PLAN mode is read-only</div>
+        </div>
+      </main>
+
+      <!-- Right sidebar -->
+      <aside class="context-panel d-none d-xl-flex flex-column flex-shrink-0">
+        <section class="side-card">
+          <div class="side-card-head">
+            <span>Usage &amp; cost</span>
+            <i class="bi bi-activity"></i>
+          </div>
+          <div class="usage-top">
+            <span>Context window</span>
+            <span id="contextPct">0%</span>
+          </div>
+          <div class="progress context-progress" role="progressbar" aria-label="Context usage">
+            <div id="ctxBar" class="progress-bar"></div>
+          </div>
+          <div id="contextMeta" class="usage-sub">0 / 128k tokens</div>
+
+          <div class="usage-grid">
+            <div class="usage-stat">
+              <strong id="tokensIn">0</strong>
+              <span>tokens in</span>
+            </div>
+            <div class="usage-stat">
+              <strong id="tokensOut">0</strong>
+              <span>tokens out</span>
+            </div>
+            <div class="usage-stat">
+              <strong id="cachedTokens">0</strong>
+              <span>cached</span>
+            </div>
+          </div>
+
+          <div class="cost-line">
+            <span>Session cost</span>
+            <strong id="sessionCost">$0.0000</strong>
+          </div>
+          <div class="cost-line">
+            <span>Project cost</span>
+            <strong id="projectCost">$0.0000</strong>
+          </div>
+        </section>
+
+        <section class="side-card files-card">
+          <div class="side-card-head">
+            <span>Active context</span>
+            <span id="fileCount" class="count-pill">0</span>
+          </div>
+          <div id="fileList" class="file-list"></div>
+        </section>
+
+        <section class="side-card checklist-card d-flex flex-column">
+          <div class="side-card-head">
+            <span>Checklist</span>
+            <span id="checklistCount" class="count-pill">0/0</span>
+          </div>
+          <div class="progress checklist-progress">
+            <div id="checklistBar" class="progress-bar"></div>
+          </div>
+          <div id="checklistItems" class="checklist-items"></div>
+          <form id="checklistForm" class="checklist-form">
+            <input id="checklistInput" type="text" placeholder="Add a task…" autocomplete="off">
+            <button type="submit" title="Add task"><i class="bi bi-plus-lg"></i></button>
+          </form>
+        </section>
+      </aside>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── Add project modal ───────────────────────────────────────────── -->
+<div class="modal fade" id="projectModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <form id="projectForm">
+        <div class="modal-header">
+          <h5 class="modal-title"><i class="bi bi-folder-plus me-2"></i>Register a project</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <div class="mb-3">
+            <label for="projectPath" class="form-label">Local directory</label>
+            <input id="projectPath" class="form-control" placeholder="/home/you/code/my-project" required>
+            <div class="form-text">Forge is scoped to this working directory. Absolute paths or <code>~/…</code>.</div>
+          </div>
+          <div class="row g-3">
+            <div class="col-8">
+              <label for="projectName" class="form-label">Display name <span class="text-secondary">(optional)</span></label>
+              <input id="projectName" class="form-control" placeholder="my-project" autocomplete="off">
+            </div>
+            <div class="col-4">
+              <label for="projectColor" class="form-label">Color</label>
+              <input id="projectColor" type="color" class="form-control form-control-color w-100" value="#6c8cff">
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-accent">Register project</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- ── Settings modal ──────────────────────────────────────────────── -->
+<div class="modal fade" id="settingsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <form id="settingsForm">
+        <div class="modal-header">
+          <h5 class="modal-title"><i class="bi bi-gear me-2"></i>Settings</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body settings-body">
+          <div class="settings-section">
+            <div class="settings-section-title">OpenRouter</div>
+            <div class="mb-3">
+              <label for="apiKey" class="form-label">API key</label>
+              <div class="input-group">
+                <input id="apiKey" type="password" class="form-control" autocomplete="off"
+                       placeholder="sk-or-v1-…">
+                <button id="toggleKey" class="btn btn-outline-secondary" type="button" title="Show / hide">
+                  <i class="bi bi-eye"></i>
+                </button>
+              </div>
+              <div id="apiKeyHelp" class="form-text">Stored locally in <code>~/.forge/config.json</code>.</div>
+            </div>
+            <div>
+              <label for="baseURL" class="form-label">Base URL</label>
+              <input id="baseURL" class="form-control" spellcheck="false">
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">Defaults</div>
+            <div class="row g-3">
+              <div class="col-md-8">
+                <label for="defaultModel" class="form-label">Default model</label>
+                <input id="defaultModel" class="form-control" list="modelOptions" spellcheck="false">
+              </div>
+              <div class="col-md-4">
+                <label for="defaultMode" class="form-label">Default mode</label>
+                <select id="defaultMode" class="form-select">
+                  <option value="PLAN">PLAN</option>
+                  <option value="BUILD">BUILD</option>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label for="maxRead" class="form-label">Max file read (chars)</label>
+                <input id="maxRead" type="number" min="1000" max="2000000" class="form-control">
+              </div>
+              <div class="col-md-6">
+                <label for="bashTimeout" class="form-label">Bash timeout (seconds)</label>
+                <input id="bashTimeout" type="number" min="1" max="600" class="form-control">
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">Server</div>
+            <div class="row g-3">
+              <div class="col-md-7">
+                <label for="serverHost" class="form-label">Host</label>
+                <input id="serverHost" class="form-control" spellcheck="false">
+              </div>
+              <div class="col-md-5">
+                <label for="serverPort" class="form-label">Port</label>
+                <input id="serverPort" type="number" min="1" max="65535" class="form-control">
+              </div>
+              <div class="col-12">
+                <div class="form-check form-switch">
+                  <input id="autoBrowser" class="form-check-input" type="checkbox">
+                  <label class="form-check-label" for="autoBrowser">Open browser on startup</label>
+                </div>
+                <div class="form-text">Host/port changes take effect after restarting Forge.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-path">
+            Config file: <code id="configPath">~/.forge/config.json</code>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-accent">Save settings</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.10.0/highlight.min.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

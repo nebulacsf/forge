@@ -1,0 +1,506 @@
+package server
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"forge/internal/config"
+	"forge/internal/store"
+)
+
+// mockOpenRouter emits a deterministic two-round tool-calling stream.
+type mockOpenRouter struct {
+	requests       atomic.Int32
+	sawToolMessage atomic.Bool
+}
+
+func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n := m.requests.Add(1)
+	var req struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		StreamOptions map[string]any `json:"stream_options"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.StreamOptions["include_usage"] != true {
+		http.Error(w, "missing stream_options.include_usage", http.StatusBadRequest)
+		return
+	}
+	for _, msg := range req.Messages {
+		if msg.Role == "tool" {
+			m.sawToolMessage.Store(true)
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	sendRaw := func(s string) {
+		fmt.Fprintf(w, "data: %s\n\n", s)
+		flusher.Flush()
+	}
+
+	if n == 1 {
+		// Verify plan tools are present and build tools are not.
+		names := map[string]bool{}
+		for _, t := range req.Tools {
+			names[t.Function.Name] = true
+		}
+		if !names["read_file"] || !names["update_checklist"] || names["bash"] {
+			http.Error(w, "unexpected plan tool set", http.StatusBadRequest)
+			return
+		}
+		send(map[string]any{"id": "gen-1", "model": "mock/model", "choices": []any{
+			map[string]any{"delta": map[string]any{
+				"reasoning": "I should inspect the entry point.",
+				"tool_calls": []any{
+					map[string]any{"index": 0, "id": "call_read", "type": "function", "function": map[string]any{
+						"name": "read_file", "arguments": `{"path":`,
+					}},
+				},
+			}},
+		}})
+		send(map[string]any{"id": "gen-1", "choices": []any{
+			map[string]any{"delta": map[string]any{
+				"tool_calls": []any{
+					map[string]any{"index": 0, "function": map[string]any{"arguments": `"main.go"}`}},
+					map[string]any{"index": 1, "id": "call_todo", "type": "function", "function": map[string]any{
+						"name": "update_checklist", "arguments": `{"action":"add","task_text":"Report the entry point"}`,
+					}},
+				},
+			}},
+		}})
+		send(map[string]any{"id": "gen-1", "choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+		}})
+		send(map[string]any{"id": "gen-1", "choices": []any{}, "usage": map[string]any{
+			"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120, "cost": 0.001,
+			"prompt_tokens_details": map[string]any{"cached_tokens": 40},
+		}})
+		sendRaw("[DONE]")
+		return
+	}
+
+	send(map[string]any{"id": "gen-2", "choices": []any{
+		map[string]any{"delta": map[string]any{"reasoning": "Now summarize."}},
+	}})
+	send(map[string]any{"id": "gen-2", "choices": []any{
+		map[string]any{"delta": map[string]any{"content": "The entry point "}},
+	}})
+	send(map[string]any{"id": "gen-2", "choices": []any{
+		map[string]any{"delta": map[string]any{"content": "prints `hi`."}, "finish_reason": "stop"},
+	}})
+	send(map[string]any{"id": "gen-2", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90, "cost": 0.0005,
+	}})
+	sendRaw("[DONE]")
+}
+
+func TestChatStreamToolLoop(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FORGE_HOME", home)
+	projectDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(projectDir, "main.go"), []byte("package main\n\nfunc main() { println(\"hi\") }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := &mockOpenRouter{}
+	mockSrv := httptest.NewServer(mock)
+	defer mockSrv.Close()
+
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = mockSrv.URL
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(home, "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	project, err := st.CreateProject("Fixture", projectDir, "#22c55e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", "PLAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+
+	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Explain main.go"})
+	resp, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	events := readEvents(t, resp.Body)
+	types := map[string]int{}
+	var toolErr, checklistCount, finalContent, usageIn, usageOut int
+	var sessionEvent *store.Session
+	var sawFiles bool
+	for _, ev := range events {
+		typ, _ := ev["type"].(string)
+		types[typ]++
+		switch typ {
+		case "tool_end":
+			if ev["name"] == "read_file" {
+				result, _ := ev["result"].(string)
+				if !strings.Contains(result, "func main()") {
+					t.Errorf("read_file result missing content: %q", result)
+				}
+				if isErr, _ := ev["is_error"].(bool); isErr {
+					t.Error("read_file unexpectedly errored")
+				}
+				if files, ok := ev["files"].([]any); ok && len(files) > 0 {
+					sawFiles = true
+				}
+			}
+		case "checklist":
+			if items, ok := ev["checklist"].([]any); ok {
+				checklistCount = len(items)
+			}
+		case "usage":
+			in, _ := ev["session_tokens_in"].(float64)
+			out, _ := ev["session_tokens_out"].(float64)
+			usageIn, usageOut = int(in), int(out)
+		case "content":
+			if s, ok := ev["content"].(string); ok {
+				finalContent += len(s)
+			}
+		case "error":
+			toolErr++
+			t.Errorf("stream error event: %v", ev["message"])
+		case "done":
+			if raw, ok := ev["session"].(map[string]any); ok {
+				sessionEvent = &store.Session{
+					TokensIn:  int64(raw["tokens_in"].(float64)),
+					TokensOut: int64(raw["tokens_out"].(float64)),
+					CostUSD:   raw["cost_usd"].(float64),
+				}
+			}
+		}
+	}
+	if types["round_start"] != 2 {
+		t.Errorf("round_start count = %d, want 2", types["round_start"])
+	}
+	if types["reasoning"] < 2 {
+		t.Errorf("reasoning events = %d, want >=2", types["reasoning"])
+	}
+	if types["tool_start"] != 2 || types["tool_end"] != 2 {
+		t.Errorf("tool events start/end = %d/%d, want 2/2", types["tool_start"], types["tool_end"])
+	}
+	if checklistCount != 1 {
+		t.Errorf("checklist count = %d, want 1", checklistCount)
+	}
+	if !sawFiles {
+		t.Error("tool_end did not include file actions")
+	}
+	if finalContent == 0 {
+		t.Error("no content events received")
+	}
+	if usageIn != 180 || usageOut != 30 {
+		t.Errorf("usage = %d/%d, want 180/30", usageIn, usageOut)
+	}
+	if sessionEvent == nil || sessionEvent.TokensIn != 180 || sessionEvent.TokensOut != 30 {
+		t.Errorf("done session usage = %+v", sessionEvent)
+	}
+	if !mock.sawToolMessage.Load() {
+		t.Error("second provider call did not include tool result messages")
+	}
+	if toolErr != 0 {
+		t.Errorf("saw %d error events", toolErr)
+	}
+
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("message count = %d, want 3 (user, assistant tools, assistant final)", len(msgs))
+	}
+	if msgs[0].Role != "user" || !strings.Contains(msgs[1].ToolCalls, `"call_read"`) {
+		t.Errorf("unexpected persisted messages: %+v", msgs)
+	}
+	items, _ := st.ListChecklist(session.ID)
+	if len(items) != 1 || !strings.Contains(items[0].TaskText, "Report") {
+		t.Errorf("checklist not persisted: %+v", items)
+	}
+	final, _ := st.GetSession(session.ID)
+	if final.Title != "Explain main.go" {
+		t.Errorf("auto title = %q", final.Title)
+	}
+	if final.Mode != "PLAN" || final.CostUSD < 0.0014 {
+		t.Errorf("session state = %+v", final)
+	}
+}
+
+// buildMockOpenRouter verifies BUILD tool exposure and writes a file through
+// the agent loop before answering.
+type buildMockOpenRouter struct {
+	requests       atomic.Int32
+	sawToolMessage atomic.Bool
+}
+
+func (m *buildMockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n := m.requests.Add(1)
+	var req struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	names := map[string]bool{}
+	for _, t := range req.Tools {
+		names[t.Function.Name] = true
+	}
+	if !names["write_file"] || !names["patch_file"] || !names["bash"] || !names["read_file"] {
+		http.Error(w, "unexpected build tool set", http.StatusBadRequest)
+		return
+	}
+	for _, msg := range req.Messages {
+		if msg.Role == "tool" {
+			m.sawToolMessage.Store(true)
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	if n == 1 {
+		writeArgs := `{"path":"notes/hello.txt","content":"hello forge\n"}`
+		bashArgs := `{"command":"cat notes/hello.txt"}`
+		send(map[string]any{"id": "gen-b1", "choices": []any{
+			map[string]any{"delta": map[string]any{
+				"reasoning": "Create the file, then verify it.",
+				"tool_calls": []any{
+					map[string]any{"index": 0, "id": "call_write", "type": "function", "function": map[string]any{
+						"name": "write_file", "arguments": writeArgs[:10],
+					}},
+				},
+			}},
+		}})
+		send(map[string]any{"id": "gen-b1", "choices": []any{
+			map[string]any{"delta": map[string]any{
+				"tool_calls": []any{
+					map[string]any{"index": 0, "function": map[string]any{"arguments": writeArgs[10:]}},
+					map[string]any{"index": 1, "id": "call_bash", "type": "function", "function": map[string]any{
+						"name": "bash", "arguments": bashArgs,
+					}},
+				},
+			}},
+		}})
+		send(map[string]any{"id": "gen-b1", "choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+		}})
+		send(map[string]any{"id": "gen-b1", "choices": []any{}, "usage": map[string]any{
+			"prompt_tokens": 50, "completion_tokens": 12, "total_tokens": 62, "cost": 0.0002,
+		}})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	send(map[string]any{"id": "gen-b2", "choices": []any{
+		map[string]any{"delta": map[string]any{"content": "Created `notes/hello.txt`."}},
+	}})
+	send(map[string]any{"id": "gen-b2", "choices": []any{
+		map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+	}})
+	send(map[string]any{"id": "gen-b2", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 40, "completion_tokens": 8, "total_tokens": 48, "cost": 0.0001,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func TestChatStreamBuildTools(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FORGE_HOME", home)
+	projectDir := t.TempDir()
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := &buildMockOpenRouter{}
+	mockSrv := httptest.NewServer(mock)
+	defer mockSrv.Close()
+
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = mockSrv.URL
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(home, "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	project, err := st.CreateProject("Build", projectDir, "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", "BUILD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+
+	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Write a note"})
+	resp, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+
+	events := readEvents(t, resp.Body)
+	var writeOK, bashOK, sawModified bool
+	for _, ev := range events {
+		if ev["type"] == "error" {
+			t.Errorf("stream error event: %v", ev["message"])
+		}
+		if ev["type"] != "tool_end" {
+			continue
+		}
+		name, _ := ev["name"].(string)
+		result, _ := ev["result"].(string)
+		if isErr, _ := ev["is_error"].(bool); isErr {
+			t.Errorf("tool %s errored: %s", name, result)
+		}
+		switch name {
+		case "write_file":
+			writeOK = strings.Contains(result, "Wrote notes/hello.txt")
+		case "bash":
+			bashOK = strings.Contains(result, "hello forge") && strings.Contains(result, "exit code: 0")
+		}
+		if files, ok := ev["files"].([]any); ok {
+			for _, f := range files {
+				if fm, ok := f.(map[string]any); ok && fm["action"] == "modified" {
+					sawModified = true
+				}
+			}
+		}
+	}
+	if !writeOK {
+		t.Error("write_file tool_end missing success output")
+	}
+	if !bashOK {
+		t.Error("bash tool_end missing command output")
+	}
+	if !sawModified {
+		t.Error("no modified file action emitted")
+	}
+	if !mock.sawToolMessage.Load() {
+		t.Error("second provider call did not include tool results")
+	}
+
+	written, err := os.ReadFile(filepath.Join(projectDir, "notes", "hello.txt"))
+	if err != nil {
+		t.Fatalf("file was not written: %v", err)
+	}
+	if string(written) != "hello forge\n" {
+		t.Errorf("file content = %q", written)
+	}
+
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("message count = %d, want 3", len(msgs))
+	}
+	if !strings.Contains(msgs[1].ToolCalls, `"call_write"`) || !strings.Contains(msgs[1].ToolCalls, `"status":"done"`) {
+		t.Errorf("tool calls not persisted: %s", msgs[1].ToolCalls)
+	}
+	final, _ := st.GetSession(session.ID)
+	if final.Mode != "BUILD" || final.TokensIn != 90 {
+		t.Errorf("session state = %+v", final)
+	}
+}
+
+func readEvents(t *testing.T, r io.Reader) []map[string]any {
+	t.Helper()
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	var out []map[string]any
+	deadline := time.Now().Add(10 * time.Second)
+	for scanner.Scan() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out reading events")
+		}
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &ev); err != nil {
+			t.Fatalf("bad event %q: %v", line, err)
+		}
+		out = append(out, ev)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
