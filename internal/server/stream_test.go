@@ -879,3 +879,292 @@ func readEvents(t *testing.T, r io.Reader) []map[string]any {
 	}
 	return out
 }
+
+// ---------------------------------------------------------------------------
+// Turn budget, auto-continue and loop guard
+
+func boolValue(v bool) *bool { return &v }
+
+func countEvents(events []map[string]any, typ string) int {
+	n := 0
+	for _, ev := range events {
+		if ev["type"] == typ {
+			n++
+		}
+	}
+	return n
+}
+
+func findEvent(events []map[string]any, typ string) map[string]any {
+	for _, ev := range events {
+		if ev["type"] == typ {
+			return ev
+		}
+	}
+	return nil
+}
+
+// toolLoopMock always asks for exactly one tool call per round. The args
+// callback decides whether rounds look identical (loop) or different (progress).
+type toolLoopMock struct {
+	requests atomic.Int32
+	tool     string
+	args     func(n int) string
+}
+
+func (m *toolLoopMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n := int(m.requests.Add(1))
+	_, _ = io.Copy(io.Discard, r.Body)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	send(map[string]any{"id": fmt.Sprintf("gen-%d", n), "choices": []any{
+		map[string]any{"delta": map[string]any{
+			"tool_calls": []any{
+				map[string]any{"index": 0, "id": fmt.Sprintf("call_%d", n), "type": "function", "function": map[string]any{
+					"name": m.tool, "arguments": m.args(n),
+				}},
+			},
+		}},
+	}})
+	send(map[string]any{"id": fmt.Sprintf("gen-%d", n), "choices": []any{
+		map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+	}})
+	send(map[string]any{"id": fmt.Sprintf("gen-%d", n), "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.0001,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// finalAnswerMock answers once without requesting tools.
+type finalAnswerMock struct{}
+
+func (m *finalAnswerMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.Copy(io.Discard, r.Body)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	send(map[string]any{"id": "gen-final", "choices": []any{
+		map[string]any{"delta": map[string]any{"content": "All done."}},
+	}})
+	send(map[string]any{"id": "gen-final", "choices": []any{
+		map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+	}})
+	send(map[string]any{"id": "gen-final", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "cost": 0.0001,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func chatBudgetFixture(t *testing.T, mode string, mock http.Handler, tweak func(*config.Config)) (*httptest.Server, *store.Store, store.Session) {
+	t.Helper()
+	cfg, st, _ := modelsFixture(t)
+	projectDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(projectDir, "main.go"), []byte(strings.Repeat("// line\n", 60)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "file.go"), []byte("package f\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(mock)
+	t.Cleanup(upstream.Close)
+
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = upstream.URL
+	if tweak != nil {
+		tweak(&c)
+	}
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+
+	project, err := st.CreateProject("Budget", projectDir, "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	t.Cleanup(app.Close)
+	return app, st, session
+}
+
+func postChatEvents(t *testing.T, app *httptest.Server, body map[string]any) []map[string]any {
+	t.Helper()
+	payload, _ := json.Marshal(body)
+	resp, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, data)
+	}
+	return readEvents(t, resp.Body)
+}
+
+func TestChatStreamPausesAtCheckpoint(t *testing.T) {
+	mock := &toolLoopMock{tool: "update_checklist", args: func(n int) string {
+		return fmt.Sprintf(`{"action":"add","task_text":"step %d"}`, n)
+	}}
+	app, st, session := chatBudgetFixture(t, "PLAN", mock, func(c *config.Config) {
+		c.Defaults.MaxToolRounds = 2
+		c.Defaults.MaxTurnRounds = 4
+		c.Defaults.AutoContinue = boolValue(false)
+	})
+
+	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "work"})
+
+	if got := countEvents(events, "round_start"); got != 2 {
+		t.Errorf("round_start = %d, want 2", got)
+	}
+	if got := countEvents(events, "limit"); got != 0 {
+		t.Errorf("limit = %d, want 0", got)
+	}
+	if got := countEvents(events, "done"); got != 1 {
+		t.Errorf("done = %d, want 1", got)
+	}
+	cp := findEvent(events, "checkpoint")
+	if cp == nil || cp["reason"] != "paused" {
+		t.Fatalf("checkpoint = %+v, want reason paused", cp)
+	}
+	if mock.requests.Load() != 2 {
+		t.Errorf("provider requests = %d, want 2", mock.requests.Load())
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Errorf("messages = %d, want 3 (user + 2 tool rounds)", len(msgs))
+	}
+}
+
+func TestChatStreamAutoContinues(t *testing.T) {
+	mock := &toolLoopMock{tool: "update_checklist", args: func(n int) string {
+		return fmt.Sprintf(`{"action":"add","task_text":"step %d"}`, n)
+	}}
+	app, st, session := chatBudgetFixture(t, "PLAN", mock, func(c *config.Config) {
+		c.Defaults.MaxToolRounds = 2
+		c.Defaults.MaxTurnRounds = 4
+		c.Defaults.AutoContinue = boolValue(true)
+	})
+
+	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "work"})
+
+	if got := countEvents(events, "round_start"); got != 4 {
+		t.Errorf("round_start = %d, want 4", got)
+	}
+	if got := countEvents(events, "checkpoint"); got != 1 {
+		t.Errorf("checkpoint = %d, want 1", got)
+	}
+	cp := findEvent(events, "checkpoint")
+	if cp == nil || cp["reason"] != "auto" {
+		t.Fatalf("checkpoint = %+v, want reason auto", cp)
+	}
+	limit := findEvent(events, "limit")
+	if limit == nil || limit["reason"] != "turn_budget" {
+		t.Fatalf("limit = %+v, want reason turn_budget", limit)
+	}
+	if got := countEvents(events, "done"); got != 1 {
+		t.Errorf("done = %d, want 1", got)
+	}
+	if got := countEvents(events, "error"); got != 0 {
+		t.Errorf("error events = %d, want 0", got)
+	}
+	if mock.requests.Load() != 4 {
+		t.Errorf("provider requests = %d, want 4", mock.requests.Load())
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 5 {
+		t.Errorf("messages = %d, want 5 (user + 4 tool rounds)", len(msgs))
+	}
+}
+
+func TestChatStreamLoopGuardStopsRepeatedCall(t *testing.T) {
+	mock := &toolLoopMock{tool: "read_file", args: func(int) string {
+		return `{"path":"main.go","start_line":1,"end_line":20}`
+	}}
+	app, st, session := chatBudgetFixture(t, "PLAN", mock, nil)
+
+	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "inspect"})
+
+	if mock.requests.Load() != int32(loopAbortRepeats) {
+		t.Errorf("provider requests = %d, want %d", mock.requests.Load(), loopAbortRepeats)
+	}
+	if got := countEvents(events, "round_start"); got != loopAbortRepeats {
+		t.Errorf("round_start = %d, want %d", got, loopAbortRepeats)
+	}
+	limit := findEvent(events, "limit")
+	if limit == nil || limit["reason"] != "loop_detected" {
+		t.Fatalf("limit = %+v, want reason loop_detected", limit)
+	}
+	if got := countEvents(events, "error"); got != 0 {
+		t.Errorf("error events = %d, want 0 (a loop stop is a pause, not a failure)", got)
+	}
+	if got := countEvents(events, "done"); got != 1 {
+		t.Errorf("done = %d, want 1", got)
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != loopAbortRepeats+1 {
+		t.Errorf("messages = %d, want %d (no tool result is lost)", len(msgs), loopAbortRepeats+1)
+	}
+}
+
+func TestChatStreamToolErrorLimit(t *testing.T) {
+	mock := &toolLoopMock{tool: "patch_file", args: func(n int) string {
+		return fmt.Sprintf(`{"path":"file.go","search":"missing-%d","replace":"x"}`, n)
+	}}
+	app, _, session := chatBudgetFixture(t, "BUILD", mock, nil)
+
+	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "patch it"})
+
+	if mock.requests.Load() != int32(errAbortStreak) {
+		t.Errorf("provider requests = %d, want %d", mock.requests.Load(), errAbortStreak)
+	}
+	limit := findEvent(events, "limit")
+	if limit == nil || limit["reason"] != "tool_error_limit" {
+		t.Fatalf("limit = %+v, want reason tool_error_limit", limit)
+	}
+}
+
+func TestChatStreamContinueFlag(t *testing.T) {
+	app, st, session := chatBudgetFixture(t, "PLAN", &finalAnswerMock{}, nil)
+
+	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "continue": true})
+	if got := countEvents(events, "error"); got != 0 {
+		t.Errorf("error events = %d, want 0", got)
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2 (synthetic user + assistant)", len(msgs))
+	}
+	if msgs[0].Role != "user" || msgs[0].Content != continuePrompt {
+		t.Errorf("first message = %+v, want the continue prompt", msgs[0])
+	}
+}

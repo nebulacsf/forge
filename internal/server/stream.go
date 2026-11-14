@@ -17,13 +17,24 @@ import (
 	"forge/internal/tools"
 )
 
-const maxToolRounds = 24
+const (
+	defaultSegmentRounds = 24
+	defaultTurnRounds    = 96
+	continuePrompt       = "Continue from where you left off."
+	continuationNote     = "You are continuing a long task from a checkpoint. Resume from the current checklist and conversation. " +
+		"Do not repeat completed work or re-read files you have already read. Keep going until the task is actually finished."
+)
 
 type chatEvent struct {
-	Type    string `json:"type"`
-	Round   int    `json:"round,omitempty"`
-	Content string `json:"content,omitempty"`
-	Message string `json:"message,omitempty"`
+	Type        string `json:"type"`
+	Round       int    `json:"round,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
+	Segment     int    `json:"segment,omitempty"`
+	SegmentSize int    `json:"segment_size,omitempty"`
+	NextRound   int    `json:"next_round,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Content     string `json:"content,omitempty"`
+	Message     string `json:"message,omitempty"`
 
 	ID         string `json:"id,omitempty"`
 	Name       string `json:"name,omitempty"`
@@ -78,6 +89,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID int64  `json:"session_id"`
 		Content   string `json:"content"`
+		Continue  bool   `json:"continue"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		apiError(w, http.StatusBadRequest, err.Error())
@@ -88,6 +100,9 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Content = strings.TrimSpace(body.Content)
+	if body.Continue && body.Content == "" {
+		body.Content = continuePrompt
+	}
 	if body.Content == "" {
 		apiError(w, http.StatusBadRequest, "message cannot be empty")
 		return
@@ -181,213 +196,332 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	client := llm.New(cfg.Providers.OpenRouter.APIKey, cfg.Providers.OpenRouter.BaseURL)
 	specs := tools.Specs(session.Mode)
 
-	for round := 1; round <= maxToolRounds; round++ {
-		if ctx.Err() != nil {
-			s.finishCancelled(stream, session.ID, "", "")
-			return
-		}
-		if err := stream.send(chatEvent{Type: "round_start", Round: round}); err != nil {
-			s.persistPartial(session.ID, "", "")
-			return
-		}
+	segmentSize := cfg.Defaults.MaxToolRounds
+	if segmentSize <= 0 {
+		segmentSize = defaultSegmentRounds
+	}
+	turnLimit := cfg.Defaults.MaxTurnRounds
+	if turnLimit <= 0 {
+		turnLimit = defaultTurnRounds
+	}
+	if turnLimit < segmentSize {
+		turnLimit = segmentSize
+	}
+	autoContinue := cfg.Defaults.AutoContinue == nil || *cfg.Defaults.AutoContinue
+	turnCostLimit := cfg.Defaults.MaxTurnCostUSD
 
-		if round > 1 {
-			if fresh, err := tools.CurrentRepoOutline(s.store, project.Path); err == nil {
-				outline = fresh
-			}
-		}
-		checklist, _ := s.store.ListChecklist(session.ID)
-		system := buildSystemPrompt(project, session, checklist, outline)
-		history, err := s.buildHistory(session.ID, system)
-		if err != nil {
-			stream.fail("Could not load conversation: " + err.Error())
-			return
-		}
-		req := llm.ChatRequest{
-			Model:    session.Model,
-			Messages: history,
-			Tools:    specs,
-		}
-		logx.Debug("round request", "session", session.ID, "round", round,
-			"messages", len(history), "tools", len(specs))
+	totalRounds := 0
+	segment := 1
+	turnCost := 0.0
+	var continueNote, guardNote string
+	guard := newLoopGuard()
 
-		result, streamErr := client.StreamChat(ctx, req, func(d llm.Delta) error {
-			kind := d.Kind
-			if kind != "reasoning" {
-				kind = "content"
-			}
-			return stream.send(chatEvent{Type: kind, Round: round, Content: d.Text})
-		})
-
-		if streamErr != nil {
-			if ctx.Err() != nil || errors.Is(streamErr, context.Canceled) {
-				if result != nil {
-					s.persistPartial(session.ID, result.Reasoning, result.Content)
-				}
-				logx.Info("turn cancelled", "session", session.ID, "round", round,
-					"duration", time.Since(turnStart).Round(time.Millisecond).String())
+	for {
+		var abortReason, abortMessage string
+		for segRound := 1; segRound <= segmentSize && totalRounds < turnLimit; segRound++ {
+			totalRounds++
+			if ctx.Err() != nil {
 				s.finishCancelled(stream, session.ID, "", "")
 				return
 			}
-			if result != nil {
-				s.persistPartial(session.ID, result.Reasoning, result.Content)
+			if err := stream.send(chatEvent{
+				Type: "round_start", Round: totalRounds, Limit: turnLimit,
+				Segment: segment, SegmentSize: segmentSize,
+			}); err != nil {
+				s.persistPartial(session.ID, "", "")
+				return
 			}
-			msg := streamErr.Error()
-			if errors.Is(streamErr, context.DeadlineExceeded) {
-				msg = "The model request timed out."
-			}
-			logx.Warn("provider stream failed", "session", session.ID, "round", round, "error", msg)
-			stream.fail(msg)
-			s.sendDone(stream, session.ID, false)
-			return
-		}
-		if result == nil {
-			logx.Warn("provider returned no result", "session", session.ID, "round", round)
-			stream.fail("The provider returned an empty response.")
-			s.sendDone(stream, session.ID, false)
-			return
-		}
 
-		if result.Usage.PromptTokens > 0 || result.Usage.CompletionTokens > 0 || result.Usage.Cost > 0 {
-			if err := s.store.AddUsage(session.ID,
-				result.Usage.PromptTokens, result.Usage.CompletionTokens,
-				result.Usage.PromptTokensDetails.CachedTokens, result.Usage.Cost); err != nil {
-				logx.Error("persist usage failed", "session", session.ID, "error", err)
+			if totalRounds > 1 {
+				if fresh, err := tools.CurrentRepoOutline(s.store, project.Path); err == nil {
+					outline = fresh
+				}
 			}
-		}
-		logx.Debug("round finished", "session", session.ID, "round", round,
-			"content_chars", len(result.Content), "reasoning_chars", len(result.Reasoning),
-			"tool_calls", len(result.ToolCalls), "prompt_tokens", result.Usage.PromptTokens,
-			"completion_tokens", result.Usage.CompletionTokens, "cost", result.Usage.Cost)
-		if fresh, err := s.store.GetSession(session.ID); err == nil {
-			session = fresh
-		}
-		projectCost := project.TotalCostUSD
-		if p, err := s.store.GetProject(project.ID); err == nil {
-			projectCost = p.TotalCostUSD
-		}
-		if err := stream.send(chatEvent{
-			Type:                "usage",
-			Round:               round,
-			PromptTokens:        result.Usage.PromptTokens,
-			CompletionTokens:    result.Usage.CompletionTokens,
-			TotalTokens:         result.Usage.TotalTokens,
-			CachedTokens:        result.Usage.PromptTokensDetails.CachedTokens,
-			ReasoningTokens:     result.Usage.CompletionTokensDetails.ReasoningTokens,
-			CostUSD:             result.Usage.Cost,
-			ContextTokens:       result.Usage.PromptTokens + result.Usage.CompletionTokens,
-			SessionTokensIn:     session.TokensIn,
-			SessionTokensOut:    session.TokensOut,
-			SessionCachedTokens: session.CachedTokens,
-			SessionCostUSD:      session.CostUSD,
-			ProjectCostUSD:      projectCost,
-		}); err != nil {
-			s.persistPartial(session.ID, result.Reasoning, result.Content)
-			return
-		}
+			checklist, _ := s.store.ListChecklist(session.ID)
+			system := buildSystemPrompt(project, session, checklist, outline, segmentSize, turnLimit)
+			history, err := s.buildHistory(session.ID, system)
+			if err != nil {
+				stream.fail("Could not load conversation: " + err.Error())
+				return
+			}
+			// Notes below are ephemeral: they steer the next request without
+			// polluting the persisted conversation.
+			if continueNote != "" {
+				history = append(history, llm.Message{Role: "user", Content: continueNote})
+				continueNote = ""
+			}
+			if guardNote != "" {
+				history = append(history, llm.Message{Role: "user", Content: guardNote})
+				guardNote = ""
+			}
+			req := llm.ChatRequest{
+				Model:    session.Model,
+				Messages: history,
+				Tools:    specs,
+			}
+			logx.Debug("round request", "session", session.ID, "round", totalRounds,
+				"segment", segment, "messages", len(history), "tools", len(specs))
 
-		if len(result.ToolCalls) == 0 {
-			hasContent := strings.TrimSpace(result.Content) != ""
-			hasReasoning := strings.TrimSpace(result.Reasoning) != ""
-			if !hasContent && !hasReasoning {
-				logx.Warn("empty completion", "session", session.ID, "round", round, "model", session.Model)
-				stream.fail("The model returned an empty response. Try another model or send the message again.")
+			result, streamErr := client.StreamChat(ctx, req, func(d llm.Delta) error {
+				kind := d.Kind
+				if kind != "reasoning" {
+					kind = "content"
+				}
+				return stream.send(chatEvent{Type: kind, Round: totalRounds, Content: d.Text})
+			})
+
+			if streamErr != nil {
+				if ctx.Err() != nil || errors.Is(streamErr, context.Canceled) {
+					if result != nil {
+						s.persistPartial(session.ID, result.Reasoning, result.Content)
+					}
+					logx.Info("turn cancelled", "session", session.ID, "round", totalRounds,
+						"duration", time.Since(turnStart).Round(time.Millisecond).String())
+					s.finishCancelled(stream, session.ID, "", "")
+					return
+				}
+				if result != nil {
+					s.persistPartial(session.ID, result.Reasoning, result.Content)
+				}
+				msg := streamErr.Error()
+				if errors.Is(streamErr, context.DeadlineExceeded) {
+					msg = "The model request timed out."
+				}
+				if looksLikeContextOverflow(msg) {
+					msg += " The conversation is too large for this model; run /compact to summarize it and continue."
+				}
+				logx.Warn("provider stream failed", "session", session.ID, "round", totalRounds, "error", msg)
+				stream.fail(msg)
 				s.sendDone(stream, session.ID, false)
 				return
 			}
-			if _, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, ""); err != nil {
-				logx.Error("persist assistant response failed", "session", session.ID, "error", err)
-				stream.fail("Could not save response: " + err.Error())
+			if result == nil {
+				logx.Warn("provider returned no result", "session", session.ID, "round", totalRounds)
+				stream.fail("The provider returned an empty response.")
+				s.sendDone(stream, session.ID, false)
 				return
 			}
-			if !hasContent && hasReasoning {
-				logx.Warn("model returned reasoning without a final answer",
-					"session", session.ID, "round", round, "model", session.Model)
-			}
-			logx.Info("turn done", "session", session.ID, "rounds", round,
-				"reasoning_only", !hasContent && hasReasoning,
-				"duration", time.Since(turnStart).Round(time.Millisecond).String(),
-				"tokens_in", session.TokensIn, "tokens_out", session.TokensOut, "cost", session.CostUSD)
-			s.sendDone(stream, session.ID, !hasContent && hasReasoning)
-			return
-		}
 
-		calls := result.ToolCalls
-		for i := range calls {
-			call := &calls[i]
-			if call.ID == "" {
-				call.ID = fmt.Sprintf("call_%d_%d", round, i)
+			if result.Usage.PromptTokens > 0 || result.Usage.CompletionTokens > 0 || result.Usage.Cost > 0 {
+				if err := s.store.AddUsage(session.ID,
+					result.Usage.PromptTokens, result.Usage.CompletionTokens,
+					result.Usage.PromptTokensDetails.CachedTokens, result.Usage.Cost); err != nil {
+					logx.Error("persist usage failed", "session", session.ID, "error", err)
+				}
 			}
-			if call.Type == "" {
-				call.Type = "function"
+			turnCost += result.Usage.Cost
+			logx.Debug("round finished", "session", session.ID, "round", totalRounds,
+				"content_chars", len(result.Content), "reasoning_chars", len(result.Reasoning),
+				"tool_calls", len(result.ToolCalls), "prompt_tokens", result.Usage.PromptTokens,
+				"completion_tokens", result.Usage.CompletionTokens, "cost", result.Usage.Cost)
+			if fresh, err := s.store.GetSession(session.ID); err == nil {
+				session = fresh
 			}
-			// Validate the mode before announcing or executing anything, so the
-			// UI never shows a tool starting only to have it denied afterwards.
-			if !tools.Allowed(session.Mode, call.Function.Name) {
-				reason := tools.ModeBlockReason(session.Mode, call.Function.Name)
-				call.Result = reason
-				call.Status = "blocked"
-				logx.Warn("tool blocked by mode", "session", session.ID, "round", round,
-					"tool", call.Function.Name, "mode", session.Mode)
+			projectCost := project.TotalCostUSD
+			if p, err := s.store.GetProject(project.ID); err == nil {
+				projectCost = p.TotalCostUSD
+			}
+			if err := stream.send(chatEvent{
+				Type:                "usage",
+				Round:               totalRounds,
+				PromptTokens:        result.Usage.PromptTokens,
+				CompletionTokens:    result.Usage.CompletionTokens,
+				TotalTokens:         result.Usage.TotalTokens,
+				CachedTokens:        result.Usage.PromptTokensDetails.CachedTokens,
+				ReasoningTokens:     result.Usage.CompletionTokensDetails.ReasoningTokens,
+				CostUSD:             result.Usage.Cost,
+				ContextTokens:       result.Usage.PromptTokens + result.Usage.CompletionTokens,
+				SessionTokensIn:     session.TokensIn,
+				SessionTokensOut:    session.TokensOut,
+				SessionCachedTokens: session.CachedTokens,
+				SessionCostUSD:      session.CostUSD,
+				ProjectCostUSD:      projectCost,
+			}); err != nil {
+				s.persistPartial(session.ID, result.Reasoning, result.Content)
+				return
+			}
+
+			if len(result.ToolCalls) == 0 {
+				hasContent := strings.TrimSpace(result.Content) != ""
+				hasReasoning := strings.TrimSpace(result.Reasoning) != ""
+				if !hasContent && !hasReasoning {
+					logx.Warn("empty completion", "session", session.ID, "round", totalRounds, "model", session.Model)
+					stream.fail("The model returned an empty response. Try another model or send the message again.")
+					s.sendDone(stream, session.ID, false)
+					return
+				}
+				if _, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, ""); err != nil {
+					logx.Error("persist assistant response failed", "session", session.ID, "error", err)
+					stream.fail("Could not save response: " + err.Error())
+					return
+				}
+				if !hasContent && hasReasoning {
+					logx.Warn("model returned reasoning without a final answer",
+						"session", session.ID, "round", totalRounds, "model", session.Model)
+				}
+				logx.Info("turn done", "session", session.ID, "rounds", totalRounds, "segments", segment,
+					"reasoning_only", !hasContent && hasReasoning,
+					"duration", time.Since(turnStart).Round(time.Millisecond).String(),
+					"tokens_in", session.TokensIn, "tokens_out", session.TokensOut, "cost", session.CostUSD)
+				s.sendDone(stream, session.ID, !hasContent && hasReasoning)
+				return
+			}
+
+			calls := result.ToolCalls
+			for i := range calls {
+				call := &calls[i]
+				if call.ID == "" {
+					call.ID = fmt.Sprintf("call_%d_%d", totalRounds, i)
+				}
+				if call.Type == "" {
+					call.Type = "function"
+				}
+				// Validate the mode before announcing or executing anything, so the
+				// UI never shows a tool starting only to have it denied afterwards.
+				if !tools.Allowed(session.Mode, call.Function.Name) {
+					reason := tools.ModeBlockReason(session.Mode, call.Function.Name)
+					call.Result = reason
+					call.Status = "blocked"
+					logx.Warn("tool blocked by mode", "session", session.ID, "round", totalRounds,
+						"tool", call.Function.Name, "mode", session.Mode)
+					if err := stream.send(chatEvent{
+						Type: "tool_blocked", Round: totalRounds, ID: call.ID, Name: call.Function.Name,
+						Message: reason, Status: "blocked",
+					}); err != nil {
+						s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
+						return
+					}
+					if verdict := guard.observe(*call, tools.Result{Content: reason, IsError: true}); verdict.Action != guardOK {
+						if verdict.Action == guardAbort {
+							if abortReason == "" {
+								abortReason, abortMessage = verdict.Reason, verdict.Note
+							}
+						} else {
+							guardNote = verdict.Note
+						}
+					}
+					continue
+				}
 				if err := stream.send(chatEvent{
-					Type: "tool_blocked", Round: round, ID: call.ID, Name: call.Function.Name,
-					Message: reason, Status: "blocked",
+					Type: "tool_start", Round: totalRounds, ID: call.ID, Name: call.Function.Name,
+					Arguments: call.Function.Arguments, Status: "running",
 				}); err != nil {
 					s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
 					return
 				}
-				continue
-			}
-			if err := stream.send(chatEvent{
-				Type: "tool_start", Round: round, ID: call.ID, Name: call.Function.Name,
-				Arguments: call.Function.Arguments, Status: "running",
-			}); err != nil {
-				s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
-				return
-			}
-			started := time.Now()
-			toolResult := mgr.Execute(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments))
-			elapsed := time.Since(started).Milliseconds()
-			if toolResult.IsError {
-				logx.Warn("tool failed", "session", session.ID, "round", round, "tool", call.Function.Name,
-					"duration_ms", elapsed, "error", logx.Preview(toolResult.Content, 200))
-			} else {
-				logx.Debug("tool finished", "session", session.ID, "round", round, "tool", call.Function.Name,
-					"duration_ms", elapsed, "result_chars", len(toolResult.Content))
-			}
-			call.Result = toolResult.Content
-			call.Status = "done"
-			if toolResult.IsError {
-				call.Status = "error"
-			}
-			call.DurationMS = elapsed
-			if err := stream.send(chatEvent{
-				Type: "tool_end", Round: round, ID: call.ID, Name: call.Function.Name,
-				Result: toolResult.Content, IsError: toolResult.IsError, DurationMS: elapsed,
-				Status: call.Status, Files: toolResult.Files,
-			}); err != nil {
-				s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
-				return
-			}
-			if toolResult.ChecklistChanged {
-				if items, err := s.store.ListChecklist(session.ID); err == nil {
-					stream.send(chatEvent{Type: "checklist", Checklist: &items})
+				started := time.Now()
+				toolResult := mgr.Execute(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+				elapsed := time.Since(started).Milliseconds()
+				if toolResult.IsError {
+					logx.Warn("tool failed", "session", session.ID, "round", totalRounds, "tool", call.Function.Name,
+						"duration_ms", elapsed, "error", logx.Preview(toolResult.Content, 200))
+				} else {
+					logx.Debug("tool finished", "session", session.ID, "round", totalRounds, "tool", call.Function.Name,
+						"duration_ms", elapsed, "result_chars", len(toolResult.Content))
 				}
+				if verdict := guard.observe(*call, toolResult); verdict.Action != guardOK {
+					if verdict.Action == guardAbort {
+						if abortReason == "" {
+							abortReason, abortMessage = verdict.Reason, verdict.Note
+						}
+					} else {
+						guardNote = verdict.Note
+					}
+				}
+				call.Result = toolResult.Content
+				call.Status = "done"
+				if toolResult.IsError {
+					call.Status = "error"
+				}
+				call.DurationMS = elapsed
+				if err := stream.send(chatEvent{
+					Type: "tool_end", Round: totalRounds, ID: call.ID, Name: call.Function.Name,
+					Result: toolResult.Content, IsError: toolResult.IsError, DurationMS: elapsed,
+					Status: call.Status, Files: toolResult.Files,
+				}); err != nil {
+					s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
+					return
+				}
+				if toolResult.ChecklistChanged {
+					if items, err := s.store.ListChecklist(session.ID); err == nil {
+						stream.send(chatEvent{Type: "checklist", Checklist: &items})
+					}
+				}
+			}
+
+			if _, err := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); err != nil {
+				stream.fail("Could not save tool results: " + err.Error())
+				return
+			}
+			if ctx.Err() != nil {
+				s.finishCancelled(stream, session.ID, "", "")
+				return
+			}
+
+			// Stop conditions that are cheaper to evaluate after the round has
+			// been persisted, so no tool result is ever lost.
+			if abortReason != "" {
+				logx.Warn("agent guard stopped the turn", "session", session.ID,
+					"reason", abortReason, "round", totalRounds)
+				stream.send(chatEvent{
+					Type: "limit", Round: totalRounds, Limit: turnLimit,
+					Segment: segment, SegmentSize: segmentSize,
+					Reason: abortReason, Message: abortMessage,
+				})
+				s.sendDone(stream, session.ID, false)
+				return
+			}
+			if turnCostLimit > 0 && turnCost >= turnCostLimit {
+				logx.Warn("turn cost budget reached", "session", session.ID,
+					"cost", turnCost, "limit", turnCostLimit, "round", totalRounds)
+				stream.send(chatEvent{
+					Type: "limit", Round: totalRounds, Limit: turnLimit,
+					Segment: segment, SegmentSize: segmentSize,
+					Reason:  "cost_budget",
+					Message: fmt.Sprintf("Paused after $%.4f (turn budget $%.4f). Send another message to continue.", turnCost, turnCostLimit),
+				})
+				s.sendDone(stream, session.ID, false)
+				return
 			}
 		}
 
-		if _, err := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); err != nil {
-			stream.fail("Could not save tool results: " + err.Error())
-			return
-		}
+		// The segment finished. Either the turn budget is spent or the model was
+		// still working, in which case we either pause or continue automatically.
 		if ctx.Err() != nil {
 			s.finishCancelled(stream, session.ID, "", "")
 			return
 		}
+		if totalRounds >= turnLimit {
+			break
+		}
+		if !autoContinue {
+			logx.Info("turn checkpoint reached", "session", session.ID,
+				"rounds", totalRounds, "segment", segment)
+			stream.send(chatEvent{
+				Type: "checkpoint", Round: totalRounds, Limit: turnLimit,
+				Segment: segment, SegmentSize: segmentSize, Reason: "paused",
+				Message: fmt.Sprintf("Checkpoint at %d rounds. Continue when ready.", totalRounds),
+			})
+			s.sendDone(stream, session.ID, false)
+			return
+		}
+		segment++
+		continueNote = continuationNote
+		logx.Info("turn segment continued", "session", session.ID,
+			"rounds", totalRounds, "segment", segment)
+		stream.send(chatEvent{
+			Type: "checkpoint", Round: totalRounds, Limit: turnLimit,
+			Segment: segment, SegmentSize: segmentSize, NextRound: totalRounds + 1,
+			Reason: "auto", Message: fmt.Sprintf("Checkpoint at %d rounds — continuing.", totalRounds),
+		})
 	}
 
-	logx.Warn("tool round limit reached", "session", session.ID, "limit", maxToolRounds)
-	stream.fail(fmt.Sprintf("Stopped after %d tool-call rounds. Send another message to continue.", maxToolRounds))
+	logx.Warn("turn round budget reached", "session", session.ID, "limit", turnLimit)
+	stream.send(chatEvent{
+		Type: "limit", Round: totalRounds, Limit: turnLimit,
+		Segment: segment, SegmentSize: segmentSize, Reason: "turn_budget",
+		Message: fmt.Sprintf("Paused after %d rounds (turn budget). Send another message or press Continue to keep going.", turnLimit),
+	})
 	s.sendDone(stream, session.ID, false)
 }
 
@@ -432,6 +566,21 @@ func statDir(path string) (bool, error) {
 		return false, err
 	}
 	return info.IsDir(), nil
+}
+
+// looksLikeContextOverflow recognizes provider errors caused by an oversized
+// request so the UI can point the user at /compact instead of a raw API error.
+func looksLikeContextOverflow(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, needle := range []string{
+		"context length", "context_length", "maximum context",
+		"too many tokens", "token limit", "context window",
+	} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildHistory reconstructs OpenAI-compatible messages from persisted rows.
@@ -490,7 +639,7 @@ func (s *Server) buildHistory(sessionID int64, system string) ([]llm.Message, er
 	return out, nil
 }
 
-func buildSystemPrompt(project store.Project, session store.Session, checklist []store.ChecklistItem, outline string) string {
+func buildSystemPrompt(project store.Project, session store.Session, checklist []store.ChecklistItem, outline string, segmentSize, turnLimit int) string {
 	var b strings.Builder
 	b.WriteString("You are Forge, an expert autonomous coding agent operating on a local project through a web UI.\n\n")
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
@@ -507,6 +656,12 @@ func buildSystemPrompt(project store.Project, session store.Session, checklist [
 	}
 	fmt.Fprintf(&b, "\nAllowed tools in %s mode: %s\n", session.Mode, strings.Join(allowed, ", "))
 	b.WriteString("Never call a tool outside this list. Disallowed calls are blocked before execution and reported back to you.\n")
+	fmt.Fprintf(&b, `
+Step budget:
+- This turn allows up to %d model rounds and is checkpointed every %d rounds; it continues automatically when needed.
+- Every response counts as one round even when it contains several tool calls. Batch independent reads, searches, and edits in the same response to conserve the budget.
+- Do not stop early just because a task is large. When a checkpoint approaches, update the checklist and leave a clear handoff.
+`, turnLimit, segmentSize)
 	b.WriteString(`
 Operating rules:
 - At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.

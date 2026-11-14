@@ -68,26 +68,49 @@ POST /api/chat/stream (session_id, content)
          │
          ▼
 ┌────────────────────────────────────────────────────────┐
-│ UP TO 24 ROUNDS:                                       │
+│ SEGMENTED ROUND LOOP (default: 24 / segment, 96 / turn)│
 │                                                         │
-│  A. SSE: round_start                                   │
-│  B. llm.StreamChat() → SSE: reasoning/content deltas   │
-│  C. Save usage (tokens, cost)                          │
-│  D. SSE: usage                                         │
-│                                                         │
-│  IF no tool_calls:                                     │
-│     - Save assistant message → SSE: done → END         │
-│                                                         │
-│  FOR EACH tool_call:                                   │
-│     1. Allowed(mode, tool)? → tool_blocked if not     │
-│     2. SSE: tool_start                                 │
-│     3. Manager.Execute()                               │
-│     4. SSE: tool_end (result/error/duration)           │
-│     5. If checklist changed → SSE: checklist           │
-│  Save assistant + tool calls + results                 │
-│  Next round                                            │
+│  FOR EACH SEGMENT (max_tool_rounds):                   │
+│   FOR EACH ROUND (until max_turn_rounds):              │
+│    A. SSE: round_start {round, limit, segment}         │
+│    B. llm.StreamChat() → SSE: reasoning/content        │
+│    C. Save usage → SSE: usage                          │
+│    D. IF no tool_calls:                                │
+│       - Save assistant → SSE: done → END               │
+│    E. FOR EACH tool_call:                              │
+│       1. Allowed(mode, tool)? → tool_blocked if not    │
+│       2. SSE: tool_start                               │
+│       3. Manager.Execute()                             │
+│       4. guard.observe(call, result)                   │
+│       5. SSE: tool_end (result/error/duration)         │
+│       6. If checklist changed → SSE: checklist         │
+│    F. Save assistant + tool calls + results            │
+│    G. Stop on loop_detected / tool_error_limit / cost  │
+│   END FOR                                               │
+│   IF turn budget spent → SSE: limit → END              │
+│   IF auto-continue → SSE: checkpoint → next segment    │
+│   ELSE → SSE: checkpoint (paused) → END                │
+│  END FOR                                                │
 └────────────────────────────────────────────────────────┘
 ```
+
+A **round** is one model call; it may contain several tool calls. The 24-round
+limit is therefore the **checkpoint/segment size**, not the total work a turn can
+do. `max_turn_rounds` (default 96) bounds the whole turn, and `auto_continue`
+crosses segment boundaries automatically while the model is still working.
+
+### 3.1 Loop guard (`server/guard.go`)
+Every executed (or blocked) tool call is fingerprinted as
+`tool + canonical JSON args + result hash + error flag`. The guard keeps a
+six-call window and:
+
+- nudges the model when the same call+result appears twice (ephemeral user
+  message, never persisted);
+- stops the turn with `limit {reason: loop_detected}` on the third repetition;
+- nudges after 4 consecutive tool errors and stops at 6
+  (`reason: tool_error_limit`);
+- leaves legitimate cycles alone: `test → patch → test` naturally produces
+  different fingerprints, and any different call moves the window forward.
 
 ### 3. Tool Execution (`tools.go`)
 **Security:** `resolve()` converts relative paths → absolute and **validates they don't escape project root** (resolves symlinks).config.go
@@ -172,7 +195,7 @@ transaction.
 | GET | `/` | Embedded SPA |
 
 **SSE Events** (from `/api/chat/stream`):
-`round_start`, `reasoning`, `content`, `tool_start`, `tool_end`, `tool_blocked`, `usage`, `checklist`, `session`, `done`, `cancelled`, `error`
+`round_start`, `reasoning`, `content`, `tool_start`, `tool_end`, `tool_blocked`, `usage`, `checklist`, `session`, `checkpoint`, `limit`, `done`, `cancelled`, `error`
 
 ---
 
@@ -194,6 +217,7 @@ transaction.
 | Mode | `tools.Allowed(mode, name)` checked **before** execution AND in specs sent to LLM |
 | Sizes | Read window 200 lines (10MB file max), grep skips >2MB, scanner skips >512KB, outputs truncated |
 | Bash | `NO_COLOR=1`, `TERM=dumb`, timeout (default 30s, max 600s) |
+| Runaway turns | Segment/turn round budgets, optional per-turn USD cap, loop guard (`server/guard.go`) |
 | Config | 0600; API key masked in responses |
 | DB | WAL, FK cascade |
 | Network | Default bind 127.0.0.1; warning if non-loopback |
@@ -245,6 +269,7 @@ internal/
   llm/models.go              # Model catalog fetch + builtin fallback
   server/router.go           # HTTP routes, middleware, APIs config/models/projects/sessions/checklist
   server/stream.go           # handleChatStream — core agent loop
+  server/guard.go            # Per-turn loop / error-streak detector
   server/compact.go          # Conversation summarization
   tools/tools.go             # Tool defs + execution (read/grep/list/git/patch/write/bash/checklist)
   tools/scanner.go           # Zero-AI repo map (Go AST + regex), SQLite cache, compact renderer

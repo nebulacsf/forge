@@ -36,6 +36,10 @@ const state = {
   sawCancelled: false,
   turnHadContent: false,
   turnHadError: false,
+  turnRound: 0,
+  turnLimit: 0,
+  turnSegment: 1,
+  turnSegmentSize: 0,
   messageIndex: -1,
 };
 
@@ -522,11 +526,23 @@ async function sendMessage() {
     return;
   }
 
-  removePlanReadyCard();
   prompt.value = '';
   resizePrompt();
   updateSendState();
-  appendUserMessage(text);
+  await runTurn({ content: text, userText: text });
+}
+
+// continueTurn resumes a paused turn from its checkpoint. The server persists
+// the synthetic user message, so the transcript stays consistent.
+async function continueTurn() {
+  if (state.streaming || !state.session) return;
+  await runTurn({ isContinue: true, userText: 'Continue from where you left off.' });
+}
+
+async function runTurn({ content = '', isContinue = false, userText = content }) {
+  removePlanReadyCard();
+  updateSendState();
+  appendUserMessage(userText);
   hideEmpty();
   state.messageIndex = -1;
   maybeScroll(true);
@@ -535,17 +551,24 @@ async function sendMessage() {
   state.sawCancelled = false;
   state.turnHadContent = false;
   state.turnHadError = false;
+  state.turnRound = 0;
+  state.turnLimit = 0;
+  state.turnSegment = 1;
+  state.turnSegmentSize = 0;
   const modeAtSend = state.session?.mode === 'BUILD' ? 'BUILD' : 'PLAN';
   setStreamingUI(true);
-  const round = beginRound(0);
+  beginRound(0);
   const controller = new AbortController();
   state.abort = controller;
 
   try {
+    const payload = isContinue
+      ? { session_id: state.session.id, continue: true }
+      : { session_id: state.session.id, content };
     const res = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: state.session.id, content: text }),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
     if (!res.ok) {
@@ -565,11 +588,11 @@ async function sendMessage() {
       const users = $('messages').querySelectorAll('.msg-user');
       if (users.length) users[users.length - 1].remove();
       if (!$('messages').querySelector('.msg-user, .assistant-round')) showEmpty('chat');
-      if (!prompt.value.trim()) {
-        prompt.value = text;
+      if (!isContinue && !$('promptInput').value.trim()) {
+        $('promptInput').value = content;
         resizePrompt();
-        updateSendState();
       }
+      updateSendState();
       toast(err.message || 'Message was not sent', 'error');
     } else if (err.name === 'AbortError' || controller.signal.aborted) {
       if (!state.sawCancelled) addNotice('Stopped', 'stopped');
@@ -582,6 +605,11 @@ async function sendMessage() {
     finalizeRound();
     state.streaming = false;
     state.abort = null;
+    state.turnRound = 0;
+    state.turnLimit = 0;
+    state.turnSegment = 1;
+    state.turnSegmentSize = 0;
+    updateStreamLabel();
     setStreamingUI(false);
     updateControls();
     if (!state.sawCancelled && !state.turnHadError && modeAtSend === 'PLAN' && state.turnHadContent) {
@@ -676,6 +704,11 @@ function handleSSEBlock(block) {
 function handleEvent(ev) {
   switch (ev.type) {
     case 'round_start':
+      state.turnRound = ev.round || 0;
+      state.turnLimit = ev.limit || 0;
+      state.turnSegment = ev.segment || 1;
+      state.turnSegmentSize = ev.segment_size || 0;
+      updateStreamLabel();
       beginRound(ev.round || 0);
       break;
     case 'reasoning': {
@@ -754,6 +787,16 @@ function handleEvent(ev) {
           'error'
         );
       }
+      break;
+    case 'checkpoint':
+      if (ev.message) {
+        if (ev.reason === 'auto') addNotice(ev.message, 'checkpoint');
+        else addContinueNotice(ev.message);
+      }
+      break;
+    case 'limit':
+      if (state.currentRound) removeThinking(state.currentRound);
+      addLimitNotice(ev);
       break;
     case 'cancelled':
       state.sawCancelled = true;
@@ -1008,6 +1051,64 @@ function addNotice(text, kind) {
   div.textContent = text;
   $('messages').appendChild(div);
   maybeScroll(true);
+}
+
+const LIMIT_LABELS = {
+  loop_detected: 'Loop detected',
+  tool_error_limit: 'Too many failed tool calls',
+  turn_budget: 'Round budget reached',
+  cost_budget: 'Cost budget reached',
+};
+
+// addLimitNotice renders a paused turn. Budget and loop stops are not errors:
+// the transcript is safe and the user can either continue or change strategy.
+function addLimitNotice(ev) {
+  const reason = ev.reason || 'limit';
+  const text = ev.message || `${LIMIT_LABELS[reason] || 'Turn paused'}.`;
+  addContinueNotice(text);
+}
+
+// addContinueNotice renders a checkpoint with an explicit Continue action.
+function addContinueNotice(text) {
+  const round = state.currentRound;
+  const host = round ? round.events : $('messages');
+  const div = document.createElement('div');
+  div.className = 'notice checkpoint';
+  const label = document.createElement('span');
+  label.textContent = text;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn-ghost btn-sm notice-action';
+  btn.textContent = 'Continue';
+  btn.addEventListener('click', () => {
+    btn.disabled = true;
+    continueTurn();
+  });
+  div.append(label, btn);
+  host.appendChild(div);
+  if (round) {
+    round.hasEvents = true;
+    maybeScroll();
+  } else {
+    maybeScroll(true);
+  }
+}
+
+function updateStreamLabel() {
+  const label = $('streamLabel');
+  if (!label) return;
+  if (state.turnRound > 0 && state.turnLimit > 0) {
+    let text = `round ${state.turnRound}/${state.turnLimit}`;
+    const segments = state.turnSegmentSize > 0
+      ? Math.ceil(state.turnLimit / state.turnSegmentSize)
+      : 1;
+    if (segments > 1 && state.turnSegment > 1) {
+      text += ` · segment ${state.turnSegment}/${segments}`;
+    }
+    label.textContent = text;
+  } else {
+    label.textContent = 'working';
+  }
 }
 
 function parseArgs(raw) {
@@ -1533,6 +1634,10 @@ function openSettings() {
   $('defaultMode').value = cfg.defaults.mode || 'PLAN';
   $('maxRead').value = cfg.defaults.max_file_read_chars || 25000;
   $('bashTimeout').value = cfg.defaults.bash_timeout_sec || 30;
+  $('maxToolRounds').value = cfg.defaults.max_tool_rounds || 24;
+  $('maxTurnRounds').value = cfg.defaults.max_turn_rounds || 96;
+  $('maxTurnCost').value = cfg.defaults.max_turn_cost_usd ?? 0;
+  $('autoContinue').checked = cfg.defaults.auto_continue !== false;
   $('serverHost').value = cfg.server.host || '127.0.0.1';
   $('serverPort').value = cfg.server.port || 7890;
   $('autoBrowser').checked = !!cfg.server.auto_open_browser;
@@ -1553,6 +1658,10 @@ async function saveSettings(e) {
   cfg.defaults.mode = $('defaultMode').value;
   cfg.defaults.max_file_read_chars = Number($('maxRead').value) || 25000;
   cfg.defaults.bash_timeout_sec = Number($('bashTimeout').value) || 30;
+  cfg.defaults.max_tool_rounds = Number($('maxToolRounds').value) || 24;
+  cfg.defaults.max_turn_rounds = Number($('maxTurnRounds').value) || 96;
+  cfg.defaults.max_turn_cost_usd = Number($('maxTurnCost').value) || 0;
+  cfg.defaults.auto_continue = $('autoContinue').checked;
   cfg.server.host = $('serverHost').value.trim();
   cfg.server.port = Number($('serverPort').value) || 7890;
   cfg.server.auto_open_browser = $('autoBrowser').checked;

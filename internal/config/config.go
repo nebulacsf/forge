@@ -42,10 +42,14 @@ type OpenRouterConfig struct {
 }
 
 type DefaultsConfig struct {
-	Model            string `json:"model"`
-	Mode             string `json:"mode"`
-	MaxFileReadChars int    `json:"max_file_read_chars"`
-	BashTimeoutSec   int    `json:"bash_timeout_sec"`
+	Model            string  `json:"model"`
+	Mode             string  `json:"mode"`
+	MaxFileReadChars int     `json:"max_file_read_chars"`
+	BashTimeoutSec   int     `json:"bash_timeout_sec"`
+	MaxToolRounds    int     `json:"max_tool_rounds"`
+	MaxTurnRounds    int     `json:"max_turn_rounds"`
+	AutoContinue     *bool   `json:"auto_continue"`
+	MaxTurnCostUSD   float64 `json:"max_turn_cost_usd"`
 }
 
 // Default returns the shipped configuration.
@@ -67,6 +71,10 @@ func Default() Config {
 			Mode:             "PLAN",
 			MaxFileReadChars: 25000,
 			BashTimeoutSec:   30,
+			MaxToolRounds:    24,
+			MaxTurnRounds:    96,
+			AutoContinue:     boolPtr(true),
+			MaxTurnCostUSD:   0,
 		},
 	}
 }
@@ -233,8 +241,31 @@ func normalize(c Config) Config {
 	if c.Defaults.BashTimeoutSec > 600 {
 		c.Defaults.BashTimeoutSec = 600
 	}
+	if c.Defaults.MaxToolRounds <= 0 {
+		c.Defaults.MaxToolRounds = d.Defaults.MaxToolRounds
+	}
+	if c.Defaults.MaxToolRounds > 200 {
+		c.Defaults.MaxToolRounds = 200
+	}
+	if c.Defaults.MaxTurnRounds <= 0 {
+		c.Defaults.MaxTurnRounds = d.Defaults.MaxTurnRounds
+	}
+	if c.Defaults.MaxTurnRounds > 1000 {
+		c.Defaults.MaxTurnRounds = 1000
+	}
+	if c.Defaults.MaxTurnRounds < c.Defaults.MaxToolRounds {
+		c.Defaults.MaxTurnRounds = c.Defaults.MaxToolRounds
+	}
+	if c.Defaults.AutoContinue == nil {
+		c.Defaults.AutoContinue = d.Defaults.AutoContinue
+	}
+	if c.Defaults.MaxTurnCostUSD < 0 {
+		c.Defaults.MaxTurnCostUSD = 0
+	}
 	return c
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 func validate(c Config) error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {

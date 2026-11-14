@@ -69,7 +69,7 @@
 
           <div class="ms-auto d-flex align-items-center gap-2">
             <span id="streamIndicator" class="stream-indicator d-none">
-              <span class="pulse-dot"></span> working
+              <span class="pulse-dot"></span> <span id="streamLabel">working</span>
             </span>
           </div>
         </div>
@@ -265,6 +265,28 @@
               <div class="col-md-6">
                 <label for="bashTimeout" class="form-label">Bash timeout (seconds)</label>
                 <input id="bashTimeout" type="number" min="1" max="600" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <label for="maxToolRounds" class="form-label">Rounds per checkpoint</label>
+                <input id="maxToolRounds" type="number" min="1" max="200" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <label for="maxTurnRounds" class="form-label">Rounds per turn</label>
+                <input id="maxTurnRounds" type="number" min="1" max="1000" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <label for="maxTurnCost" class="form-label">Turn cost cap (USD)</label>
+                <input id="maxTurnCost" type="number" min="0" step="0.01" class="form-control">
+              </div>
+              <div class="col-12">
+                <div class="form-check form-switch">
+                  <input id="autoContinue" class="form-check-input" type="checkbox">
+                  <label class="form-check-label" for="autoContinue">Continue automatically on long tasks</label>
+                </div>
+                <div class="form-text">
+                  One round is one model call and may run several tools. Forge checkpoints every
+                  “rounds per checkpoint” and stops at “rounds per turn”. Use 0 in the cost cap to disable it.
+                </div>
               </div>
             </div>
           </div>

@@ -104,6 +104,20 @@ Every reasoning step and tool call is a collapsed accordion by default
 expand inputs and outputs. Stop aborts the stream and keeps whatever text had
 already arrived.
 
+### Long turns and checkpoints
+
+A **round** is one model call and may run several tools. Forge checkpoints every
+`max_tool_rounds` rounds (default **24**) and keeps going automatically until
+`max_turn_rounds` (default **96**) when **auto-continue** is enabled. A
+checkpoint never loses work: every tool result is already persisted, and a
+paused turn shows a **Continue** action.
+
+A loop guard runs alongside the budget. It fingerprints each tool call together
+with its result and stops the turn when the same call produces the same result
+three times in a short window, or after six consecutive tool errors. Budget and
+loop stops are reported as a neutral checkpoint (`limit` event), not as failures.
+All limits are configurable in **Settings → Defaults**.
+
 In PLAN mode, tools that write files or run commands are rejected **before
 execution** and rendered as a `🚫 … blocked` card, so you never see a tool start
 only to fail because of the mode.
@@ -152,7 +166,11 @@ system shortcuts.
     "model": "qwen/qwen-2.5-coder-32b-instruct",
     "mode": "PLAN",
     "max_file_read_chars": 25000,
-    "bash_timeout_sec": 30
+    "bash_timeout_sec": 30,
+    "max_tool_rounds": 24,
+    "max_turn_rounds": 96,
+    "auto_continue": true,
+    "max_turn_cost_usd": 0
   }
 }
 ```
