@@ -22,7 +22,7 @@
       <button id="addProjectBtn" class="rail-btn" type="button" title="Register a local project">
         <i class="bi bi-plus-lg"></i>
       </button>
-      <button id="settingsBtn" class="rail-btn" type="button" title="Settings (Ctrl+,)">
+      <button id="settingsBtn" class="rail-btn" type="button" title="Settings (Ctrl+Shift+,)">
         <i class="bi bi-gear"></i>
       </button>
     </div>
@@ -49,7 +49,7 @@
             <i class="bi bi-cpu"></i>
             <input id="modelInput" class="model-input" list="modelOptions" spellcheck="false"
                    autocomplete="off" placeholder="model id" aria-label="Model"
-                   title="Model (Ctrl+/)">
+                   title="Model (Ctrl+Shift+/)">
             <datalist id="modelOptions">
               <option value="qwen/qwen-2.5-coder-32b-instruct"></option>
               <option value="anthropic/claude-sonnet-4.5"></option>
@@ -62,7 +62,7 @@
           </div>
 
           <div id="modeToggle" class="mode-toggle flex-shrink-0" role="group" aria-label="Operating mode"
-               title="Toggle PLAN / BUILD (Ctrl+.)">
+               title="Toggle PLAN / BUILD (Ctrl+Shift+.)">
             <button type="button" data-mode="PLAN">PLAN</button>
             <button type="button" data-mode="BUILD">BUILD</button>
           </div>
@@ -86,11 +86,11 @@
               <span><kbd>/compact</kbd> summarizes the conversation</span>
             </div>
             <div class="empty-shortcuts">
-              <kbd>Ctrl</kbd>+<kbd>,</kbd> settings ·
-              <kbd>Ctrl</kbd>+<kbd>.</kbd> mode ·
-              <kbd>Ctrl</kbd>+<kbd>/</kbd> model ·
-              <kbd>Ctrl</kbd>+<kbd>L</kbd> chat ·
-              <kbd>Ctrl</kbd>+<kbd>P</kbd>/<kbd>N</kbd> messages
+              <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>,</kbd> settings ·
+              <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>.</kbd> mode ·
+              <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>/</kbd> model ·
+              <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> chat ·
+              <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> messages
             </div>
           </div>
         </div>
@@ -121,28 +121,29 @@
             <i class="bi bi-activity"></i>
           </div>
           <div class="usage-top">
-            <span>Context window</span>
+            <span title="Share of the model's context window occupied by the current request.">Context window</span>
             <span id="contextPct">0%</span>
           </div>
           <div class="progress context-progress" role="progressbar" aria-label="Context usage">
             <div id="ctxBar" class="progress-bar"></div>
           </div>
-          <div id="contextMeta" class="usage-sub">0 / 128k tokens</div>
+          <div id="contextMeta" class="usage-sub" title="Tokens in the current context: the prompt sent to the model plus the response it just generated.">0 / 128k tokens</div>
 
           <div class="usage-grid">
-            <div class="usage-stat">
+            <div class="usage-stat" title="Cumulative input tokens billed across every model request in this session. Each tool round resends the full context, so this total is normally much larger than the context gauge.">
               <strong id="tokensIn">0</strong>
-              <span>tokens in</span>
+              <span>input (session)</span>
             </div>
-            <div class="usage-stat">
+            <div class="usage-stat" title="Cumulative output tokens generated across every model request in this session.">
               <strong id="tokensOut">0</strong>
-              <span>tokens out</span>
+              <span>output (session)</span>
             </div>
-            <div class="usage-stat">
+            <div class="usage-stat" title="Cumulative prompt tokens served from the provider cache in this session.">
               <strong id="cachedTokens">0</strong>
-              <span>cached</span>
+              <span>cached (session)</span>
             </div>
           </div>
+          <div class="usage-note">Session input/output totals add every tool round; the gauge shows only the current context. Cached tokens are provider-reported.</div>
 
           <div class="cost-line">
             <span>Session cost</span>

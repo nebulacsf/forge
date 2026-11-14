@@ -251,7 +251,7 @@ async function loadSession(id) {
       projectCost: data.project.total_cost_usd || 0,
       contextTokens: estimateContext(data.messages || []),
       contextExact: false,
-      cached: 0,
+      cached: data.session.cached_tokens || 0,
     };
     localStorage.setItem(`forge.session.${data.project.id}`, String(id));
     updateProjectTotals(data.project);
@@ -1086,7 +1086,11 @@ function applyUsage(ev) {
   if (ev.session_tokens_out !== undefined) state.usage.sessionOut = ev.session_tokens_out;
   if (ev.session_cost_usd !== undefined) state.usage.sessionCost = ev.session_cost_usd;
   if (ev.project_cost_usd !== undefined) state.usage.projectCost = ev.project_cost_usd;
-  if (ev.cached_tokens !== undefined) state.usage.cached = ev.cached_tokens;
+  if (ev.session_cached_tokens !== undefined) {
+    state.usage.cached = ev.session_cached_tokens;
+  } else if (ev.cached_tokens !== undefined) {
+    state.usage.cached += ev.cached_tokens;
+  }
   if (ev.context_tokens) {
     state.usage.contextTokens = ev.context_tokens;
     state.usage.contextExact = true;
@@ -1133,10 +1137,18 @@ function updateUsageUI() {
   $('contextPct').textContent = (pct < 1 && pct > 0 ? '<1' : Math.round(pct)) + '%';
   $('contextMeta').textContent =
     `${state.usage.contextExact ? '' : 'est. '}${formatNum(used)} / ${formatLimit(limit)} tokens`;
-  $('contextMeta').title = `${used} / ${limit} tokens`;
+  $('contextMeta').title =
+    `${used} / ${limit} tokens in the current context (prompt + response). ` +
+    'The session input/output totals below add every model round.';
   $('tokensIn').textContent = formatNum(state.usage.sessionIn);
   $('tokensOut').textContent = formatNum(state.usage.sessionOut);
   $('cachedTokens').textContent = formatNum(state.usage.cached);
+  const cachePct = state.usage.sessionIn > 0
+    ? Math.min(100, (state.usage.cached / state.usage.sessionIn) * 100)
+    : 0;
+  $('cachedTokens').parentElement.title =
+    `Cumulative prompt tokens served from the provider cache (${cachePct.toFixed(0)}% of session input). ` +
+    'Cache hits require an identical prompt prefix and the same upstream provider.';
   $('sessionCost').textContent = formatCost(state.usage.sessionCost);
   $('projectCost').textContent = formatCost(state.usage.projectCost);
   const status = $('sessionStatus');
@@ -1696,56 +1708,48 @@ function bindEvents() {
 
 function handleShortcut(e) {
   if (e.isComposing) return;
-  const mod = e.ctrlKey || e.metaKey;
-  const alt = e.altKey;
-  if (!mod && !alt) return;
-  if (e.shiftKey) return;
+  // Ctrl+Shift avoids the shortcuts every browser and desktop reserves for
+  // Ctrl+L / Ctrl+N / Ctrl+P / Ctrl+W / Ctrl+, / Cmd+? etc.
+  if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return;
 
   const key = e.key.toLowerCase();
+  const code = e.code || '';
   const modalOpen = !!document.querySelector('.modal.show');
 
-  // Alt+L / Alt+N work where browsers reserve Ctrl+L / Ctrl+N.
-  if (alt) {
-    if (key === 'l') {
-      e.preventDefault();
-      focusChat();
-    } else if (key === 'n') {
-      e.preventDefault();
-      navigateMessage(1);
-    }
+  if (code === 'Comma') {
+    e.preventDefault();
+    openSettings();
     return;
   }
-
-  switch (key) {
-    case ',':
-      e.preventDefault();
-      openSettings();
-      break;
-    case '.':
-      e.preventDefault();
-      if (!modalOpen) toggleMode();
-      break;
-    case '/':
-      e.preventDefault();
-      if (!modalOpen) {
-        $('modelInput').focus();
-        $('modelInput').select();
-      }
-      break;
-    case 'l':
-      e.preventDefault();
-      focusChat();
-      break;
-    case 'p':
-      e.preventDefault();
-      if (!modalOpen) navigateMessage(-1);
-      break;
-    case 'n':
-      e.preventDefault();
-      if (!modalOpen) navigateMessage(1);
-      break;
-    default:
-      break;
+  if (code === 'Period') {
+    if (modalOpen) return;
+    e.preventDefault();
+    toggleMode();
+    return;
+  }
+  if (code === 'Slash' || code === 'NumpadDivide' || key === '/' || key === '?') {
+    if (modalOpen) return;
+    e.preventDefault();
+    $('modelInput').focus();
+    $('modelInput').select();
+    return;
+  }
+  if (code === 'KeyL' || key === 'l') {
+    if (modalOpen) return;
+    e.preventDefault();
+    focusChat();
+    return;
+  }
+  if (key === 'arrowup') {
+    if (modalOpen) return;
+    e.preventDefault();
+    navigateMessage(-1);
+    return;
+  }
+  if (key === 'arrowdown') {
+    if (modalOpen) return;
+    e.preventDefault();
+    navigateMessage(1);
   }
 }
 

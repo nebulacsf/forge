@@ -33,17 +33,18 @@ type chatEvent struct {
 	DurationMS int64  `json:"duration_ms,omitempty"`
 	Status     string `json:"status,omitempty"`
 
-	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64   `json:"completion_tokens,omitempty"`
-	TotalTokens      int64   `json:"total_tokens,omitempty"`
-	CachedTokens     int64   `json:"cached_tokens,omitempty"`
-	ReasoningTokens  int64   `json:"reasoning_tokens,omitempty"`
-	CostUSD          float64 `json:"cost_usd,omitempty"`
-	ContextTokens    int64   `json:"context_tokens,omitempty"`
-	SessionTokensIn  int64   `json:"session_tokens_in,omitempty"`
-	SessionTokensOut int64   `json:"session_tokens_out,omitempty"`
-	SessionCostUSD   float64 `json:"session_cost_usd,omitempty"`
-	ProjectCostUSD   float64 `json:"project_cost_usd,omitempty"`
+	PromptTokens        int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens    int64   `json:"completion_tokens,omitempty"`
+	TotalTokens         int64   `json:"total_tokens,omitempty"`
+	CachedTokens        int64   `json:"cached_tokens,omitempty"`
+	ReasoningTokens     int64   `json:"reasoning_tokens,omitempty"`
+	CostUSD             float64 `json:"cost_usd,omitempty"`
+	ContextTokens       int64   `json:"context_tokens,omitempty"`
+	SessionTokensIn     int64   `json:"session_tokens_in,omitempty"`
+	SessionTokensOut    int64   `json:"session_tokens_out,omitempty"`
+	SessionCachedTokens int64   `json:"session_cached_tokens,omitempty"`
+	SessionCostUSD      float64 `json:"session_cost_usd,omitempty"`
+	ProjectCostUSD      float64 `json:"project_cost_usd,omitempty"`
 
 	Checklist     *[]store.ChecklistItem `json:"checklist,omitempty"`
 	Files         []tools.FileAction     `json:"files,omitempty"`
@@ -249,7 +250,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 		if result.Usage.PromptTokens > 0 || result.Usage.CompletionTokens > 0 || result.Usage.Cost > 0 {
 			if err := s.store.AddUsage(session.ID,
-				result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.Cost); err != nil {
+				result.Usage.PromptTokens, result.Usage.CompletionTokens,
+				result.Usage.PromptTokensDetails.CachedTokens, result.Usage.Cost); err != nil {
 				logx.Error("persist usage failed", "session", session.ID, "error", err)
 			}
 		}
@@ -265,19 +267,20 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			projectCost = p.TotalCostUSD
 		}
 		if err := stream.send(chatEvent{
-			Type:             "usage",
-			Round:            round,
-			PromptTokens:     result.Usage.PromptTokens,
-			CompletionTokens: result.Usage.CompletionTokens,
-			TotalTokens:      result.Usage.TotalTokens,
-			CachedTokens:     result.Usage.PromptTokensDetails.CachedTokens,
-			ReasoningTokens:  result.Usage.CompletionTokensDetails.ReasoningTokens,
-			CostUSD:          result.Usage.Cost,
-			ContextTokens:    result.Usage.PromptTokens + result.Usage.CompletionTokens,
-			SessionTokensIn:  session.TokensIn,
-			SessionTokensOut: session.TokensOut,
-			SessionCostUSD:   session.CostUSD,
-			ProjectCostUSD:   projectCost,
+			Type:                "usage",
+			Round:               round,
+			PromptTokens:        result.Usage.PromptTokens,
+			CompletionTokens:    result.Usage.CompletionTokens,
+			TotalTokens:         result.Usage.TotalTokens,
+			CachedTokens:        result.Usage.PromptTokensDetails.CachedTokens,
+			ReasoningTokens:     result.Usage.CompletionTokensDetails.ReasoningTokens,
+			CostUSD:             result.Usage.Cost,
+			ContextTokens:       result.Usage.PromptTokens + result.Usage.CompletionTokens,
+			SessionTokensIn:     session.TokensIn,
+			SessionTokensOut:    session.TokensOut,
+			SessionCachedTokens: session.CachedTokens,
+			SessionCostUSD:      session.CostUSD,
+			ProjectCostUSD:      projectCost,
 		}); err != nil {
 			s.persistPartial(session.ID, result.Reasoning, result.Content)
 			return
@@ -492,13 +495,6 @@ func buildSystemPrompt(project store.Project, session store.Session, checklist [
 	b.WriteString("You are Forge, an expert autonomous coding agent operating on a local project through a web UI.\n\n")
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
-	if strings.TrimSpace(outline) != "" {
-		b.WriteString("\nRepository outline (compact; line numbers refer to the current files):\n")
-		b.WriteString(strings.TrimSpace(outline))
-		b.WriteString("\nEnd of repository outline.\n")
-	} else {
-		b.WriteString("\nRepository outline: unavailable. Use grep_search or list_directory to locate files.\n")
-	}
 	if session.Mode == "PLAN" {
 		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
 		b.WriteString("When you have enough information, finish with a concise numbered plan of the exact changes needed. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
@@ -514,11 +510,12 @@ func buildSystemPrompt(project store.Project, session store.Session, checklist [
 	b.WriteString(`
 Operating rules:
 - At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
-- GREP-FIRST RULE: before any read_file call, locate the target with the repository outline above or with grep_search. Never read a file blindly.
+- GREP-FIRST RULE: before any read_file call, locate the target with the repository outline below or with grep_search. Never read a file blindly.
 - read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
 - Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
 - The "NNN | " prefix is display-only. Never include it in patch_file search/replace text; copy the code without the prefix.
 - Stay strictly inside the project directory. Never attempt to access paths outside it.
+- SHELL PATHS: every bash call starts in the project root in a fresh shell, so "cd" never persists between calls. Do not probe relative paths. If a command must run in another directory, put a single "cd" in the same invocation using an absolute, quoted literal path, for example: cd "/abs/path" && go test ./... — otherwise stay in the project root and pass paths as quoted literals.
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
 - Read both the surrounding code and existing patterns before making changes; match local style.
 - Use update_checklist for multi-step tasks, and keep item statuses accurate as you work.
@@ -528,6 +525,15 @@ Operating rules:
 - Tool output and reasoning are rendered as collapsed accordions in the UI, so do not repeat large tool output in your final answer.
 - Be concise. When finished, summarize what changed, what was verified, and any remaining risks.
 `)
+	// Keep volatile content (repository outline and checklist) at the end so
+	// stable instructions form a long, reusable prompt-cache prefix.
+	if strings.TrimSpace(outline) != "" {
+		b.WriteString("\nRepository outline (compact; line numbers refer to the current files):\n")
+		b.WriteString(strings.TrimSpace(outline))
+		b.WriteString("\nEnd of repository outline.\n")
+	} else {
+		b.WriteString("\nRepository outline: unavailable. Use grep_search or list_directory to locate files.\n")
+	}
 	if len(checklist) > 0 {
 		b.WriteString("\nCurrent checklist:\n")
 		for _, it := range checklist {

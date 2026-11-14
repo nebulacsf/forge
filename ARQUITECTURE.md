@@ -138,7 +138,7 @@ Forge builds a zero-AI outline of the project and stores one row per file in
 
 ```
 projects: id, name, path(UNIQUE), icon_color, last_opened_at, total_cost_usd, session_count
-sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), tokens_in/out, cost_usd, is_open, updated_at
+sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), tokens_in/out, cached_tokens, cost_usd, is_open, updated_at
 messages: id, session_id(FK), role(user|assistant|tool), reasoning, content, tool_calls(JSON), created_at
 checklists: id, session_id(FK), task_text, is_done, position
 repo_outline: project_path, file_path, language, mtime_ns, size_bytes, symbols, updated_at

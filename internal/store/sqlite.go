@@ -28,16 +28,17 @@ type Project struct {
 }
 
 type Session struct {
-	ID        int64   `json:"id"`
-	ProjectID int64   `json:"project_id"`
-	Title     string  `json:"title"`
-	Model     string  `json:"model"`
-	Mode      string  `json:"mode"`
-	TokensIn  int64   `json:"tokens_in"`
-	TokensOut int64   `json:"tokens_out"`
-	CostUSD   float64 `json:"cost_usd"`
-	IsOpen    bool    `json:"is_open"`
-	UpdatedAt string  `json:"updated_at"`
+	ID           int64   `json:"id"`
+	ProjectID    int64   `json:"project_id"`
+	Title        string  `json:"title"`
+	Model        string  `json:"model"`
+	Mode         string  `json:"mode"`
+	TokensIn     int64   `json:"tokens_in"`
+	TokensOut    int64   `json:"tokens_out"`
+	CachedTokens int64   `json:"cached_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+	IsOpen       bool    `json:"is_open"`
+	UpdatedAt    string  `json:"updated_at"`
 }
 
 type Message struct {
@@ -204,6 +205,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 	mode       TEXT NOT NULL DEFAULT 'PLAN' CHECK (mode IN ('PLAN','BUILD')),
 	tokens_in  INTEGER NOT NULL DEFAULT 0,
 	tokens_out INTEGER NOT NULL DEFAULT 0,
+	cached_tokens INTEGER NOT NULL DEFAULT 0,
 	cost_usd   REAL NOT NULL DEFAULT 0,
 	is_open    INTEGER NOT NULL DEFAULT 1,
 	updated_at TEXT NOT NULL
@@ -244,6 +246,41 @@ CREATE INDEX IF NOT EXISTS idx_checklists_session ON checklists(session_id, posi
 `
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize schema: %w", err)
+	}
+	// Databases created before cached-token accounting need the new column.
+	if err := ensureColumn(db, "sessions", "cached_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureColumn(db *sql.DB, table, column, decl string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    any
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("inspect %s columns: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -356,7 +393,7 @@ func (s *Store) CreateSession(projectID int64, title, model, mode string) (Sessi
 }
 
 func (s *Store) ListSessions(projectID int64, openOnly bool) ([]Session, error) {
-	query := `SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cost_usd, is_open, updated_at
+	query := `SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, is_open, updated_at
 		FROM sessions WHERE project_id = ?`
 	if openOnly {
 		query += ` AND is_open = 1`
@@ -379,7 +416,7 @@ func (s *Store) ListSessions(projectID int64, openOnly bool) ([]Session, error) 
 }
 
 func (s *Store) GetSession(id int64) (Session, error) {
-	row := s.db.QueryRow(`SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cost_usd, is_open, updated_at
+	row := s.db.QueryRow(`SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, is_open, updated_at
 		FROM sessions WHERE id = ?`, id)
 	sess, err := scanSession(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -398,7 +435,7 @@ func scanSession(r rowScanner) (Session, error) {
 		isOpen int
 	)
 	if err := r.Scan(&sess.ID, &sess.ProjectID, &sess.Title, &sess.Model, &sess.Mode,
-		&sess.TokensIn, &sess.TokensOut, &sess.CostUSD, &isOpen, &sess.UpdatedAt); err != nil {
+		&sess.TokensIn, &sess.TokensOut, &sess.CachedTokens, &sess.CostUSD, &isOpen, &sess.UpdatedAt); err != nil {
 		return Session{}, err
 	}
 	sess.IsOpen = isOpen != 0
@@ -445,11 +482,12 @@ func (s *Store) UpdateSession(id int64, title, model, mode *string, isOpen *bool
 	return s.GetSession(id)
 }
 
-func (s *Store) AddUsage(sessionID, tokensIn, tokensOut int64, cost float64) error {
+func (s *Store) AddUsage(sessionID, tokensIn, tokensOut, cachedTokens int64, cost float64) error {
 	_, err := s.db.Exec(`
 		UPDATE sessions
-		SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?, cost_usd = cost_usd + ?, updated_at = ?
-		WHERE id = ?`, tokensIn, tokensOut, cost, now(), sessionID)
+		SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?,
+			cached_tokens = cached_tokens + ?, cost_usd = cost_usd + ?, updated_at = ?
+		WHERE id = ?`, tokensIn, tokensOut, cachedTokens, cost, now(), sessionID)
 	return err
 }
 

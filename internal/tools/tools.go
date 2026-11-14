@@ -236,7 +236,7 @@ func Specs(mode string) []llm.Tool {
 				Type: "function",
 				Function: llm.ToolFunctionSpec{
 					Name:        "bash",
-					Description: "Run a shell command with bash in the project root. Use for builds, tests, git inspection, and other local commands. Output is truncated and commands are killed on timeout.",
+					Description: "Run a shell command with bash. Each call starts in the project root in a fresh shell, so `cd` does not persist. Use absolute, quoted literal paths; when a command needs another directory, combine it in the same call as `cd \"/abs/path\" && ...`. Output is truncated and commands are killed on timeout.",
 					Parameters: objectSchema(map[string]any{
 						"command":     stringProp("Shell command to execute."),
 						"timeout_sec": integerProp("Optional timeout in seconds (capped at 600)."),

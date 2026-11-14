@@ -52,7 +52,8 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		!strings.Contains(req.Messages[0].Content, "switch to BUILD") ||
 		!strings.Contains(req.Messages[0].Content, "FIRST action must be update_checklist") ||
 		!strings.Contains(req.Messages[0].Content, "Repository outline") ||
-		!strings.Contains(req.Messages[0].Content, "GREP-FIRST RULE") {
+		!strings.Contains(req.Messages[0].Content, "GREP-FIRST RULE") ||
+		!strings.Contains(req.Messages[0].Content, "SHELL PATHS") {
 		http.Error(w, "PLAN system prompt missing required guidance", http.StatusBadRequest)
 		return
 	}
@@ -185,7 +186,7 @@ func TestChatStreamToolLoop(t *testing.T) {
 
 	events := readEvents(t, resp.Body)
 	types := map[string]int{}
-	var toolErr, checklistCount, finalContent, usageIn, usageOut int
+	var toolErr, checklistCount, finalContent, usageIn, usageOut, usageCached int
 	var sessionEvent *store.Session
 	var sawFiles bool
 	for _, ev := range events {
@@ -215,7 +216,8 @@ func TestChatStreamToolLoop(t *testing.T) {
 		case "usage":
 			in, _ := ev["session_tokens_in"].(float64)
 			out, _ := ev["session_tokens_out"].(float64)
-			usageIn, usageOut = int(in), int(out)
+			cached, _ := ev["session_cached_tokens"].(float64)
+			usageIn, usageOut, usageCached = int(in), int(out), int(cached)
 		case "content":
 			if s, ok := ev["content"].(string); ok {
 				finalContent += len(s)
@@ -226,9 +228,10 @@ func TestChatStreamToolLoop(t *testing.T) {
 		case "done":
 			if raw, ok := ev["session"].(map[string]any); ok {
 				sessionEvent = &store.Session{
-					TokensIn:  int64(raw["tokens_in"].(float64)),
-					TokensOut: int64(raw["tokens_out"].(float64)),
-					CostUSD:   raw["cost_usd"].(float64),
+					TokensIn:     int64(raw["tokens_in"].(float64)),
+					TokensOut:    int64(raw["tokens_out"].(float64)),
+					CachedTokens: int64(raw["cached_tokens"].(float64)),
+					CostUSD:      raw["cost_usd"].(float64),
 				}
 			}
 		}
@@ -251,10 +254,10 @@ func TestChatStreamToolLoop(t *testing.T) {
 	if finalContent == 0 {
 		t.Error("no content events received")
 	}
-	if usageIn != 180 || usageOut != 30 {
-		t.Errorf("usage = %d/%d, want 180/30", usageIn, usageOut)
+	if usageIn != 180 || usageOut != 30 || usageCached != 40 {
+		t.Errorf("usage = %d/%d cached %d, want 180/30/40", usageIn, usageOut, usageCached)
 	}
-	if sessionEvent == nil || sessionEvent.TokensIn != 180 || sessionEvent.TokensOut != 30 {
+	if sessionEvent == nil || sessionEvent.TokensIn != 180 || sessionEvent.TokensOut != 30 || sessionEvent.CachedTokens != 40 {
 		t.Errorf("done session usage = %+v", sessionEvent)
 	}
 	if !mock.sawToolMessage.Load() {

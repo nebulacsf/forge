@@ -76,7 +76,8 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.Cost > 0 {
-		if err := s.store.AddUsage(id, usage.PromptTokens, usage.CompletionTokens, usage.Cost); err != nil {
+		if err := s.store.AddUsage(id, usage.PromptTokens, usage.CompletionTokens,
+			usage.PromptTokensDetails.CachedTokens, usage.Cost); err != nil {
 			logx.Error("compact usage failed", "session", id, "error", err)
 		}
 	}

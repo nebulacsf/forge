@@ -81,9 +81,11 @@ model returns only reasoning and no final answer, Forge expands the reasoning
 card and warns you instead of leaving an apparently empty turn.
 
 `bash` runs in the project root with a timeout (default 30 s, capped at 600 s)
-and is killed as a process group on timeout or cancellation. All file tools are
-confined to the project directory, including symlink-escape checks for paths
-that do not exist yet. Writes are atomic.
+and is killed as a process group on timeout or cancellation. Each call is a
+fresh shell, so `cd` does not persist; when a command needs another directory,
+use one absolute, quoted literal path in the same call (`cd "/abs/path" && …`).
+All file tools are confined to the project directory, including symlink-escape
+checks for paths that do not exist yet. Writes are atomic.
 
 ## UI
 
@@ -91,6 +93,11 @@ that do not exist yet. Writes are atomic.
 - Top: open session tabs
 - Center: chat with auto-resizing composer, **Send** and **Stop**
 - Right: usage/cost, active files, checklist
+
+The context gauge shows the current request only (prompt + response). The
+**input (session)** and **output (session)** counters are cumulative: every
+tool round resends the whole conversation, so they normally grow much faster
+than the context gauge. Both views are expected to differ.
 
 Every reasoning step and tool call is a collapsed accordion by default
 (`🧠 Thinking…`, `📄 Reading main.go`, `⚡ Running: go test ./...`). Click to
@@ -113,15 +120,17 @@ only to fail because of the mode.
 | --- | --- |
 | `Enter` | Send message |
 | `Shift+Enter` | Newline |
-| `Ctrl+,` | Open Settings |
-| `Ctrl+.` | Toggle PLAN / BUILD |
-| `Ctrl+/` | Focus the model picker |
-| `Ctrl+L` | Focus the chat composer |
-| `Ctrl+P` / `Ctrl+N` | Previous / next message |
-| `Alt+L` / `Alt+N` | Focus chat / next message (fallback where the browser reserves `Ctrl+L`/`Ctrl+N`) |
+| `Ctrl+Shift+,` | Open Settings |
+| `Ctrl+Shift+.` | Toggle PLAN / BUILD |
+| `Ctrl+Shift+/` | Focus the model picker |
+| `Ctrl+Shift+L` | Focus the chat composer |
+| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | Previous / next message |
 
-Chrome and Firefox reserve `Ctrl+L` (address bar) and `Ctrl+N` (new window) at
-the browser level; the `Alt` variants always work.
+All modifier shortcuts use **Ctrl+Shift** and are handled with `preventDefault`,
+so they do not reuse the combinations browsers and desktops reserve for the
+address bar, print, new window, new tab, close tab, settings, or help. `Ctrl` is
+used on every platform (including macOS) to avoid `Cmd+?`, `Cmd+,`, and similar
+system shortcuts.
 
 ## Config
 
@@ -177,6 +186,28 @@ hours. The UI uses the real `context_length` for the context-window gauge and
 the model picker labels, so switching models updates the denominator
 immediately. If the provider catalog is unreachable, Forge falls back to a
 built-in table and a heuristic (and keeps working offline).
+
+## Billing and prompt cache
+
+The final charge is whatever OpenRouter reports in `usage.cost` for each
+request; Forge accumulates it into **session cost** and **project cost**. The
+token counters are informational:
+
+- **input (session)** is the sum of `prompt_tokens` over every request. Each
+  tool round re-sends the whole conversation, so this total grows quickly.
+- **output (session)** is the sum of `completion_tokens`.
+- **cached (session)** is the cumulative subset of input tokens that the
+  provider served from its prompt cache (`prompt_tokens_details.cached_tokens`).
+  Cached input is billed at a lower rate, so the actual charge is lower than
+  `input × list price`.
+
+A cache hit requires an identical prefix (system prompt, tool definitions, and
+message history) and the same upstream provider. Forge now puts volatile
+content (repository outline and checklist) at the end of the system prompt so
+the stable instructions stay cacheable, and the UI accumulates cached tokens
+for the whole session instead of showing only the last round. Cache behavior is
+still controlled by the provider; routing, short cache TTLs, and model changes
+can reduce the hit rate.
 
 ## HTTP API
 

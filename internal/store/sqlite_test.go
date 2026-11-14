@@ -37,14 +37,14 @@ func TestOpenFreshAndCRUD(t *testing.T) {
 	if _, err := st.AddMessage(sess.ID, "user", "", "hello", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AddUsage(sess.ID, 10, 20, 0.5); err != nil {
+	if err := st.AddUsage(sess.ID, 10, 20, 5, 0.5); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := st.GetSession(sess.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fresh.TokensIn != 10 || fresh.TokensOut != 20 || fresh.CostUSD != 0.5 {
+	if fresh.TokensIn != 10 || fresh.TokensOut != 20 || fresh.CachedTokens != 5 || fresh.CostUSD != 0.5 {
 		t.Fatalf("usage not accumulated: %+v", fresh)
 	}
 	items, err := st.ListMessages(sess.ID)
@@ -152,5 +152,53 @@ func TestOpenMovesIncompatibleLegacyDatabase(t *testing.T) {
 	}
 	if _, err := st.CreateProject("New", "/new/root", "#123456"); err != nil {
 		t.Fatalf("new schema unusable: %v", err)
+	}
+}
+
+func TestOpenAddsCachedTokensColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	old, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`
+		CREATE TABLE projects (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			path TEXT NOT NULL UNIQUE,
+			icon_color TEXT NOT NULL DEFAULT '#6c8cff',
+			last_opened_at TEXT NOT NULL
+		);
+		CREATE TABLE sessions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			project_id INTEGER NOT NULL,
+			title TEXT NOT NULL DEFAULT 'New Chat',
+			model TEXT NOT NULL,
+			mode TEXT NOT NULL DEFAULT 'PLAN',
+			tokens_in INTEGER NOT NULL DEFAULT 0,
+			tokens_out INTEGER NOT NULL DEFAULT 0,
+			cost_usd REAL NOT NULL DEFAULT 0,
+			is_open INTEGER NOT NULL DEFAULT 1,
+			updated_at TEXT NOT NULL
+		);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	var count int
+	if err := st.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'cached_tokens'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("cached_tokens column count = %d, want 1", count)
 	}
 }
