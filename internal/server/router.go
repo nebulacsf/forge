@@ -21,6 +21,7 @@ import (
 	"forge/internal/llm"
 	"forge/internal/logx"
 	"forge/internal/store"
+	"forge/internal/tools"
 )
 
 const keepAPIKey = "__KEEP__"
@@ -352,8 +353,24 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusConflict, err.Error())
 		return
 	}
+	go s.warmRepoOutline(project)
 	projects, _ := s.store.ListProjects()
 	writeJSON(w, http.StatusCreated, map[string]any{"project": project, "projects": projects})
+}
+
+// warmRepoOutline builds the local repository map in the background so the
+// first chat turn is fast. Failures are non-fatal; the turn will retry.
+func (s *Server) warmRepoOutline(project store.Project) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	started := time.Now()
+	outline, err := tools.EnsureRepoOutline(ctx, s.store, project.Path)
+	if err != nil {
+		logx.Warn("repo outline warmup failed", "project", project.ID, "error", err)
+		return
+	}
+	logx.Debug("repo outline warmed", "project", project.ID,
+		"chars", len(outline), "duration", time.Since(started).Round(time.Millisecond).String())
 }
 
 func normalizeProjectPath(raw string) (string, error) {

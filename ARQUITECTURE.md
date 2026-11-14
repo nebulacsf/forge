@@ -61,8 +61,9 @@ POST /api/chat/stream (session_id, content)
 │ 1. Validate session/project/API key                    │
 │ 2. Save user message                                   │
 │ 3. Create tools.Manager (project root, mode)           │
-│ 4. Build system prompt (includes checklist, rules)     │
-│ 5. Load history from DB                                │
+│ 4. Ensure local repo outline (AST/regex scan, cached)  │
+│ 5. Build system prompt (outline + checklist + rules)   │
+│ 6. Load history from DB                                │
 └────────────────────────────────────────────────────────┘
          │
          ▼
@@ -98,6 +99,26 @@ POST /api/chat/stream (session_id, content)
 | read_file, grep_search, list_directory, git_diff, update_checklist | ✅ | ✅ |
 | patch_file, write_file, bash | ❌ | ✅ |
 
+**Bounded reads:** `read_file` requires `start_line` and `end_line`; at most 200
+lines are returned, each prefixed with its real line number (`142 | code`).
+Requests above the cap are truncated and report the requested vs. returned
+range. The agent is instructed to use the repo outline or `grep_search` before
+reading.
+
+### Repository Map (`tools/scanner.go`)
+Forge builds a zero-AI outline of the project and stores one row per file in
+`repo_outline`:
+
+- `.go` files: `go/parser` + `go/ast` (`SkipObjectResolution`) for package,
+  structs, interfaces, types, functions, and methods with declaration lines.
+- Other languages: fast regex/line scanners for JS/TS, Python, Rust, Java,
+  Ruby, PHP, and HTML.
+- The walk skips vendor/build/hidden directories, binary files, and files
+  larger than 512 KB; only files whose mtime/size changed are reparsed.
+- The rendered outline is capped at ~2,000 runes (~450–500 tokens) and injected
+  into the system prompt. It is refreshed on project creation and on each chat
+  turn; `write_file`/`patch_file` refresh just the affected file.
+
 ### 4. Compaction (`compact.go`)
 `POST /api/sessions/{id}/compact` → Summarize history with LLM → Replace in DB: summary + last 1-2 exchanges → Return new list.
 
@@ -120,9 +141,17 @@ projects: id, name, path(UNIQUE), icon_color, last_opened_at, total_cost_usd, se
 sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), tokens_in/out, cost_usd, is_open, updated_at
 messages: id, session_id(FK), role(user|assistant|tool), reasoning, content, tool_calls(JSON), created_at
 checklists: id, session_id(FK), task_text, is_done, position
+repo_outline: project_path, file_path, language, mtime_ns, size_bytes, symbols, updated_at
+              PRIMARY KEY(project_path, file_path)
 ```
 
-Indexes: sessions(project_id, is_open, updated_at), messages(session_id, id), checklists(session_id, position, id)
+Indexes: sessions(project_id, is_open, updated_at), messages(session_id, id),
+checklists(session_id, position, id). `repo_outline` is covered by its composite
+primary key `(project_path, file_path)`.
+
+`repo_outline` is keyed by the project's absolute CWD. Rows are upserted only
+when a file's mtime or size changes; removed files are pruned in the same
+transaction.
 
 ---
 
@@ -163,7 +192,7 @@ Indexes: sessions(project_id, is_open, updated_at), messages(session_id, id), ch
 |----------|-----------|
 | Project root | `tools.resolve()` — `filepath.Rel` + symlink resolution; rejects escapes |
 | Mode | `tools.Allowed(mode, name)` checked **before** execution AND in specs sent to LLM |
-| Sizes | Read 10MB max, grep skips >2MB, outputs truncated |
+| Sizes | Read window 200 lines (10MB file max), grep skips >2MB, scanner skips >512KB, outputs truncated |
 | Bash | `NO_COLOR=1`, `TERM=dumb`, timeout (default 30s, max 600s) |
 | Config | 0600; API key masked in responses |
 | DB | WAL, FK cascade |
@@ -218,6 +247,7 @@ internal/
   server/stream.go           # handleChatStream — core agent loop
   server/compact.go          # Conversation summarization
   tools/tools.go             # Tool defs + execution (read/grep/list/git/patch/write/bash/checklist)
+  tools/scanner.go           # Zero-AI repo map (Go AST + regex), SQLite cache, compact renderer
   logx/logx.go               # Leveled logging with file output
 web/
   index.html                 # SPA structure, modals, CDN deps

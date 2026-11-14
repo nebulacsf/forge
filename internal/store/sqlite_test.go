@@ -71,6 +71,50 @@ func TestOpenFreshAndCRUD(t *testing.T) {
 	}
 }
 
+func TestRepoOutlineSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	projectPath := "/tmp/outline-project"
+	initial := []RepoOutlineFile{
+		{ProjectPath: projectPath, FilePath: "main.go", Language: "go", MTimeNS: 10, SizeBytes: 100, Symbols: "L1 package main"},
+		{ProjectPath: projectPath, FilePath: "web/app.js", Language: "js", MTimeNS: 20, SizeBytes: 200, Symbols: "L1 func boot"},
+	}
+	if err := st.SyncRepoOutline(projectPath, initial, nil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.ListRepoOutline(projectPath)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows = %+v, %v", rows, err)
+	}
+	if rows[0].FilePath != "main.go" || rows[1].FilePath != "web/app.js" {
+		t.Fatalf("unexpected order: %+v", rows)
+	}
+
+	update := []RepoOutlineFile{
+		{ProjectPath: projectPath, FilePath: "main.go", Language: "go", MTimeNS: 11, SizeBytes: 120, Symbols: "L1 package main; L5 func main"},
+	}
+	if err := st.SyncRepoOutline(projectPath, update, []string{"web/app.js"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = st.ListRepoOutline(projectPath)
+	if err != nil || len(rows) != 1 || rows[0].MTimeNS != 11 {
+		t.Fatalf("updated rows = %+v, %v", rows, err)
+	}
+
+	if err := st.DeleteRepoOutline(projectPath); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = st.ListRepoOutline(projectPath)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rows after delete = %+v, %v", rows, err)
+	}
+}
+
 func TestOpenMovesIncompatibleLegacyDatabase(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "forge.db")

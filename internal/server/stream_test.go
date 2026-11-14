@@ -50,7 +50,9 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Messages) == 0 || req.Messages[0].Role != "system" ||
 		!strings.Contains(req.Messages[0].Content, "switch to BUILD") ||
-		!strings.Contains(req.Messages[0].Content, "FIRST action must be update_checklist") {
+		!strings.Contains(req.Messages[0].Content, "FIRST action must be update_checklist") ||
+		!strings.Contains(req.Messages[0].Content, "Repository outline") ||
+		!strings.Contains(req.Messages[0].Content, "GREP-FIRST RULE") {
 		http.Error(w, "PLAN system prompt missing required guidance", http.StatusBadRequest)
 		return
 	}
@@ -83,12 +85,13 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unexpected plan tool set", http.StatusBadRequest)
 			return
 		}
+		readArgs := `{"path":"main.go","start_line":1,"end_line":50}`
 		send(map[string]any{"id": "gen-1", "model": "mock/model", "choices": []any{
 			map[string]any{"delta": map[string]any{
 				"reasoning": "I should inspect the entry point.",
 				"tool_calls": []any{
 					map[string]any{"index": 0, "id": "call_read", "type": "function", "function": map[string]any{
-						"name": "read_file", "arguments": `{"path":`,
+						"name": "read_file", "arguments": readArgs[:10],
 					}},
 				},
 			}},
@@ -96,7 +99,7 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		send(map[string]any{"id": "gen-1", "choices": []any{
 			map[string]any{"delta": map[string]any{
 				"tool_calls": []any{
-					map[string]any{"index": 0, "function": map[string]any{"arguments": `"main.go"}`}},
+					map[string]any{"index": 0, "function": map[string]any{"arguments": readArgs[10:]}},
 					map[string]any{"index": 1, "id": "call_todo", "type": "function", "function": map[string]any{
 						"name": "update_checklist", "arguments": `{"action":"add","task_text":"Report the entry point"}`,
 					}},
@@ -194,6 +197,9 @@ func TestChatStreamToolLoop(t *testing.T) {
 				result, _ := ev["result"].(string)
 				if !strings.Contains(result, "func main()") {
 					t.Errorf("read_file result missing content: %q", result)
+				}
+				if !strings.Contains(result, "1 | package main") {
+					t.Errorf("read_file result missing line numbers: %q", result)
 				}
 				if isErr, _ := ev["is_error"].(bool); isErr {
 					t.Error("read_file unexpectedly errored")

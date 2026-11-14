@@ -32,7 +32,7 @@ Configured host/port are used when the flags are omitted.
 | Path | Purpose |
 | --- | --- |
 | `${FORGE_HOME:-~/.forge}/config.json` | Configuration (created on first run) |
-| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists) |
+| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists, repo outlines) |
 | `${FORGE_HOME:-~/.forge}/forge.log` | Application log (rotated to `forge.log.1` at 10 MB) |
 
 Both the directory (0700) and the files are created automatically. `FORGE_HOME`
@@ -59,6 +59,21 @@ Sessions are stored per project; open tabs are restored after a reload.
 
 At the start of a new task the agent records it in the checklist before reading
 files or running any other tool, and keeps the list updated as it works.
+
+### Token-saving behavior
+
+- **Grep first.** The system prompt requires the agent to locate a target with
+  `grep_search` or the repository outline before calling `read_file`.
+- **Bounded reads.** `read_file` requires explicit `start_line` and `end_line`
+  and returns at most **200 lines** per call. Larger requests are capped and
+  report the requested vs. returned range.
+- **Line-numbered output.** Every line is prefixed with its real line number
+  (`142 | func Save() {`) so the agent can pick precise edit locations.
+- **Local repo map.** Forge scans the project with Go's AST (and fast regex
+  scanners for other languages), caches symbols and line numbers in SQLite, and
+  injects a compact outline (~300–500 tokens) into the system prompt. No LLM
+  calls are used to build it. The cache refreshes when files change and when a
+  project is opened.
 
 In PLAN mode a completed turn ends with a **Plan ready — Switch to BUILD** card
 so it is always clear that files cannot change until you switch modes. If a

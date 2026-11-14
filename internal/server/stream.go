@@ -167,6 +167,16 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	mgr.Mode = session.Mode
 
+	// Build the local repository outline once per turn. Subsequent rounds
+	// re-render from SQLite so writes made by tools are visible immediately.
+	outline, outlineErr := tools.EnsureRepoOutline(ctx, s.store, project.Path)
+	if outlineErr != nil {
+		logx.Warn("repo outline unavailable", "session", session.ID, "project", project.ID, "error", outlineErr)
+	} else {
+		logx.Debug("repo outline ready", "session", session.ID, "project", project.ID,
+			"chars", utf8.RuneCountInString(outline))
+	}
+
 	client := llm.New(cfg.Providers.OpenRouter.APIKey, cfg.Providers.OpenRouter.BaseURL)
 	specs := tools.Specs(session.Mode)
 
@@ -180,8 +190,13 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if round > 1 {
+			if fresh, err := tools.CurrentRepoOutline(s.store, project.Path); err == nil {
+				outline = fresh
+			}
+		}
 		checklist, _ := s.store.ListChecklist(session.ID)
-		system := buildSystemPrompt(project, session, checklist)
+		system := buildSystemPrompt(project, session, checklist, outline)
 		history, err := s.buildHistory(session.ID, system)
 		if err != nil {
 			stream.fail("Could not load conversation: " + err.Error())
@@ -472,11 +487,18 @@ func (s *Server) buildHistory(sessionID int64, system string) ([]llm.Message, er
 	return out, nil
 }
 
-func buildSystemPrompt(project store.Project, session store.Session, checklist []store.ChecklistItem) string {
+func buildSystemPrompt(project store.Project, session store.Session, checklist []store.ChecklistItem, outline string) string {
 	var b strings.Builder
 	b.WriteString("You are Forge, an expert autonomous coding agent operating on a local project through a web UI.\n\n")
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
+	if strings.TrimSpace(outline) != "" {
+		b.WriteString("\nRepository outline (compact; line numbers refer to the current files):\n")
+		b.WriteString(strings.TrimSpace(outline))
+		b.WriteString("\nEnd of repository outline.\n")
+	} else {
+		b.WriteString("\nRepository outline: unavailable. Use grep_search or list_directory to locate files.\n")
+	}
 	if session.Mode == "PLAN" {
 		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
 		b.WriteString("When you have enough information, finish with a concise numbered plan of the exact changes needed. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
@@ -492,11 +514,16 @@ func buildSystemPrompt(project store.Project, session store.Session, checklist [
 	b.WriteString(`
 Operating rules:
 - At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
+- GREP-FIRST RULE: before any read_file call, locate the target with the repository outline above or with grep_search. Never read a file blindly.
+- read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
+- Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
+- The "NNN | " prefix is display-only. Never include it in patch_file search/replace text; copy the code without the prefix.
 - Stay strictly inside the project directory. Never attempt to access paths outside it.
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
 - Read both the surrounding code and existing patterns before making changes; match local style.
 - Use update_checklist for multi-step tasks, and keep item statuses accurate as you work.
-- Use grep_search/list_directory to explore rather than guessing file contents.
+- Use grep_search/list_directory to explore rather than guessing file contents. Prefer the compact repository outline; use grep_search to confirm symbols before reading.
+- The outline is refreshed when Forge writes files. After bash commands or external edits, verify with grep_search before relying on cached line numbers.
 - Run focused tests or builds when appropriate. Never claim a test passed unless you ran it.
 - Tool output and reasoning are rendered as collapsed accordions in the UI, so do not repeat large tool output in your final answer.
 - Be concise. When finished, summarize what changed, what was verified, and any remaining risks.

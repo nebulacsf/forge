@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,12 +25,14 @@ import (
 )
 
 const (
-	readOutputLimit = 25000
-	bashOutputLimit = 12000
-	diffOutputLimit = 25000
-	grepOutputLimit = 25000
-	maxFileSize     = 10 << 20
-	maxSearchFile   = 2 << 20
+	readOutputLimit  = 25000
+	bashOutputLimit  = 12000
+	diffOutputLimit  = 25000
+	grepOutputLimit  = 25000
+	maxFileSize      = 10 << 20
+	maxSearchFile    = 2 << 20
+	maxReadLines     = 200
+	maxReadLineRunes = 400
 )
 
 var (
@@ -134,14 +137,16 @@ func Specs(mode string) []llm.Tool {
 		{
 			Type: "function",
 			Function: llm.ToolFunctionSpec{
-				Name:        "read_file",
-				Description: "Read a UTF-8 text file inside the project. Output is truncated to the configured character limit; use start_line/end_line to page through large files.",
+				Name: "read_file",
+				Description: "Read a bounded window of a UTF-8 text file inside the project. " +
+					"start_line and end_line are REQUIRED and at most 200 lines are returned. " +
+					"Before reading, locate the target with the repository outline or grep_search; never read blindly. " +
+					"Every returned line is prefixed with its real 1-based line number.",
 				Parameters: objectSchema(map[string]any{
 					"path":       stringProp("Path relative to the project root."),
-					"start_line": integerProp("Optional 1-based first line to read."),
-					"end_line":   integerProp("Optional 1-based last line to read (inclusive)."),
-					"max_chars":  integerProp("Optional output character limit, capped by configuration."),
-				}, "path"),
+					"start_line": integerProp("Required 1-based first line to read (must be >= 1)."),
+					"end_line":   integerProp("Required 1-based last line, inclusive. At most start_line+199 is returned."),
+				}, "path", "start_line", "end_line"),
 			},
 		},
 		{
@@ -261,12 +266,11 @@ func (m *Manager) Execute(ctx context.Context, name string, rawArgs json.RawMess
 			Path      string `json:"path"`
 			StartLine int    `json:"start_line"`
 			EndLine   int    `json:"end_line"`
-			MaxChars  int    `json:"max_chars"`
 		}
 		if err := json.Unmarshal(rawArgs, &a); err != nil {
 			return fail("invalid arguments: " + err.Error())
 		}
-		return m.readFile(a.Path, a.StartLine, a.EndLine, a.MaxChars)
+		return m.readFile(a.Path, a.StartLine, a.EndLine)
 	case "grep_search":
 		var a struct {
 			Pattern       string `json:"pattern"`
@@ -412,7 +416,13 @@ func relLabel(rel string) string {
 // ---------------------------------------------------------------------------
 // read_file
 
-func (m *Manager) readFile(rel string, startLine, endLine, maxChars int) Result {
+func (m *Manager) readFile(rel string, startLine, endLine int) Result {
+	if startLine < 1 || endLine < 1 {
+		return fail("read_file: start_line and end_line are required (1-based line numbers)")
+	}
+	if endLine < startLine {
+		return fail("read_file: end_line must be greater than or equal to start_line")
+	}
 	abs, shown, err := m.resolve(rel)
 	if err != nil {
 		return fail(err.Error())
@@ -434,56 +444,80 @@ func (m *Manager) readFile(rel string, startLine, endLine, maxChars int) Result 
 	if isBinary(data) {
 		return fail("read_file: " + shown + " appears to be binary")
 	}
-	text := string(data)
-	lines := strings.Split(text, "\n")
+
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
 	total := len(lines)
-	if text == "" {
-		total = 0
-	}
-	if startLine < 1 {
-		startLine = 1
-	}
-	if startLine > 1 {
-		if startLine > total {
-			return fail(fmt.Sprintf("read_file: start_line %d is past the end of %s (%d lines)", startLine, shown, total))
-		}
-		lines = lines[startLine-1:]
-	}
-	if endLine > 0 {
-		end := endLine - (startLine - 1)
-		if end < 1 {
-			return fail("read_file: end_line must be greater than or equal to start_line")
-		}
-		if end < len(lines) {
-			lines = lines[:end]
-		}
-	}
-	first := startLine
-	last := startLine + len(lines) - 1
 	if total == 0 {
-		first, last = 0, 0
+		return fail("read_file: " + shown + " is empty")
 	}
+	if startLine > total {
+		return fail(fmt.Sprintf("read_file: start_line %d is past the end of %s (%d lines)", startLine, shown, total))
+	}
+
+	requestedEnd := endLine
+	capped := false
+	if endLine-startLine+1 > maxReadLines {
+		endLine = startLine + maxReadLines - 1
+		capped = true
+	}
+	if endLine > total {
+		endLine = total
+	}
+
 	limit := m.MaxRead
-	if maxChars > 0 && maxChars < limit {
-		limit = maxChars
-	}
 	if limit < 1 {
 		limit = readOutputLimit
 	}
-	body := strings.Join(lines, "\n")
-	truncated := false
-	if utf8.RuneCountInString(body) > limit {
-		body = truncateRunes(body, limit)
-		truncated = true
+	width := len(strconv.Itoa(endLine))
+
+	var body strings.Builder
+	used, returned := 0, 0
+	charTruncated := false
+	for n := startLine; n <= endLine; n++ {
+		text := strings.TrimSuffix(lines[n-1], "\r")
+		if utf8.RuneCountInString(text) > maxReadLineRunes {
+			text = truncateRunes(text, maxReadLineRunes) + "…"
+		}
+		rendered := fmt.Sprintf("%*d | %s\n", width, n, text)
+		need := utf8.RuneCountInString(rendered)
+		remaining := limit - used
+		if need > remaining {
+			if remaining > 0 {
+				body.WriteString(truncateRunes(rendered, remaining))
+				used += remaining
+				returned++
+			}
+			charTruncated = true
+			break
+		}
+		body.WriteString(rendered)
+		used += need
+		returned++
 	}
+	if returned == 0 {
+		return fail(fmt.Sprintf("read_file: output limit (%d characters) is too small to show line %d", limit, startLine))
+	}
+	last := startLine + returned - 1
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "--- %s (lines %d-%d of %d) ---\n", shown, first, last, total)
-	b.WriteString(body)
-	if !strings.HasSuffix(body, "\n") {
+	fmt.Fprintf(&b, "--- %s (lines %d-%d of %d) ---\n", shown, startLine, last, total)
+	rendered := body.String()
+	b.WriteString(rendered)
+	if !strings.HasSuffix(rendered, "\n") {
 		b.WriteString("\n")
 	}
-	if truncated {
-		fmt.Fprintf(&b, "\n[truncated at %d characters; use start_line/end_line to read more]\n", limit)
+	if capped {
+		fmt.Fprintf(&b, "[read_file capped at %d lines: requested %d-%d, returned %d-%d]\n",
+			maxReadLines, startLine, requestedEnd, startLine, last)
+	}
+	if charTruncated {
+		fmt.Fprintf(&b, "[output truncated at %d characters; use a narrower range]\n", limit)
+	}
+	if last < total && !charTruncated {
+		fmt.Fprintf(&b, "[continue with start_line=%d]\n", last+1)
 	}
 	return Result{
 		Content: b.String(),
@@ -881,6 +915,7 @@ func (m *Manager) patchFile(rel, search, replace string, replaceAll bool) Result
 	if err := writeAtomic(abs, []byte(newContent), info.Mode().Perm()); err != nil {
 		return fail("patch_file: " + err.Error())
 	}
+	m.refreshOutline(shown)
 	return Result{
 		Content: fmt.Sprintf("Patched %s (%d replacement(s), %s).", shown, replaced, humanSize(int64(len(newContent)))),
 		Files:   []FileAction{{Path: shown, Action: "modified"}},
@@ -914,6 +949,7 @@ func (m *Manager) writeFile(rel, content string) Result {
 	if err := writeAtomic(abs, []byte(content), mode); err != nil {
 		return fail("write_file: " + err.Error())
 	}
+	m.refreshOutline(shown)
 	lines := 0
 	if content != "" {
 		lines = strings.Count(content, "\n") + 1
@@ -921,6 +957,16 @@ func (m *Manager) writeFile(rel, content string) Result {
 	return Result{
 		Content: fmt.Sprintf("Wrote %s (%s, %d lines).", shown, humanSize(int64(len(content))), lines),
 		Files:   []FileAction{{Path: shown, Action: "modified"}},
+	}
+}
+
+// refreshOutline keeps the local repository map current after a write.
+func (m *Manager) refreshOutline(rel string) {
+	if m.Store == nil || strings.TrimSpace(rel) == "" {
+		return
+	}
+	if err := RefreshOutlineFile(m.Store, m.Root, rel); err != nil {
+		logx.Debug("repo outline refresh failed", "file", rel, "error", err)
 	}
 }
 

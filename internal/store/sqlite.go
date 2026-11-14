@@ -58,6 +58,18 @@ type ChecklistItem struct {
 	Position  int    `json:"position"`
 }
 
+// RepoOutlineFile is one cached file in a project's local repository map.
+// Symbols is a compact text form such as "L12 struct User; L30 func New".
+type RepoOutlineFile struct {
+	ProjectPath string `json:"project_path"`
+	FilePath    string `json:"file_path"`
+	Language    string `json:"language"`
+	MTimeNS     int64  `json:"mtime_ns"`
+	SizeBytes   int64  `json:"size_bytes"`
+	Symbols     string `json:"symbols"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
@@ -213,6 +225,17 @@ CREATE TABLE IF NOT EXISTS checklists (
 	task_text  TEXT NOT NULL,
 	is_done    INTEGER NOT NULL DEFAULT 0,
 	position   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS repo_outline (
+	project_path TEXT NOT NULL,
+	file_path    TEXT NOT NULL,
+	language     TEXT NOT NULL DEFAULT '',
+	mtime_ns     INTEGER NOT NULL DEFAULT 0,
+	size_bytes   INTEGER NOT NULL DEFAULT 0,
+	symbols      TEXT NOT NULL DEFAULT '',
+	updated_at   TEXT NOT NULL,
+	PRIMARY KEY (project_path, file_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, is_open, updated_at DESC);
@@ -653,4 +676,75 @@ func (s *Store) ReplaceChecklist(sessionID int64, tasks []string) error {
 		pos++
 	}
 	return tx.Commit()
+}
+
+// ---------------------------------------------------------------------------
+// Repository outline cache
+
+// ListRepoOutline returns the cached file outline for a project, ordered by path.
+func (s *Store) ListRepoOutline(projectPath string) ([]RepoOutlineFile, error) {
+	rows, err := s.db.Query(`
+		SELECT project_path, file_path, language, mtime_ns, size_bytes, symbols, updated_at
+		FROM repo_outline WHERE project_path = ? ORDER BY file_path ASC`, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RepoOutlineFile{}
+	for rows.Next() {
+		var f RepoOutlineFile
+		if err := rows.Scan(&f.ProjectPath, &f.FilePath, &f.Language, &f.MTimeNS,
+			&f.SizeBytes, &f.Symbols, &f.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// SyncRepoOutline applies a set of file outline upserts and deletions for a
+// project in one transaction. Files that are still fresh should be omitted.
+func (s *Store) SyncRepoOutline(projectPath string, upserts []RepoOutlineFile, deleted []string) error {
+	if len(upserts) == 0 && len(deleted) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, file := range deleted {
+		if _, err := tx.Exec(`DELETE FROM repo_outline WHERE project_path = ? AND file_path = ?`,
+			projectPath, file); err != nil {
+			return err
+		}
+	}
+	ts := now()
+	for _, f := range upserts {
+		updated := f.UpdatedAt
+		if updated == "" {
+			updated = ts
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO repo_outline
+				(project_path, file_path, language, mtime_ns, size_bytes, symbols, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(project_path, file_path) DO UPDATE SET
+				language = excluded.language,
+				mtime_ns = excluded.mtime_ns,
+				size_bytes = excluded.size_bytes,
+				symbols = excluded.symbols,
+				updated_at = excluded.updated_at`,
+			projectPath, f.FilePath, f.Language, f.MTimeNS, f.SizeBytes, f.Symbols, updated); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// DeleteRepoOutline removes every cached file for a project.
+func (s *Store) DeleteRepoOutline(projectPath string) error {
+	_, err := s.db.Exec(`DELETE FROM repo_outline WHERE project_path = ?`, projectPath)
+	return err
 }

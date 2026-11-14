@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,30 +47,70 @@ func run(t *testing.T, m *Manager, name string, args any) Result {
 }
 
 func TestReadFileAndTruncate(t *testing.T) {
-	m, _ := newTestManager(t, "PLAN", 45)
-	res := run(t, m, "read_file", map[string]any{"path": "hello.go"})
+	m, _ := newTestManager(t, "PLAN", 120)
+	res := run(t, m, "read_file", map[string]any{"path": "hello.go", "start_line": 1, "end_line": 4})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.Content)
 	}
 	if !strings.Contains(res.Content, "package hello") {
 		t.Errorf("missing content: %q", res.Content)
 	}
-	if !strings.Contains(res.Content, "[truncated at 45 characters") {
+	if !strings.Contains(res.Content, "1 | package hello") {
+		t.Errorf("missing line-number prefix: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "[output truncated at 120 characters") {
 		t.Errorf("expected truncation notice: %q", res.Content)
 	}
 	if len(res.Files) != 1 || res.Files[0].Action != "read" || res.Files[0].Path != "hello.go" {
 		t.Errorf("files = %+v", res.Files)
 	}
 
-	res = run(t, m, "read_file", map[string]any{"path": "blob.bin"})
+	res = run(t, m, "read_file", map[string]any{"path": "blob.bin", "start_line": 1, "end_line": 2})
 	if !res.IsError || !strings.Contains(res.Content, "binary") {
 		t.Errorf("binary read should fail: %+v", res)
 	}
 }
 
+func TestReadFileRequiresBoundsAndCapsRange(t *testing.T) {
+	m, root := newTestManager(t, "PLAN", 25000)
+
+	res := run(t, m, "read_file", map[string]any{"path": "hello.go"})
+	if !res.IsError || !strings.Contains(res.Content, "start_line") {
+		t.Errorf("missing bounds should fail: %+v", res)
+	}
+	res = run(t, m, "read_file", map[string]any{"path": "hello.go", "start_line": 3, "end_line": 2})
+	if !res.IsError || !strings.Contains(res.Content, "end_line") {
+		t.Errorf("reversed bounds should fail: %+v", res)
+	}
+
+	var b strings.Builder
+	for i := 1; i <= 250; i++ {
+		fmt.Fprintf(&b, "line %d\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(root, "long.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res = run(t, m, "read_file", map[string]any{"path": "long.txt", "start_line": 1, "end_line": 250})
+	if res.IsError {
+		t.Fatalf("capped read failed: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "200 | line 200") {
+		t.Errorf("expected line 200 in capped output: %q", res.Content)
+	}
+	if strings.Contains(res.Content, "201 | line 201") {
+		t.Errorf("output exceeded the 200-line cap: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "capped at 200 lines") {
+		t.Errorf("missing cap notice: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "[continue with start_line=201]") {
+		t.Errorf("missing continuation hint: %q", res.Content)
+	}
+}
+
 func TestPathEscapeAndSymlinks(t *testing.T) {
 	m, root := newTestManager(t, "BUILD", 25000)
-	res := run(t, m, "read_file", map[string]any{"path": "../outside.txt"})
+	res := run(t, m, "read_file", map[string]any{"path": "../outside.txt", "start_line": 1, "end_line": 10})
 	if !res.IsError {
 		t.Fatalf("path escape was allowed: %q", res.Content)
 	}
@@ -81,7 +122,7 @@ func TestPathEscapeAndSymlinks(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	res = run(t, m, "read_file", map[string]any{"path": "escape/secret.txt"})
+	res = run(t, m, "read_file", map[string]any{"path": "escape/secret.txt", "start_line": 1, "end_line": 10})
 	if !res.IsError {
 		t.Fatalf("symlink escape was allowed: %q", res.Content)
 	}
