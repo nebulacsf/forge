@@ -124,7 +124,7 @@ only to fail because of the mode.
 | `Ctrl+Shift+.` | Toggle PLAN / BUILD |
 | `Ctrl+Shift+/` | Focus the model picker |
 | `Ctrl+Shift+L` | Focus the chat composer |
-| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | Previous / next message |
+| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | Previous / next user message |
 
 All modifier shortcuts use **Ctrl+Shift** and are handled with `preventDefault`,
 so they do not reuse the combinations browsers and desktops reserve for the

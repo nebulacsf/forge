@@ -1743,13 +1743,13 @@ function handleShortcut(e) {
   if (key === 'arrowup') {
     if (modalOpen) return;
     e.preventDefault();
-    navigateMessage(-1);
+    navigateUserMessage(-1);
     return;
   }
   if (key === 'arrowdown') {
     if (modalOpen) return;
     e.preventDefault();
-    navigateMessage(1);
+    navigateUserMessage(1);
   }
 }
 
@@ -1777,9 +1777,12 @@ async function toggleMode() {
   if (updated) setModeUI(updated.mode);
 }
 
-function navigateMessage(dir) {
-  const items = [...$('messages').querySelectorAll('.msg')];
+function navigateUserMessage(dir) {
+  // Cycle only the user's own messages; assistant/tool rounds are skipped.
+  const all = [...$('messages').querySelectorAll('.msg')];
+  const items = all.filter((el) => el.classList.contains('msg-user'));
   if (!items.length) return;
+  all.forEach((el) => el.classList.remove('msg-focus'));
   let idx = state.messageIndex;
   if (idx < 0 || idx >= items.length) {
     idx = dir > 0 ? -1 : items.length;
