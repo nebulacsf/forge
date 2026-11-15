@@ -161,7 +161,7 @@ Forge builds a zero-AI outline of the project and stores one row per file in
 Every provider round rebuilds the request from persisted rows. Before sending,
 Forge prunes tool traffic so a long turn does not re-inject every prior result:
 
-- The last `history_keep_recent_rounds` tool rounds (default 32) are sent
+- The last `history_keep_recent_rounds` tool rounds (default 36, max 100) are sent
   verbatim, except that each result is clipped head+tail to
   `history_max_result_chars` (default 16,000) and oversized arguments are
   replaced with a compact, valid JSON summary (`history_max_arg_chars`, default
@@ -171,7 +171,7 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
   one-line `[pruned] tool target → outcome` digest. Nothing is removed,
   reordered, or merged, so the message count and `tool_call_id` pairing stay
   valid. Old errors keep a short `ERROR:` digest.
-- Pruning advances in chunks of `history_prune_chunk_rounds` (default 16). Within
+- Pruning advances in chunks of `history_prune_chunk_rounds` (default 24, max 100). Within
   a chunk the request is strictly append-only; only when a whole chunk becomes
   old do those rounds switch to stubs. This keeps most consecutive requests as
   an exact prefix of the next one, which is what provider prompt caching needs.

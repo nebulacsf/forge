@@ -91,8 +91,8 @@ func TestNormalizeRejectsNegativeCostCap(t *testing.T) {
 
 func TestNormalizeHistoryPruningDefaults(t *testing.T) {
 	got := normalize(Default())
-	if got.Defaults.HistoryKeepRecent != 32 {
-		t.Errorf("history_keep_recent_rounds = %d, want 32", got.Defaults.HistoryKeepRecent)
+	if got.Defaults.HistoryKeepRecent != 36 {
+		t.Errorf("history_keep_recent_rounds = %d, want 36", got.Defaults.HistoryKeepRecent)
 	}
 	if got.Defaults.HistoryMaxResult != 16000 {
 		t.Errorf("history_max_result_chars = %d, want 16000", got.Defaults.HistoryMaxResult)
@@ -100,20 +100,20 @@ func TestNormalizeHistoryPruningDefaults(t *testing.T) {
 	if got.Defaults.HistoryMaxArg != 4000 {
 		t.Errorf("history_max_arg_chars = %d, want 4000", got.Defaults.HistoryMaxArg)
 	}
-	if got.Defaults.HistoryPruneChunk != 16 {
-		t.Errorf("history_prune_chunk_rounds = %d, want 16", got.Defaults.HistoryPruneChunk)
+	if got.Defaults.HistoryPruneChunk != 24 {
+		t.Errorf("history_prune_chunk_rounds = %d, want 24", got.Defaults.HistoryPruneChunk)
 	}
 }
 
 func TestNormalizeClampsHistoryPruning(t *testing.T) {
 	c := Default()
-	c.Defaults.HistoryKeepRecent = 99
+	c.Defaults.HistoryKeepRecent = 150
 	c.Defaults.HistoryMaxResult = 10
 	c.Defaults.HistoryMaxArg = -5
-	c.Defaults.HistoryPruneChunk = 99
+	c.Defaults.HistoryPruneChunk = 150
 	got := normalize(c)
-	if got.Defaults.HistoryKeepRecent != 40 {
-		t.Errorf("history_keep_recent_rounds = %d, want 40", got.Defaults.HistoryKeepRecent)
+	if got.Defaults.HistoryKeepRecent != 100 {
+		t.Errorf("history_keep_recent_rounds = %d, want 100", got.Defaults.HistoryKeepRecent)
 	}
 	if got.Defaults.HistoryMaxResult != 500 {
 		t.Errorf("history_max_result_chars = %d, want 500", got.Defaults.HistoryMaxResult)
@@ -121,20 +121,20 @@ func TestNormalizeClampsHistoryPruning(t *testing.T) {
 	if got.Defaults.HistoryMaxArg != 4000 {
 		t.Errorf("history_max_arg_chars = %d, want default 4000 for negative input", got.Defaults.HistoryMaxArg)
 	}
-	if got.Defaults.HistoryPruneChunk != 20 {
-		t.Errorf("history_prune_chunk_rounds = %d, want 20", got.Defaults.HistoryPruneChunk)
+	if got.Defaults.HistoryPruneChunk != 100 {
+		t.Errorf("history_prune_chunk_rounds = %d, want 100", got.Defaults.HistoryPruneChunk)
 	}
 }
 
 func TestNormalizeHistoryPruneChunkFallsBack(t *testing.T) {
 	c := Default()
 	c.Defaults.HistoryPruneChunk = 0
-	if got := normalize(c); got.Defaults.HistoryPruneChunk != 16 {
-		t.Errorf("history_prune_chunk_rounds = %d, want default 16 for zero input", got.Defaults.HistoryPruneChunk)
+	if got := normalize(c); got.Defaults.HistoryPruneChunk != 24 {
+		t.Errorf("history_prune_chunk_rounds = %d, want default 24 for zero input", got.Defaults.HistoryPruneChunk)
 	}
 	c.Defaults.HistoryPruneChunk = -3
-	if got := normalize(c); got.Defaults.HistoryPruneChunk != 16 {
-		t.Errorf("history_prune_chunk_rounds = %d, want default 16 for negative input", got.Defaults.HistoryPruneChunk)
+	if got := normalize(c); got.Defaults.HistoryPruneChunk != 24 {
+		t.Errorf("history_prune_chunk_rounds = %d, want default 24 for negative input", got.Defaults.HistoryPruneChunk)
 	}
 }
 

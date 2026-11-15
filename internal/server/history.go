@@ -47,8 +47,8 @@ func normalizeHistoryOptions(o historyOptions) historyOptions {
 		o.KeepRecent = defaultHistoryKeepRecent
 	}
 	// PLAN raises KeepRecent to plan_rounds+2, and plan_rounds can be 24.
-	if o.KeepRecent > 40 {
-		o.KeepRecent = 40
+	if o.KeepRecent > 100 {
+		o.KeepRecent = 100
 	}
 	if o.MaxResultChars < 0 {
 		o.MaxResultChars = defaultHistoryMaxResult
@@ -59,8 +59,8 @@ func normalizeHistoryOptions(o historyOptions) historyOptions {
 	if o.ChunkRounds <= 0 {
 		o.ChunkRounds = defaultHistoryChunk
 	}
-	if o.ChunkRounds > 20 {
-		o.ChunkRounds = 20
+	if o.ChunkRounds > 100 {
+		o.ChunkRounds = 100
 	}
 	return o
 }

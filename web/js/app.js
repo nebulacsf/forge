@@ -2476,10 +2476,10 @@ function openSettings() {
   $('maxTurnCost').value = cfg.defaults.max_turn_cost_usd ?? 0;
   $('planRounds').value = cfg.defaults.plan_rounds ?? 16;
   $('planToolCalls').value = cfg.defaults.plan_tool_calls ?? 64;
-  $('historyKeepRecent').value = cfg.defaults.history_keep_recent_rounds ?? 32;
+  $('historyKeepRecent').value = cfg.defaults.history_keep_recent_rounds ?? 36;
   $('historyMaxResult').value = cfg.defaults.history_max_result_chars ?? 16000;
   $('historyMaxArg').value = cfg.defaults.history_max_arg_chars ?? 4000;
-  $('historyPruneChunk').value = cfg.defaults.history_prune_chunk_rounds ?? 16;
+  $('historyPruneChunk').value = cfg.defaults.history_prune_chunk_rounds ?? 24;
   $('autoContinue').checked = cfg.defaults.auto_continue !== false;
   $('serverHost').value = cfg.server.host || '127.0.0.1';
   $('serverPort').value = cfg.server.port || 7890;
@@ -2512,10 +2512,10 @@ async function saveSettings(e) {
     const n = Number(raw);
     return Number.isFinite(n) ? n : fallback;
   };
-  cfg.defaults.history_keep_recent_rounds = numOr('historyKeepRecent', 32);
+  cfg.defaults.history_keep_recent_rounds = numOr('historyKeepRecent', 36);
   cfg.defaults.history_max_result_chars = numOr('historyMaxResult', 16000);
   cfg.defaults.history_max_arg_chars = numOr('historyMaxArg', 4000);
-  cfg.defaults.history_prune_chunk_rounds = numOr('historyPruneChunk', 16);
+  cfg.defaults.history_prune_chunk_rounds = numOr('historyPruneChunk', 24);
   cfg.defaults.auto_continue = $('autoContinue').checked;
   cfg.server.host = $('serverHost').value.trim();
   cfg.server.port = Number($('serverPort').value) || 7890;
@@ -2553,10 +2553,10 @@ function resetDefaults() {
   $('maxTurnCost').value = 0;
   $('planRounds').value = 16;
   $('planToolCalls').value = 32;
-  $('historyKeepRecent').value = 32;
+  $('historyKeepRecent').value = 36;
   $('historyMaxResult').value = 16000;
   $('historyMaxArg').value = 4000;
-  $('historyPruneChunk').value = 16;
+  $('historyPruneChunk').value = 24;
   $('autoContinue').checked = true;
   $('serverHost').value = '127.0.0.1';
   $('serverPort').value = 7890;
