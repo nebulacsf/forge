@@ -63,6 +63,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
 	mux.HandleFunc("PATCH /api/projects/{id}", s.handlePatchProject)
 	mux.HandleFunc("DELETE /api/projects/{id}", s.handleDeleteProject)
+	mux.HandleFunc("GET /api/projects/{id}/files", s.handleListProjectFiles)
 	mux.HandleFunc("GET /api/projects/{id}/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/projects/{id}/sessions", s.handleCreateSession)
 
@@ -447,6 +448,41 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	logx.Info("project deleted", "project", id)
 	projects, _ := s.store.ListProjects()
 	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
+}
+
+// handleListProjectFiles lists the project files available to the composer's
+// "@" attachment picker. Hidden entries, symlinks and vendor/build directories
+// are skipped; the query parameter q filters by case-insensitive substring.
+func (s *Server) handleListProjectFiles(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	project, err := s.store.GetProject(id)
+	if err != nil {
+		apiError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	files, err := tools.ProjectFiles(project.Path, 0)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q"))); q != "" {
+		filtered := make([]tools.ProjectFile, 0, len(files))
+		for _, f := range files {
+			if strings.Contains(strings.ToLower(f.Path), q) {
+				filtered = append(filtered, f)
+			}
+		}
+		files = filtered
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project_id": project.ID,
+		"root":       project.Path,
+		"files":      files,
+	})
 }
 
 // warmRepoOutline builds the local repository map in the background so the

@@ -122,11 +122,22 @@
         </div>
 
         <div class="composer-wrap flex-shrink-0">
-          <div class="composer mx-auto">
-            <textarea id="promptInput" rows="1" placeholder="Ask Forge to explore, explain, or build…"
+          <div class="composer mx-auto position-relative">
+            <div id="attachmentChips" class="composer-chips d-none"></div>
+            <div id="filePicker" class="file-picker d-none" role="listbox" aria-label="Attach project files">
+              <div class="file-picker-head">
+                <span><i class="bi bi-paperclip"></i> Attach project files</span>
+                <span id="filePickerCount" class="file-picker-count"></span>
+              </div>
+              <div id="filePickerList" class="file-picker-list" role="presentation"></div>
+              <div class="file-picker-foot">
+                <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> attach · <kbd>Esc</kbd> close
+              </div>
+            </div>
+            <textarea id="promptInput" rows="1" placeholder="Ask Forge to explore, explain, or build… (type @ to attach files)"
                       aria-label="Message"></textarea>
             <div class="composer-actions">
-              <span class="composer-hint">Enter to send · Shift+Enter for newline</span>
+              <span class="composer-hint">Enter to send · Shift+Enter for newline · @ attach files</span>
               <button id="stopBtn" class="btn btn-stop d-none" type="button" title="Stop generation">
                 <i class="bi bi-stop-fill"></i> Stop
               </button>

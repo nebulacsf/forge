@@ -92,9 +92,10 @@ func (s *sseWriter) fail(msg string) {
 // executes tool calls, appends history, and emits typed SSE events.
 func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SessionID int64  `json:"session_id"`
-		Content   string `json:"content"`
-		Continue  bool   `json:"continue"`
+		SessionID   int64    `json:"session_id"`
+		Content     string   `json:"content"`
+		Continue    bool     `json:"continue"`
+		Attachments []string `json:"attachments"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		apiError(w, http.StatusBadRequest, err.Error())
@@ -108,7 +109,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	if body.Continue && body.Content == "" {
 		body.Content = continuePrompt
 	}
-	if body.Content == "" {
+	if body.Content == "" && len(body.Attachments) == 0 {
 		apiError(w, http.StatusBadRequest, "message cannot be empty")
 		return
 	}
@@ -197,15 +198,29 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		finish(false)
 	}
 
+	// Files pinned with the composer's "@" picker are inlined into the persisted
+	// user message so the model sees them and later turns keep the context.
+	userContent := body.Content
+	if block := buildAttachmentBlock(project.Path, body.Attachments); block != "" {
+		if userContent == "" {
+			userContent = "Attached context."
+		}
+		userContent += "\n\n" + block
+	}
+
 	// Persist the user message first.
-	if _, err := s.store.AddMessage(session.ID, "user", "", body.Content, ""); err != nil {
+	if _, err := s.store.AddMessage(session.ID, "user", "", userContent, ""); err != nil {
 		stream.fail("Could not save message: " + err.Error())
 		return
 	}
 	_ = s.store.TouchProject(project.ID)
 
 	if session.Title == "" || session.Title == "New Chat" {
-		title := deriveTitle(body.Content)
+		titleSource := body.Content
+		if strings.TrimSpace(titleSource) == "" && len(body.Attachments) > 0 {
+			titleSource = "Attach " + strings.Join(body.Attachments, ", ")
+		}
+		title := deriveTitle(titleSource)
 		if updated, err := s.store.UpdateSession(session.ID, &title, nil, nil, nil); err == nil {
 			session = updated
 			stream.send(chatEvent{Type: "session", Session: &session})
@@ -859,7 +874,7 @@ func buildSystemPrompt(project store.Project, session store.Session, segmentSize
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
 	if session.Mode == "PLAN" {
 		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
-		b.WriteString("When you have enough information, finish with a concise numbered plan of the exact changes needed. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
+		b.WriteString("When you have enough information, finish with a detailed plan: the exact changes needed, the evidence that justifies them, and the open questions. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
 	} else {
 		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them.\n")
 	}
@@ -913,9 +928,20 @@ Response style (strict):
 - No preamble, no praise, no restating code, no long explanations.
 `)
 	if session.Mode == "PLAN" {
-		b.WriteString("- PLAN final message: Markdown text only, no tool-call syntax. The numbered plan, at most 7 one-line items, then the ready line. No extra commentary.\n")
+		b.WriteString(`- PLAN final message: Markdown text only, no tool-call syntax. It is the deliverable, so it must be detailed enough to implement without re-reading the code. Use exactly these sections, in this order:
+  ## Plan
+  1. **path/to/file.go:120-148** — symbol/function: the exact change to make and why. One item per change, at most 8 items. Never collapse two files into one item.
+  ## Decisions & assumptions
+  - One line per decision or assumption that shaped the plan (why this file, why this approach, what was assumed).
+  ## Findings
+  - One line per relevant file or symbol, with the line range that justifies the plan (the evidence you gathered).
+  ## Open questions
+  - One short line per remaining doubt, or "None." when nothing is uncertain.
+  Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
+  Rules: never repeat raw tool output or file dumps; never write a vague summary ("update the UI", "improve the prompt") — always name the file, the line range, the symbol, and the concrete change.
+`)
 	} else {
-		b.WriteString("- BUILD final message: at most 3 short bullets — (1) what changed, with file paths; (2) what you verified; (3) blockers or next step.\n")
+		b.WriteString("- BUILD final message: the most compact possible output — at most 3 one-line bullets (about 12 words each): (1) what changed, with file paths; (2) what you verified; (3) blockers or next step. No headings, no sections, no explanations, no unrequested code.\n")
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -967,10 +993,13 @@ func buildFinalPlanNote(reason string, planRounds, planToolCalls, usedRounds, us
 	if attempt > 1 {
 		b.WriteString("Your previous final response was not a usable plan (empty, reasoning-only, or a tool call written as text). This time write the plan in Markdown only.\n")
 	}
-	b.WriteString(`Write the final answer now, in normal response content:
-- The numbered plan of the exact changes (file + concrete change), at most 7 one-line items.
+	b.WriteString(`Write the final answer now, in normal response content, with the full PLAN deliverable:
+- "## Plan": numbered items, each one "**path/to/file.go:120-148** — symbol: exact change and why" (at most 8 items).
+- "## Decisions & assumptions": one line per decision or assumption.
+- "## Findings": one line per relevant file or symbol with the justifying line range (evidence only, never raw tool output).
+- "## Open questions": one short line per remaining doubt, or "None.".
 - Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
-- If something is still uncertain, state it as an assumption or an open question in one short line; do not try to research further.`)
+Do not try to research further; if something is missing, state the assumption instead.`)
 	return b.String()
 }
 

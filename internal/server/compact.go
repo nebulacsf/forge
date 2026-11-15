@@ -179,7 +179,12 @@ func compactTranscript(messages []store.Message) (string, int) {
 func compactMessageText(m store.Message) string {
 	switch m.Role {
 	case "user":
-		text := strings.TrimSpace(m.Content)
+		// Attachments can be tens of thousands of chars; the summary only needs
+		// the intent plus the list of pinned paths.
+		text := stripAttachmentBlocks(m.Content)
+		if text == "" {
+			text = attachmentPathList(m.Content)
+		}
 		if text == "" {
 			return ""
 		}

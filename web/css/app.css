@@ -497,6 +497,35 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   word-break: break-word;
 }
 
+/* Attached-file chips inside a sent user bubble */
+.msg-user .bubble-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 7px;
+}
+.msg-user .bubble-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 240px;
+  padding: 1px 6px;
+  border: 1px solid var(--bubble-border);
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.7;
+}
+.msg-user .bubble-file > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
 .assistant-round {
   display: flex;
   gap: 10px;
@@ -646,23 +675,24 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 
 .reasoning-card .event-body pre { color: var(--muted); font-family: inherit; font-size: 12px; }
 
-/* Markdown */
-.md { color: var(--text-soft); font-size: 13.5px; line-height: 1.66; word-break: break-word; }
+/* Markdown — this is the assistant's result area, so it reads larger than
+   chrome text: plans and reports must stay easy to scan. */
+.md { color: var(--text-soft); font-size: 15px; line-height: 1.72; word-break: break-word; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
-.md p { margin: 0 0 .8em; }
+.md p { margin: 0 0 .85em; }
 .md h1, .md h2, .md h3, .md h4 {
   color: var(--text);
   font-weight: 650;
   line-height: 1.3;
   margin: 1.15em 0 .45em;
 }
-.md h1 { font-size: 1.35em; }
-.md h2 { font-size: 1.2em; }
-.md h3 { font-size: 1.06em; }
-.md h4 { font-size: .98em; }
-.md ul, .md ol { margin: 0 0 .8em; padding-left: 1.4em; }
-.md li { margin: .18em 0; }
+.md h1 { font-size: 1.32em; }
+.md h2 { font-size: 1.22em; }
+.md h3 { font-size: 1.1em; }
+.md h4 { font-size: 1em; }
+.md ul, .md ol { margin: 0 0 .85em; padding-left: 1.45em; }
+.md li { margin: .3em 0; }
 .md li::marker { color: var(--muted-2); }
 .md strong { color: var(--text); font-weight: 650; }
 .md em { color: var(--text); }
@@ -684,10 +714,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   border-radius: var(--radius-sm);
   background: var(--code-bg);
   overflow: auto;
-  font-size: 12px;
-  line-height: 1.55;
+  font-size: 13px;
+  line-height: 1.58;
 }
-.md pre code { padding: 0; background: transparent; color: var(--text-soft); font-size: 11.5px; }
+.md pre code { padding: 0; background: transparent; color: var(--text-soft); font-size: 12.5px; }
 .md .code-block { position: relative; }
 .md .code-copy {
   position: absolute;
@@ -923,6 +953,144 @@ kbd {
   font-size: 9.5px;
   text-align: center;
   letter-spacing: .02em;
+}
+
+/* Attached-file chips inside the composer */
+.composer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 0 2px 7px;
+}
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 260px;
+  padding: 2px 5px 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+  color: var(--accent-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.6;
+}
+.composer-chip > i { font-size: 9.5px; flex: 0 0 auto; }
+.composer-chip .chip-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-chip .chip-remove {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1;
+  opacity: .65;
+  cursor: pointer;
+}
+.composer-chip .chip-remove:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--red) 22%, transparent);
+  color: var(--red);
+}
+
+/* "@" file picker dropdown */
+.file-picker {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  box-shadow: var(--shadow);
+}
+.file-picker.d-none { display: none !important; }
+.file-picker-head,
+.file-picker-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  color: var(--muted-2);
+  font-size: 10px;
+  letter-spacing: .02em;
+}
+.file-picker-head {
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-3);
+  color: var(--text-soft);
+  font-weight: 650;
+}
+.file-picker-head > i { color: var(--accent-2); }
+.file-picker-count { font-family: var(--mono); font-size: 9.5px; color: var(--muted-2); }
+.file-picker-foot { border-top: 1px solid var(--border-soft); }
+.file-picker-foot kbd {
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-3);
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+.file-picker-list {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px;
+  scrollbar-width: thin;
+}
+.file-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: 5px;
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  min-width: 0;
+}
+.file-picker-item > i { flex: 0 0 auto; color: var(--muted-2); font-size: 11px; }
+.file-picker-item .picker-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+.file-picker-item .picker-size { flex: 0 0 auto; color: var(--muted-2); font-size: 9.5px; }
+.file-picker-item:hover { background: var(--hover); }
+.file-picker-item.active {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+.file-picker-item.active > i { color: var(--accent-2); }
+.file-picker-item.already { opacity: .5; }
+.file-picker-empty {
+  padding: 14px 10px;
+  color: var(--muted-2);
+  font-size: 11px;
+  text-align: center;
 }
 
 /* ── Inspector (context panel) ────────────────────────────────────── */

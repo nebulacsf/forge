@@ -21,6 +21,10 @@ const state = {
   session: null,
   checklist: [],
   files: new Map(),
+  // Files pinned with the composer's "@" picker for the next message.
+  attachments: [],
+  fileCache: null,
+  filePicker: { open: false, mention: null, files: [], matches: [], index: 0 },
   usage: {
     sessionIn: 0,
     sessionOut: 0,
@@ -681,13 +685,33 @@ function addPlanReadyCard() {
   $('messages').appendChild(card);
 }
 
-function appendUserMessage(text) {
+function appendUserMessage(text, attachments = []) {
+  const parsed = splitAttachmentBlock(text);
+  const body = parsed.text;
+  const files = attachments.length ? attachments.slice() : parsed.files;
   const wrap = document.createElement('div');
   wrap.className = 'msg msg-user';
   const bubble = document.createElement('div');
   bubble.className = 'user-bubble';
-  bubble.textContent = text;
-  const btn = makeCopyButton('msg-copy', 'Copy message', (b) => copyToClipboard(text, b));
+  if (body) bubble.textContent = body;
+  if (files.length) {
+    const chips = document.createElement('div');
+    chips.className = 'bubble-files';
+    for (const path of files) {
+      const chip = document.createElement('span');
+      chip.className = 'bubble-file';
+      const icon = document.createElement('i');
+      icon.className = 'bi bi-file-earmark-code';
+      const label = document.createElement('span');
+      label.textContent = path;
+      chip.appendChild(icon);
+      chip.appendChild(label);
+      chips.appendChild(chip);
+    }
+    bubble.appendChild(chips);
+  }
+  const copyText = [body, ...files.map((f) => '@' + f)].filter(Boolean).join('\n');
+  const btn = makeCopyButton('msg-copy', 'Copy message', (b) => copyToClipboard(copyText, b));
   wrap.appendChild(btn);
   wrap.appendChild(bubble);
   $('messages').appendChild(wrap);
@@ -752,7 +776,8 @@ async function sendMessage() {
   if (state.streaming) return;
   const prompt = $('promptInput');
   const text = prompt.value.trim();
-  if (!text) return;
+  const attachments = state.attachments.slice();
+  if (!text && !attachments.length) return;
   if (!state.session) {
     if (!state.activeProjectId) {
       toast('Select or register a project first', 'error');
@@ -768,9 +793,10 @@ async function sendMessage() {
   }
 
   prompt.value = '';
+  clearAttachments();
   resizePrompt();
   updateSendState();
-  await runTurn({ content: text, userText: text });
+  await runTurn({ content: text, userText: text, attachments });
 }
 
 // continueTurn resumes a paused turn from its checkpoint. The server persists
@@ -780,10 +806,10 @@ async function continueTurn() {
   await runTurn({ isContinue: true, userText: 'Continue from where you left off.' });
 }
 
-async function runTurn({ content = '', isContinue = false, userText = content }) {
+async function runTurn({ content = '', isContinue = false, userText = content, attachments = [] }) {
   removePlanReadyCard();
   updateSendState();
-  appendUserMessage(userText);
+  appendUserMessage(userText, attachments);
   hideEmpty();
   state.messageIndex = -1;
   maybeScroll(true);
@@ -807,7 +833,7 @@ async function runTurn({ content = '', isContinue = false, userText = content })
   try {
     const payload = isContinue
       ? { session_id: state.session.id, continue: true }
-      : { session_id: state.session.id, content };
+      : { session_id: state.session.id, content, attachments };
     const res = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1844,7 +1870,8 @@ function updateControls() {
 
 function updateSendState() {
   const prompt = $('promptInput');
-  $('sendBtn').disabled = state.streaming || !state.session || !prompt.value.trim();
+  const hasBody = !!prompt.value.trim() || state.attachments.length > 0;
+  $('sendBtn').disabled = state.streaming || !state.session || !hasBody;
 }
 
 function maybeScroll(force = false) {
@@ -1884,6 +1911,318 @@ function resizePrompt() {
   const el = $('promptInput');
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 230) + 'px';
+}
+
+/* ── Attachments ("@" file picker) ───────────────────────────────── */
+
+// Persisted user messages carry inline attachments wrapped in these tags, so
+// transcript bubbles can show the files without dumping their content.
+const ATTACHMENT_OPEN = '<attachments>';
+const ATTACHMENT_CLOSE = '</attachments>';
+
+function splitAttachmentBlock(text) {
+  const source = String(text || '');
+  const start = source.indexOf(ATTACHMENT_OPEN);
+  if (start < 0) return { text: source.trim(), files: [] };
+  const end = source.indexOf(ATTACHMENT_CLOSE, start);
+  const head = (end < 0 ? source.slice(0, start) : source.slice(0, start)).trim();
+  const block = source.slice(start, end < 0 ? undefined : end);
+  const tail = end < 0 ? '' : source.slice(end + ATTACHMENT_CLOSE.length).trim();
+  const files = [...block.matchAll(/<file path="([^"]+)"/g)].map((m) => m[1]);
+  return { text: [head, tail].filter(Boolean).join('\n'), files };
+}
+
+function formatFileSize(bytes) {
+  const n = Number(bytes || 0);
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB';
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+function detectMention() {
+  const el = $('promptInput');
+  if (!el || el.disabled) return null;
+  const caret = typeof el.selectionStart === 'number' ? el.selectionStart : el.value.length;
+  const before = el.value.slice(0, caret);
+  // "@" must start a word so emails and handles never open the picker.
+  const match = /(^|[\s([])@([^\s@]*)$/.exec(before);
+  if (!match) return null;
+  return { start: caret - match[2].length - 1, end: caret, query: match[2] };
+}
+
+async function loadProjectFiles() {
+  if (!state.activeProjectId) return [];
+  if (state.fileCache && state.fileCache.projectId === state.activeProjectId) {
+    return state.fileCache.files;
+  }
+  try {
+    const data = await api(`/api/projects/${state.activeProjectId}/files`);
+    const files = Array.isArray(data.files) ? data.files : [];
+    state.fileCache = { projectId: state.activeProjectId, files };
+    return files;
+  } catch (err) {
+    toast(err.message, 'error');
+    return [];
+  }
+}
+
+function rankFileMatches(files, query) {
+  const q = query.toLowerCase().trim();
+  if (!q) {
+    return files.slice().sort((a, b) => a.path.localeCompare(b.path)).slice(0, 80);
+  }
+  const scored = [];
+  for (const file of files) {
+    const path = file.path.toLowerCase();
+    const base = path.slice(path.lastIndexOf('/') + 1);
+    let score = -1;
+    if (base.startsWith(q)) score = 0;
+    else if (path.endsWith('/' + q) || path === q) score = 1;
+    else if (base.includes(q)) score = 2;
+    else if (path.includes(q)) score = 3;
+    else if (subsequence(q, path)) score = 4;
+    if (score >= 0) scored.push({ file, score, len: file.path.length });
+  }
+  scored.sort((a, b) => a.score - b.score || a.len - b.len || a.file.path.localeCompare(b.file.path));
+  return scored.slice(0, 80).map((s) => s.file);
+}
+
+function subsequence(needle, haystack) {
+  let i = 0;
+  for (let j = 0; j < haystack.length && i < needle.length; j++) {
+    if (haystack[j] === needle[i]) i++;
+  }
+  return i === needle.length;
+}
+
+function fileIcon(language) {
+  const lang = String(language || '').toLowerCase();
+  if (lang === 'go') return 'bi-filetype-go';
+  if (lang === 'js' || lang === 'javascript') return 'bi-filetype-js';
+  if (lang === 'ts' || lang === 'typescript') return 'bi-filetype-ts';
+  if (lang === 'html') return 'bi-filetype-html';
+  if (lang === 'css') return 'bi-filetype-css';
+  if (lang === 'json') return 'bi-filetype-json';
+  if (lang === 'md') return 'bi-filetype-md';
+  if (lang === 'py' || lang === 'python') return 'bi-filetype-py';
+  if (lang === 'sh' || lang === 'bash') return 'bi-filetype-sh';
+  return 'bi-file-earmark-code';
+}
+
+async function openFilePicker(mention) {
+  const picker = $('filePicker');
+  if (!picker) return;
+  state.filePicker.open = true;
+  state.filePicker.mention = mention;
+  state.filePicker.index = 0;
+  picker.classList.remove('d-none');
+
+  const files = await loadProjectFiles();
+  // The user may have kept typing or closed the picker while the list loaded.
+  if (!state.filePicker.open || !state.filePicker.mention ||
+      state.filePicker.mention.query !== mention.query) return;
+  state.filePicker.files = files;
+  state.filePicker.matches = rankFileMatches(files, mention.query);
+  state.filePicker.index = 0;
+  renderFilePicker();
+}
+
+function closeFilePicker() {
+  const picker = $('filePicker');
+  state.filePicker.open = false;
+  state.filePicker.mention = null;
+  state.filePicker.matches = [];
+  state.filePicker.index = 0;
+  if (picker) picker.classList.add('d-none');
+}
+
+// syncMentionPicker is the single entry point that keeps the dropdown in sync
+// with the caret while the user types, pastes, clicks or moves inside the box.
+function syncMentionPicker() {
+  const mention = detectMention();
+  if (!mention) {
+    if (state.filePicker.open) closeFilePicker();
+    return;
+  }
+  const same = state.filePicker.open &&
+    state.filePicker.mention &&
+    state.filePicker.mention.query === mention.query;
+  state.filePicker.mention = mention;
+  if (same) return;
+  openFilePicker(mention);
+}
+
+// handlePickerKey consumes the keys the dropdown needs. It returns true when the
+// event was handled so the composer never sends a message by accident.
+function handlePickerKey(e) {
+  if (e.isComposing) return false;
+  switch (e.key) {
+    case 'ArrowDown':
+      e.preventDefault();
+      movePickerSelection(1);
+      return true;
+    case 'ArrowUp':
+      e.preventDefault();
+      movePickerSelection(-1);
+      return true;
+    case 'Enter':
+    case 'Tab': {
+      const file = state.filePicker.matches[state.filePicker.index];
+      if (!file) {
+        e.preventDefault();
+        closeFilePicker();
+        return true;
+      }
+      e.preventDefault();
+      applyAttachment(file.path);
+      return true;
+    }
+    case 'Escape':
+      e.preventDefault();
+      closeFilePicker();
+      return true;
+    default:
+      return false;
+  }
+}
+
+function renderFilePicker() {
+  const list = $('filePickerList');
+  if (!list) return;
+  const { matches, index } = state.filePicker;
+  list.innerHTML = '';
+  $('filePickerCount').textContent = matches.length
+    ? `${Math.min(index + 1, matches.length)}/${matches.length}`
+    : '';
+
+  if (!matches.length) {
+    const empty = document.createElement('div');
+    empty.className = 'file-picker-empty';
+    empty.textContent = state.activeProjectId
+      ? 'No matching files in this project.'
+      : 'Select a project first.';
+    list.appendChild(empty);
+    return;
+  }
+
+  matches.forEach((file, i) => {
+    const row = document.createElement('div');
+    row.className = 'file-picker-item';
+    if (i === index) row.classList.add('active');
+    if (state.attachments.includes(file.path)) row.classList.add('already');
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', i === index ? 'true' : 'false');
+    row.dataset.path = file.path;
+
+    const icon = document.createElement('i');
+    icon.className = 'bi ' + fileIcon(file.language || file.path.split('.').pop());
+    const path = document.createElement('span');
+    path.className = 'picker-path';
+    path.textContent = file.path;
+    path.title = file.path;
+    const size = document.createElement('span');
+    size.className = 'picker-size';
+    size.textContent = formatFileSize(file.size_bytes);
+
+    row.appendChild(icon);
+    row.appendChild(path);
+    row.appendChild(size);
+    row.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      applyAttachment(file.path);
+    });
+    list.appendChild(row);
+  });
+
+  const active = list.querySelector('.file-picker-item.active');
+  if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+}
+
+function movePickerSelection(delta) {
+  const total = state.filePicker.matches.length;
+  if (!total) return;
+  state.filePicker.index = (state.filePicker.index + delta + total) % total;
+  renderFilePicker();
+}
+
+function applyAttachment(path) {
+  const el = $('promptInput');
+  const mention = state.filePicker.mention;
+  if (el && mention) {
+    const before = el.value.slice(0, mention.start);
+    const after = el.value.slice(mention.end);
+    // Drop a single leftover space so the sentence stays tidy.
+    const rest = after.replace(/^\s/, '');
+    el.value = before + rest;
+    const caret = before.length;
+    try {
+      el.setSelectionRange(caret, caret);
+    } catch { /* ignore */ }
+  }
+  addAttachment(path);
+  closeFilePicker();
+  resizePrompt();
+  updateSendState();
+  if (el) el.focus();
+}
+
+function addAttachment(path) {
+  const clean = String(path || '').trim();
+  if (!clean) return;
+  if (state.attachments.includes(clean)) {
+    toast('Already attached: ' + clean, 'error');
+    return;
+  }
+  if (state.attachments.length >= 12) {
+    toast('Up to 12 files per message', 'error');
+    return;
+  }
+  state.attachments.push(clean);
+  renderAttachmentChips();
+  updateSendState();
+}
+
+function removeAttachment(path) {
+  state.attachments = state.attachments.filter((p) => p !== path);
+  renderAttachmentChips();
+  updateSendState();
+}
+
+function renderAttachmentChips() {
+  const box = $('attachmentChips');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!state.attachments.length) {
+    box.classList.add('d-none');
+    return;
+  }
+  box.classList.remove('d-none');
+  for (const path of state.attachments) {
+    const chip = document.createElement('span');
+    chip.className = 'composer-chip';
+    chip.title = path;
+    const icon = document.createElement('i');
+    icon.className = 'bi ' + fileIcon(path.split('.').pop());
+    const label = document.createElement('span');
+    label.className = 'chip-path';
+    label.textContent = path;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'chip-remove';
+    remove.title = 'Remove attachment';
+    remove.setAttribute('aria-label', 'Remove ' + path);
+    remove.innerHTML = '&times;';
+    remove.addEventListener('click', () => removeAttachment(path));
+    chip.appendChild(icon);
+    chip.appendChild(label);
+    chip.appendChild(remove);
+    box.appendChild(chip);
+  }
+}
+
+function clearAttachments() {
+  state.attachments = [];
+  renderAttachmentChips();
 }
 
 function formatNum(n) {
@@ -2648,12 +2987,31 @@ function bindEvents() {
   $('promptInput').addEventListener('input', () => {
     resizePrompt();
     updateSendState();
+    syncMentionPicker();
   });
+  $('promptInput').addEventListener('click', syncMentionPicker);
   $('promptInput').addEventListener('keydown', (e) => {
+    if (state.filePicker.open && handlePickerKey(e)) return;
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       sendMessage();
     }
+  });
+  document.addEventListener('mousedown', (e) => {
+    if (!state.filePicker.open) return;
+    const picker = $('filePicker');
+    if (picker && picker.contains(e.target)) return;
+    if (e.target === $('promptInput')) return;
+    closeFilePicker();
+  });
+  $('promptInput').addEventListener('blur', () => {
+    setTimeout(() => {
+      const el = document.activeElement;
+      const picker = $('filePicker');
+      if (picker && picker.contains(el)) return;
+      if (el === $('promptInput')) return;
+      closeFilePicker();
+    }, 120);
   });
 
   $('modeToggle').addEventListener('click', async (e) => {

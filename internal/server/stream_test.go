@@ -1280,6 +1280,62 @@ func TestBuildSystemPromptIsStableAndStateFree(t *testing.T) {
 	}
 }
 
+// TestBuildSystemPromptPLANFinalDetail pins the PLAN deliverable format: the
+// plan must arrive with evidence and open questions, not a one-line summary.
+func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
+	project := store.Project{Name: "demo", Path: "/tmp/demo"}
+	prompt := buildSystemPrompt(project, store.Session{Mode: "PLAN"}, 12, 96, 8, 24)
+	for _, want := range []string{
+		"## Plan",
+		"## Decisions & assumptions",
+		"## Findings",
+		"## Open questions",
+		"Ready to implement — switch to BUILD to apply this plan.",
+		"never write a vague summary",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("PLAN system prompt missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"at most 7 one-line items", "BUILD final message"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Errorf("PLAN system prompt still contains %q", unwanted)
+		}
+	}
+}
+
+// TestBuildSystemPromptBUILDStaysTerse keeps BUILD output minimal: the detail
+// upgrade is PLAN-only.
+func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
+	project := store.Project{Name: "demo", Path: "/tmp/demo"}
+	prompt := buildSystemPrompt(project, store.Session{Mode: "BUILD"}, 12, 96, 8, 24)
+	if !strings.Contains(prompt, "at most 3 one-line bullets") {
+		t.Error("BUILD system prompt is missing the compact final-message rule")
+	}
+	for _, unwanted := range []string{"## Decisions & assumptions", "## Findings", "## Open questions"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Errorf("BUILD system prompt must not require the detailed PLAN section %q", unwanted)
+		}
+	}
+}
+
+// TestBuildFinalPlanNoteRequestsDetailedPlan checks the forced final answer asks
+// for the same detailed deliverable.
+func TestBuildFinalPlanNoteRequestsDetailedPlan(t *testing.T) {
+	note := buildFinalPlanNote("", 8, 24, 8, 24, 1, false)
+	for _, want := range []string{
+		"FINAL ANSWER REQUIRED",
+		"## Plan",
+		"## Findings",
+		"## Open questions",
+		"Ready to implement — switch to BUILD to apply this plan.",
+	} {
+		if !strings.Contains(note, want) {
+			t.Errorf("final plan note missing %q", want)
+		}
+	}
+}
+
 func TestBuildStateMessageCarriesVolatileState(t *testing.T) {
 	checklist := []store.ChecklistItem{
 		{ID: 1, TaskText: "write tests", IsDone: true},
