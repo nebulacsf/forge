@@ -2039,6 +2039,29 @@ async function saveSettings(e) {
   }
 }
 
+function resetDefaults() {
+  $('defaultModel').value = 'qwen/qwen-2.5-coder-32b-instruct';
+  $('defaultMode').value = 'PLAN';
+  $('maxRead').value = 25000;
+  $('bashTimeout').value = 30;
+  $('maxToolRounds').value = 16;
+  $('maxTurnRounds').value = 64;
+  $('maxTurnCost').value = 0;
+  $('planRounds').value = 16;
+  $('planToolCalls').value = 32;
+  $('historyKeepRecent').value = 12;
+  $('historyMaxResult').value = 8000;
+  $('historyMaxArg').value = 4000;
+  $('historyPruneChunk').value = 8;
+  $('autoContinue').checked = true;
+  $('serverHost').value = '127.0.0.1';
+  $('serverPort').value = 7890;
+  $('autoBrowser').checked = true;
+  $('debugToggle').checked = false;
+  $('baseURL').value = 'https://openrouter.ai/api/v1';
+  toast('Defaults restored — click Save settings to persist', 'success');
+}
+
 function openProjectModal() {
   $('projectForm').reset();
   $('projectColor').value = randomPaletteColor();
@@ -2157,6 +2180,7 @@ function bindEvents() {
 
   $('projectForm').addEventListener('submit', saveProject);
   $('settingsForm').addEventListener('submit', saveSettings);
+  $('resetDefaultsBtn').addEventListener('click', resetDefaults);
   $('toggleKey').addEventListener('click', () => {
     const input = $('apiKey');
     input.type = input.type === 'password' ? 'text' : 'password';
