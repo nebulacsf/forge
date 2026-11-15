@@ -524,6 +524,8 @@ function appendUserMessage(text) {
   const bubble = document.createElement('div');
   bubble.className = 'user-bubble';
   bubble.textContent = text;
+  const btn = makeCopyButton('msg-copy', 'Copy message', (b) => copyToClipboard(text, b));
+  wrap.appendChild(btn);
   wrap.appendChild(bubble);
   $('messages').appendChild(wrap);
 }
@@ -1065,8 +1067,19 @@ function ensureContentEl(round) {
     round.contentEl.className = 'md';
     if (round.footer) round.main.insertBefore(round.contentEl, round.footer);
     else round.main.appendChild(round.contentEl);
+    addRoundCopyButton(round);
   }
   return round.contentEl;
+}
+
+// Assistant responses get a copy button in the round footer. The handler reads
+// round.rawContent at click time so it always copies the latest text.
+function addRoundCopyButton(round) {
+  if (!round || round.copyBtn || !round.contentEl) return;
+  const btn = makeCopyButton('round-copy', 'Copy response', (b) => copyToClipboard(round.rawContent, b));
+  if (round.footer) round.footer.insertBefore(btn, round.footer.firstChild);
+  else round.main.appendChild(btn);
+  round.copyBtn = btn;
 }
 
 function renderContent(round, final) {
@@ -1796,6 +1809,7 @@ function renderMarkdownInto(el, raw, highlight) {
       } catch { /* ignore */ }
     }
   }
+  decorateCodeBlocks(el);
 }
 
 function sanitizeHtml(html) {
@@ -1849,6 +1863,90 @@ function escapeHtml(text) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/* ── Copy to clipboard ───────────────────────────────────────────── */
+
+async function copyToClipboard(text, btn) {
+  const value = String(text == null ? '' : text);
+  if (!value.trim()) return false;
+  let ok = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+      ok = true;
+    }
+  } catch {
+    ok = false;
+  }
+  if (!ok) ok = legacyCopy(value);
+  if (ok) {
+    flashCopied(btn);
+    toast('Copied to clipboard', 'success');
+  } else {
+    toast('Could not copy to clipboard', 'error');
+  }
+  return ok;
+}
+
+function legacyCopy(value) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = value;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function flashCopied(btn) {
+  if (!btn) return;
+  if (btn.copyTimer) clearTimeout(btn.copyTimer);
+  const icon = btn.querySelector('i');
+  const prevClass = icon ? icon.className : '';
+  btn.classList.add('is-copied');
+  if (icon) icon.className = 'bi bi-check2';
+  btn.copyTimer = setTimeout(() => {
+    btn.classList.remove('is-copied');
+    if (icon) icon.className = prevClass;
+  }, 1200);
+}
+
+function makeCopyButton(className, title, onCopy) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = className;
+  btn.title = title;
+  btn.setAttribute('aria-label', title);
+  btn.innerHTML = '<i class="bi bi-clipboard"></i>';
+  btn.addEventListener('click', () => onCopy(btn));
+  return btn;
+}
+
+// Wrap every fenced code block so a copy button can float over its top-right
+// corner. Called after markdown rendering (which replaces innerHTML), so it is
+// safe to re-run on each streaming re-render.
+function decorateCodeBlocks(el) {
+  for (const pre of Array.from(el.querySelectorAll('pre'))) {
+    if (pre.parentElement && pre.parentElement.classList.contains('code-block')) continue;
+    const wrap = document.createElement('div');
+    wrap.className = 'code-block';
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(pre);
+    const btn = makeCopyButton('code-copy', 'Copy code', (b) => {
+      const code = pre.querySelector('code');
+      copyToClipboard(code ? code.textContent : pre.textContent, b);
+    });
+    wrap.appendChild(btn);
+  }
 }
 
 /* ── Settings / project modals ───────────────────────────────────── */
