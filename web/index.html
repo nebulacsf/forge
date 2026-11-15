@@ -302,16 +302,24 @@
                 <input id="bashTimeout" type="number" min="1" max="600" class="form-control">
               </div>
               <div class="col-md-4">
-                <label for="maxToolRounds" class="form-label">Rounds per checkpoint</label>
+                <label for="maxToolRounds" class="form-label">BUILD rounds per checkpoint</label>
                 <input id="maxToolRounds" type="number" min="1" max="200" class="form-control">
               </div>
               <div class="col-md-4">
-                <label for="maxTurnRounds" class="form-label">Rounds per turn</label>
+                <label for="maxTurnRounds" class="form-label">BUILD rounds per turn</label>
                 <input id="maxTurnRounds" type="number" min="1" max="1000" class="form-control">
               </div>
               <div class="col-md-4">
                 <label for="maxTurnCost" class="form-label">Turn cost cap (USD)</label>
                 <input id="maxTurnCost" type="number" min="0" step="0.01" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <label for="planRounds" class="form-label">PLAN research rounds</label>
+                <input id="planRounds" type="number" min="1" max="24" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <label for="planToolCalls" class="form-label">PLAN tool-call cap</label>
+                <input id="planToolCalls" type="number" min="1" max="200" class="form-control">
               </div>
               <div class="col-md-4">
                 <label for="historyKeepRecent" class="form-label">Keep recent tool rounds</label>
@@ -335,11 +343,13 @@
                   <label class="form-check-label" for="autoContinue">Continue automatically on long tasks</label>
                 </div>
                 <div class="form-text">
-                  One round is one model call and may run several tools. Forge checkpoints every
+                  One round is one model call and may run several tools. BUILD checkpoints every
                   “rounds per checkpoint” and stops at “rounds per turn”. Use 0 in the cost cap to disable it.
-                  Older tool output is stubbed in place; only the most recent rounds are sent in full.
-                  Pruning every N rounds keeps the prompt prefix stable longer (better provider caching).
-                  Set a max to 0 to disable that cap.
+                  PLAN has its own research budget: when it is reached, tools are disabled and Forge requires
+                  the final plan in up to three attempts, rejecting empty answers and tool calls written as text.
+                  Auto-continue applies to BUILD only. Older tool output is stubbed in place;
+                  only the most recent rounds are sent in full. Pruning every N rounds keeps the prompt prefix
+                  stable longer (better provider caching). Set a max to 0 to disable that cap.
                 </div>
               </div>
             </div>

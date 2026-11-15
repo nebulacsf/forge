@@ -46,8 +46,9 @@ func normalizeHistoryOptions(o historyOptions) historyOptions {
 	if o.KeepRecent <= 0 {
 		o.KeepRecent = defaultHistoryKeepRecent
 	}
-	if o.KeepRecent > 20 {
-		o.KeepRecent = 20
+	// PLAN raises KeepRecent to plan_rounds+2, and plan_rounds can be 24.
+	if o.KeepRecent > 40 {
+		o.KeepRecent = 40
 	}
 	if o.MaxResultChars < 0 {
 		o.MaxResultChars = defaultHistoryMaxResult

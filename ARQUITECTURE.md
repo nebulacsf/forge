@@ -99,6 +99,18 @@ limit is therefore the **checkpoint/segment size**, not the total work a turn ca
 do. `max_turn_rounds` (default 96) bounds the whole turn, and `auto_continue`
 crosses segment boundaries automatically while the model is still working.
 
+PLAN is special-cased: it is one bounded research turn with its own
+`plan_rounds` (default 16, max 24) and `plan_tool_calls` (default 64, max 200)
+budget. When either limit is reached, the next request keeps the tool
+definitions for cache stability but sets `tool_choice=none` and appends a
+final-answer instruction. Tool calls emitted in that round are ignored. The
+finalization phase allows three attempts; empty answers, reasoning-only replies,
+and tool calls written as text (`<tool_call>`, XML or JSON) are rejected and
+retried. The last attempt removes the tool definitions entirely for providers
+that ignore `tool_choice`. A guard-triggered stop in PLAN also transitions to
+this forced final answer instead of ending with no plan. PLAN never
+auto-continues.
+
 ### 3.1 Loop guard (`server/guard.go`)
 Every executed (or blocked) tool call is fingerprinted as
 `tool + canonical JSON args + result hash + error flag`. The guard keeps a
@@ -164,9 +176,16 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
   old do those rounds switch to stubs. This keeps most consecutive requests as
   an exact prefix of the next one, which is what provider prompt caching needs.
 - The system prompt contains only stable content (project, mode, rules). The
-  volatile checklist, repository outline, continue note, and guard note are
-  appended as the final ephemeral `user` message of each request and are never
-  persisted. Changing them cannot invalidate the cached prefix.
+  volatile checklist, repository outline, research ledger, continue note, guard
+  note, and forced-final instruction are appended as the final ephemeral `user`
+  message of each request and are never persisted. Changing them cannot
+  invalidate the cached prefix.
+- In PLAN, `history_keep_recent_rounds` is raised to at least
+  `plan_rounds + 2`, so every tool round of the current bounded research turn is
+  sent unpruned. The per-result cap is also raised to at least 8,000 characters
+  (unless the user disabled it with 0), so a normal 100-line read is not clipped
+  in half. Older turns are pruned normally. This prevents pruning and clipping
+  from erasing the findings the model needs for the final plan.
 - Setting a max to `0` disables that cap; negative values fall back to defaults.
 - Full results remain in SQLite and in the UI (`/api/sessions/{id}/messages`);
   only the provider request is trimmed. Each round logs `messages`, `chars`,
@@ -180,6 +199,8 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
 - `Manager` with `RWMutex`, atomic writes (temp → chmod 600 → rename)
 - Validation + normalization on every `Update()`
 - `defaults.history_*` control history pruning (see 3.2)
+- `defaults.plan_rounds` / `defaults.plan_tool_calls` bound PLAN research
+  (defaults 16 / 64; clamped to 24 / 200)
 - Hot-reload: invalidates model cache if API key/base URL changes
 
 ### 6. Model Catalog (`router.go`)

@@ -36,6 +36,7 @@ const state = {
   sawCancelled: false,
   turnHadContent: false,
   turnHadError: false,
+  turnReasoningOnly: false,
   turnRound: 0,
   turnLimit: 0,
   turnSegment: 1,
@@ -626,6 +627,7 @@ async function runTurn({ content = '', isContinue = false, userText = content })
   state.sawCancelled = false;
   state.turnHadContent = false;
   state.turnHadError = false;
+  state.turnReasoningOnly = false;
   state.turnRound = 0;
   state.turnLimit = 0;
   state.turnSegment = 1;
@@ -689,7 +691,8 @@ async function runTurn({ content = '', isContinue = false, userText = content })
     updateStreamLabel();
     setStreamingUI(false);
     updateControls();
-    if (!state.sawCancelled && !state.turnHadError && modeAtSend === 'PLAN' && state.turnHadContent) {
+    if (!state.sawCancelled && !state.turnHadError && !state.turnReasoningOnly &&
+        modeAtSend === 'PLAN' && state.turnHadContent) {
       addPlanReadyCard();
     }
     maybeScroll(true);
@@ -855,6 +858,7 @@ function handleEvent(ev) {
       break;
     case 'done':
       if (ev.session) syncSession(ev.session);
+      state.turnReasoningOnly = !!ev.reasoning_only;
       stopTurnClock(true);
       if (state.currentRound) removeThinking(state.currentRound);
       if (ev.reasoning_only) {
@@ -1868,6 +1872,8 @@ function openSettings() {
   $('maxToolRounds').value = cfg.defaults.max_tool_rounds || 24;
   $('maxTurnRounds').value = cfg.defaults.max_turn_rounds || 96;
   $('maxTurnCost').value = cfg.defaults.max_turn_cost_usd ?? 0;
+  $('planRounds').value = cfg.defaults.plan_rounds ?? 16;
+  $('planToolCalls').value = cfg.defaults.plan_tool_calls ?? 64;
   $('historyKeepRecent').value = cfg.defaults.history_keep_recent_rounds ?? 4;
   $('historyMaxResult').value = cfg.defaults.history_max_result_chars ?? 4000;
   $('historyMaxArg').value = cfg.defaults.history_max_arg_chars ?? 4000;
@@ -1896,6 +1902,8 @@ async function saveSettings(e) {
   cfg.defaults.max_tool_rounds = Number($('maxToolRounds').value) || 24;
   cfg.defaults.max_turn_rounds = Number($('maxTurnRounds').value) || 96;
   cfg.defaults.max_turn_cost_usd = Number($('maxTurnCost').value) || 0;
+  cfg.defaults.plan_rounds = Number($('planRounds').value) || 16;
+  cfg.defaults.plan_tool_calls = Number($('planToolCalls').value) || 64;
   const numOr = (id, fallback) => {
     const raw = $(id).value.trim();
     if (raw === '') return fallback;

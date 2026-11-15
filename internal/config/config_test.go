@@ -18,6 +18,34 @@ func TestNormalizeRoundBudgetDefaults(t *testing.T) {
 	if got.Defaults.MaxTurnCostUSD != 0 {
 		t.Errorf("max_turn_cost_usd = %v, want 0 (disabled)", got.Defaults.MaxTurnCostUSD)
 	}
+	if got.Defaults.PlanRounds != 16 {
+		t.Errorf("plan_rounds = %d, want 16", got.Defaults.PlanRounds)
+	}
+	if got.Defaults.PlanToolCalls != 64 {
+		t.Errorf("plan_tool_calls = %d, want 64", got.Defaults.PlanToolCalls)
+	}
+}
+
+func TestNormalizeClampsPlanBudget(t *testing.T) {
+	c := Default()
+	c.Defaults.PlanRounds = 99
+	c.Defaults.PlanToolCalls = 999
+	got := normalize(c)
+	if got.Defaults.PlanRounds != 24 {
+		t.Errorf("plan_rounds = %d, want 24", got.Defaults.PlanRounds)
+	}
+	if got.Defaults.PlanToolCalls != 200 {
+		t.Errorf("plan_tool_calls = %d, want 200", got.Defaults.PlanToolCalls)
+	}
+
+	c = Default()
+	c.Defaults.PlanRounds = -2
+	c.Defaults.PlanToolCalls = -2
+	got = normalize(c)
+	if got.Defaults.PlanRounds != 16 || got.Defaults.PlanToolCalls != 64 {
+		t.Errorf("negative plan budget should fall back to defaults, got rounds=%d calls=%d",
+			got.Defaults.PlanRounds, got.Defaults.PlanToolCalls)
+	}
 }
 
 func TestNormalizeClampsRoundBudgets(t *testing.T) {

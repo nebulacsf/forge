@@ -964,6 +964,74 @@ func (m *toolLoopMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
+// planFinalizeMock returns a different read each research round. It answers
+// with a plan when the harness sets tool_choice=none.
+type planFinalizeMock struct {
+	requests                  atomic.Int32
+	finalSeen                 atomic.Int32
+	sameRange                 bool
+	emptyFinalOnce            bool
+	invalidFinalOnce          bool
+	invalidFinalUnlessNoTools bool
+	pseudoResearchOnce        bool
+	sawToolChoiceNone         atomic.Bool
+	sawNoToolsFinal           atomic.Bool
+	sawFirstResult            atomic.Bool
+	sawPruned                 atomic.Bool
+	finalNote                 atomic.Value
+}
+
+func (m *planFinalizeMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n := int(m.requests.Add(1))
+	var req struct {
+		ToolChoice string `json:"tool_choice"`
+		Tools      []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	isFinal := false
+	for _, msg := range req.Messages {
+		if msg.Role == "tool" {
+			if strings.HasPrefix(msg.Content, "[pruned]") {
+				m.sawPruned.Store(true)
+			}
+			if strings.Contains(msg.Content, "lines 1-5 of 60") {
+				m.sawFirstResult.Store(true)
+			}
+		}
+		if msg.Role == "user" && strings.Contains(msg.Content, "FINAL ANSWER REQUIRED") {
+			isFinal = true
+			m.finalNote.Store(msg.Content)
+		}
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	if req.ToolChoice == "none" {
+		m.sawToolChoiceNone.Store(true)
+	}
+	noTools := len(req.Tools) == 0
+	if noTools && isFinal {
+		m.sawNoToolsFinal.Store(true)
+	}
+	m.respond(w, flusher, send, n, req.ToolChoice, noTools)
+}
+
 // finalAnswerMock answers once without requesting tools.
 type finalAnswerMock struct{}
 
@@ -1045,7 +1113,7 @@ func TestChatStreamPausesAtCheckpoint(t *testing.T) {
 	mock := &toolLoopMock{tool: "update_checklist", args: func(n int) string {
 		return fmt.Sprintf(`{"action":"add","task_text":"step %d"}`, n)
 	}}
-	app, st, session := chatBudgetFixture(t, "PLAN", mock, func(c *config.Config) {
+	app, st, session := chatBudgetFixture(t, "BUILD", mock, func(c *config.Config) {
 		c.Defaults.MaxToolRounds = 2
 		c.Defaults.MaxTurnRounds = 4
 		c.Defaults.AutoContinue = boolValue(false)
@@ -1082,7 +1150,7 @@ func TestChatStreamAutoContinues(t *testing.T) {
 	mock := &toolLoopMock{tool: "update_checklist", args: func(n int) string {
 		return fmt.Sprintf(`{"action":"add","task_text":"step %d"}`, n)
 	}}
-	app, st, session := chatBudgetFixture(t, "PLAN", mock, func(c *config.Config) {
+	app, st, session := chatBudgetFixture(t, "BUILD", mock, func(c *config.Config) {
 		c.Defaults.MaxToolRounds = 2
 		c.Defaults.MaxTurnRounds = 4
 		c.Defaults.AutoContinue = boolValue(true)
@@ -1126,7 +1194,7 @@ func TestChatStreamLoopGuardStopsRepeatedCall(t *testing.T) {
 	mock := &toolLoopMock{tool: "read_file", args: func(int) string {
 		return `{"path":"main.go","start_line":1,"end_line":20}`
 	}}
-	app, st, session := chatBudgetFixture(t, "PLAN", mock, nil)
+	app, st, session := chatBudgetFixture(t, "BUILD", mock, nil)
 
 	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "inspect"})
 
@@ -1196,8 +1264,8 @@ func TestBuildSystemPromptIsStableAndStateFree(t *testing.T) {
 	session := store.Session{Mode: "PLAN"}
 	outline := "FILE internal/volatile.go"
 
-	first := buildSystemPrompt(project, session, 12, 96)
-	second := buildSystemPrompt(project, session, 12, 96)
+	first := buildSystemPrompt(project, session, 12, 96, 8, 24)
+	second := buildSystemPrompt(project, session, 12, 96, 8, 24)
 	if first != second {
 		t.Fatal("buildSystemPrompt is not deterministic")
 	}

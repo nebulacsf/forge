@@ -42,14 +42,19 @@ type OpenRouterConfig struct {
 }
 
 type DefaultsConfig struct {
-	Model            string  `json:"model"`
-	Mode             string  `json:"mode"`
-	MaxFileReadChars int     `json:"max_file_read_chars"`
-	BashTimeoutSec   int     `json:"bash_timeout_sec"`
-	MaxToolRounds    int     `json:"max_tool_rounds"`
-	MaxTurnRounds    int     `json:"max_turn_rounds"`
-	AutoContinue     *bool   `json:"auto_continue"`
-	MaxTurnCostUSD   float64 `json:"max_turn_cost_usd"`
+	Model            string `json:"model"`
+	Mode             string `json:"mode"`
+	MaxFileReadChars int    `json:"max_file_read_chars"`
+	BashTimeoutSec   int    `json:"bash_timeout_sec"`
+	MaxToolRounds    int    `json:"max_tool_rounds"`
+	MaxTurnRounds    int    `json:"max_turn_rounds"`
+	// PLAN mode has its own research budget. When either limit is reached the
+	// harness disables tools and requires the final plan, so a tool-hungry model
+	// cannot loop indefinitely while researching.
+	PlanRounds     int     `json:"plan_rounds"`
+	PlanToolCalls  int     `json:"plan_tool_calls"`
+	AutoContinue   *bool   `json:"auto_continue"`
+	MaxTurnCostUSD float64 `json:"max_turn_cost_usd"`
 
 	// History pruning keeps recent tool output verbatim and stubs older rounds
 	// in place before each provider request. Volatile state (checklist, outline)
@@ -81,6 +86,8 @@ func Default() Config {
 			BashTimeoutSec:    30,
 			MaxToolRounds:     24,
 			MaxTurnRounds:     96,
+			PlanRounds:        16,
+			PlanToolCalls:     64,
 			AutoContinue:      boolPtr(true),
 			MaxTurnCostUSD:    0,
 			HistoryKeepRecent: 4,
@@ -267,6 +274,18 @@ func normalize(c Config) Config {
 	}
 	if c.Defaults.MaxTurnRounds < c.Defaults.MaxToolRounds {
 		c.Defaults.MaxTurnRounds = c.Defaults.MaxToolRounds
+	}
+	if c.Defaults.PlanRounds <= 0 {
+		c.Defaults.PlanRounds = d.Defaults.PlanRounds
+	}
+	if c.Defaults.PlanRounds > 24 {
+		c.Defaults.PlanRounds = 24
+	}
+	if c.Defaults.PlanToolCalls <= 0 {
+		c.Defaults.PlanToolCalls = d.Defaults.PlanToolCalls
+	}
+	if c.Defaults.PlanToolCalls > 200 {
+		c.Defaults.PlanToolCalls = 200
 	}
 	if c.Defaults.AutoContinue == nil {
 		c.Defaults.AutoContinue = d.Defaults.AutoContinue

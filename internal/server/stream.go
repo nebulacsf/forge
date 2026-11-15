@@ -20,6 +20,11 @@ import (
 const (
 	defaultSegmentRounds = 24
 	defaultTurnRounds    = 96
+	defaultPlanRounds    = 16
+	defaultPlanToolCalls = 64
+	planFinalGraceRounds = 4
+	planFinalRetries     = 2
+	planMinResultChars   = 8000
 	continuePrompt       = "Continue from where you left off."
 	continuationNote     = "You are continuing a long task from a checkpoint. Resume from the current checklist and conversation. " +
 		"Do not repeat completed work or re-read files you have already read. Keep going until the task is actually finished."
@@ -239,13 +244,39 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	if turnLimit < segmentSize {
 		turnLimit = segmentSize
 	}
+	planRounds := cfg.Defaults.PlanRounds
+	if planRounds <= 0 {
+		planRounds = defaultPlanRounds
+	}
+	planToolCalls := cfg.Defaults.PlanToolCalls
+	if planToolCalls <= 0 {
+		planToolCalls = defaultPlanToolCalls
+	}
 	autoContinue := cfg.Defaults.AutoContinue == nil || *cfg.Defaults.AutoContinue
 	turnCostLimit := cfg.Defaults.MaxTurnCostUSD
+
+	// PLAN is a single bounded research turn. It never auto-continues: when the
+	// research budget is spent, tools are disabled and the model must answer.
+	// The extra grace rounds cover the forced final answer and its retries.
+	if session.Mode == "PLAN" {
+		if planRounds < 1 {
+			planRounds = 1
+		}
+		turnLimit = planRounds + planFinalGraceRounds
+		segmentSize = turnLimit
+		autoContinue = false
+	}
 
 	totalRounds := 0
 	segment := 1
 	turnCost := 0.0
+	toolRounds := 0
+	toolCalls := 0
+	finalizing := false
+	finalAttempts := 0
+	finalReason := ""
 	var continueNote, guardNote string
+	ledger := newResearchLedger()
 	guard := newLoopGuard()
 
 	for {
@@ -269,24 +300,52 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					outline = fresh
 				}
 			}
+
+			// The PLAN research budget is a hard stop. Once it is spent the next
+			// round is the final answer: tools stay in the request for prompt
+			// cache stability, but tool_choice=none and the server ignores any
+			// tool call the provider still emits.
+			if session.Mode == "PLAN" && !finalizing &&
+				(toolRounds >= planRounds || toolCalls >= planToolCalls) {
+				finalizing = true
+				finalAttempts = 0
+				finalReason = "research budget exhausted"
+				logx.Info("plan research budget reached", "session", session.ID,
+					"round", totalRounds, "tool_rounds", toolRounds, "tool_calls", toolCalls,
+					"plan_rounds", planRounds, "plan_tool_calls", planToolCalls)
+			}
+			if finalizing {
+				finalAttempts++
+			}
+
 			checklist, _ := s.store.ListChecklist(session.ID)
-			system := buildSystemPrompt(project, session, segmentSize, turnLimit)
+			system := buildSystemPrompt(project, session, segmentSize, turnLimit, planRounds, planToolCalls)
 			rows, err := s.store.ListMessages(session.ID)
 			if err != nil {
 				stream.fail("Could not load conversation: " + err.Error())
 				saveTurnTiming()
 				return
 			}
+			keepRecent := cfg.Defaults.HistoryKeepRecent
+			// In PLAN, the current turn is the research budget. Keep every tool
+			// round of this turn verbatim so pruning cannot erase the findings
+			// that the model needs for the final plan. Older turns are pruned
+			// normally; the budget guarantees the current turn stays small.
+			if session.Mode == "PLAN" && planRounds+2 > keepRecent {
+				keepRecent = planRounds + 2
+			}
+			maxResult := effectiveHistoryResultLimit(session.Mode, cfg.Defaults.HistoryMaxResult)
 			history, hstats := buildHistory(rows, system, historyOptions{
-				KeepRecent:     cfg.Defaults.HistoryKeepRecent,
-				MaxResultChars: cfg.Defaults.HistoryMaxResult,
+				KeepRecent:     keepRecent,
+				MaxResultChars: maxResult,
 				MaxArgChars:    cfg.Defaults.HistoryMaxArg,
 				ChunkRounds:    cfg.Defaults.HistoryPruneChunk,
 			})
 			logx.Debug("history built", "session", session.ID, "round", totalRounds,
 				"messages", hstats.Messages, "chars", hstats.Chars,
 				"est_tokens", hstats.Chars/4, "pruned_rounds", hstats.PrunedRounds,
-				"pruned_chars", hstats.PrunedChars)
+				"pruned_chars", hstats.PrunedChars, "keep_recent", keepRecent,
+				"max_result_chars", maxResult)
 			// Volatile state and steering notes are ephemeral: they live at the
 			// very end of the request so the stable prefix stays cacheable and
 			// the persisted conversation is never polluted.
@@ -298,9 +357,25 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			if state := buildStateMessage(checklist, outline); state != "" {
 				tail = append(tail, state)
 			}
+			if session.Mode == "PLAN" {
+				ledger.rounds = toolRounds
+				ledger.calls = toolCalls
+				if research := ledger.render(planRounds, planToolCalls); research != "" {
+					tail = append(tail, research)
+				}
+			}
 			if guardNote != "" {
 				tail = append(tail, guardNote)
 				guardNote = ""
+			}
+			noTools := finalizing && finalAttempts > planFinalRetries
+			if finalizing {
+				reason := finalReason
+				if reason == "" {
+					reason = "research budget exhausted"
+				}
+				tail = append(tail, buildFinalPlanNote(reason, planRounds, planToolCalls,
+					toolRounds, toolCalls, finalAttempts, noTools))
 			}
 			if len(tail) > 0 {
 				history = append(history, llm.Message{Role: "user", Content: strings.Join(tail, "\n\n")})
@@ -310,8 +385,19 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				Messages: history,
 				Tools:    specs,
 			}
+			if finalizing {
+				if noTools {
+					// Last resort: remove the tool definitions entirely so a
+					// provider that ignores tool_choice cannot keep calling tools.
+					req.Tools = nil
+					req.ToolChoice = ""
+				} else {
+					req.ToolChoice = "none"
+				}
+			}
 			logx.Debug("round request", "session", session.ID, "round", totalRounds,
-				"segment", segment, "messages", len(history), "tools", len(specs))
+				"segment", segment, "messages", len(history), "tools", len(req.Tools),
+				"finalizing", finalizing, "tool_choice", req.ToolChoice, "no_tools", noTools)
 
 			result, streamErr := client.StreamChat(ctx, req, func(d llm.Delta) error {
 				kind := d.Kind
@@ -404,7 +490,82 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			if finalizing {
+				hasReasoning := strings.TrimSpace(result.Reasoning) != ""
+				if len(result.ToolCalls) > 0 {
+					// tool_choice=none should prevent this, but a provider may still
+					// emit calls. They are deliberately ignored: executing one would
+					// restart the loop the budget is meant to stop.
+					logx.Warn("plan finalization ignored tool calls", "session", session.ID,
+						"round", totalRounds, "calls", len(result.ToolCalls))
+				}
+				if !usablePlanContent(result.Content) {
+					// Do not persist the bad content: some providers return a
+					// <tool_call> block as text when tools are disabled. Persisting
+					// it would show a fake tool call as the plan and would also feed
+					// it back to the model on the retry.
+					logx.Warn("plan finalization returned unusable content",
+						"session", session.ID, "round", totalRounds, "attempt", finalAttempts,
+						"content_chars", len(result.Content),
+						"preview", logx.Preview(result.Content, 200))
+					if id := s.persistPartial(session.ID, result.Reasoning, ""); id > 0 {
+						lastAssistantID = id
+					}
+					if finalAttempts <= planFinalRetries {
+						logx.Warn("plan finalization retrying with a stricter instruction",
+							"session", session.ID, "round", totalRounds, "attempt", finalAttempts)
+						continue
+					}
+					if hasReasoning {
+						logx.Warn("model returned reasoning without a final plan",
+							"session", session.ID, "round", totalRounds, "model", session.Model)
+						finish(true)
+						return
+					}
+					stream.fail("The model did not return a usable plan after the PLAN research budget.")
+					finish(false)
+					return
+				}
+				msg, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, "")
+				if err != nil {
+					logx.Error("persist plan failed", "session", session.ID, "error", err)
+					stream.fail("Could not save the plan: " + err.Error())
+					saveTurnTiming()
+					return
+				}
+				lastAssistantID = msg.ID
+				logx.Info("plan finalized", "session", session.ID, "round", totalRounds,
+					"reason", finalReason, "tool_rounds", toolRounds, "tool_calls", toolCalls,
+					"duration", time.Since(turnStart).Round(time.Millisecond).String())
+				finish(false)
+				return
+			}
+
 			if len(result.ToolCalls) == 0 {
+				if session.Mode == "PLAN" && looksLikePseudoToolCall(result.Content) {
+					// The model wrote a tool call into the response text instead
+					// of using the native interface. Treat it as malformed, not as
+					// a final answer, and give it one corrective round.
+					logx.Warn("model wrote a tool call as text", "session", session.ID,
+						"round", totalRounds, "preview", logx.Preview(result.Content, 200))
+					if id := s.persistPartial(session.ID, result.Reasoning, ""); id > 0 {
+						lastAssistantID = id
+					}
+					// A malformed tool call is still an attempt to use the research
+					// budget. Count it so a model that keeps emitting text tool calls
+					// reaches the forced finalization instead of consuming grace rounds.
+					toolRounds++
+					toolCalls++
+					if totalRounds < turnLimit {
+						guardNote = "Invalid response: tool calls must use the native tool interface. " +
+							"Do not write <tool_call>, <function=...>, XML, or JSON tool calls in the response text. " +
+							"Use the native tools, or write the final plan if the budget is exhausted."
+						continue
+					}
+					stream.fail("The model wrote a tool call as text instead of using the tool interface.")
+					finish(false)
+					return
+				}
 				hasContent := strings.TrimSpace(result.Content) != ""
 				hasReasoning := strings.TrimSpace(result.Reasoning) != ""
 				if !hasContent && !hasReasoning {
@@ -442,6 +603,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				if call.Type == "" {
 					call.Type = "function"
 				}
+				toolCalls++
 				// Validate the mode before announcing or executing anything, so the
 				// UI never shows a tool starting only to have it denied afterwards.
 				if !tools.Allowed(session.Mode, call.Function.Name) {
@@ -484,6 +646,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				started := time.Now()
 				toolResult := mgr.Execute(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments))
 				elapsed := time.Since(started).Milliseconds()
+				ledger.observe(*call, toolResult)
 				if toolResult.IsError {
 					logx.Warn("tool failed", "session", session.ID, "round", totalRounds, "tool", call.Function.Name,
 						"duration_ms", elapsed, "error", logx.Preview(toolResult.Content, 200))
@@ -523,6 +686,9 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			if len(calls) > 0 {
+				toolRounds++
+			}
 
 			if id, err := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); err != nil {
 				stream.fail("Could not save tool results: " + err.Error())
@@ -539,6 +705,19 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			// Stop conditions that are cheaper to evaluate after the round has
 			// been persisted, so no tool result is ever lost.
 			if abortReason != "" {
+				// In PLAN, a pathological loop should still produce a plan instead
+				// of ending with no answer. Disable tools and force the final
+				// response on the next round. BUILD keeps the existing pause.
+				if session.Mode == "PLAN" && !finalizing && totalRounds < turnLimit {
+					logx.Warn("plan guard forcing final answer", "session", session.ID,
+						"reason", abortReason, "round", totalRounds)
+					finalizing = true
+					finalAttempts = 0
+					finalReason = "the agent stopped repeating tool calls"
+					abortReason, abortMessage = "", ""
+					guardNote = ""
+					continue
+				}
 				logx.Warn("agent guard stopped the turn", "session", session.ID,
 					"reason", abortReason, "round", totalRounds)
 				stream.send(chatEvent{
@@ -658,11 +837,22 @@ func looksLikeContextOverflow(msg string) bool {
 	return false
 }
 
+// effectiveHistoryResultLimit keeps PLAN research reads intact. The default
+// 4,000-char result cap clips ~100-line reads in half, which makes the model
+// re-read windows and wastes the research budget. A configured 0 still disables
+// the cap entirely.
+func effectiveHistoryResultLimit(mode string, configured int) int {
+	if mode == "PLAN" && configured > 0 && configured < planMinResultChars {
+		return planMinResultChars
+	}
+	return configured
+}
+
 // buildSystemPrompt assembles the stable instruction prefix. It intentionally
 // excludes volatile state (checklist, repository outline) so the provider's
 // prompt cache can reuse this prefix across rounds. Volatile state is injected
 // as a trailing ephemeral message by buildStateMessage.
-func buildSystemPrompt(project store.Project, session store.Session, segmentSize, turnLimit int) string {
+func buildSystemPrompt(project store.Project, session store.Session, segmentSize, turnLimit, planRounds, planToolCalls int) string {
 	var b strings.Builder
 	b.WriteString("You are Forge, an expert autonomous coding agent operating on a local project through a web UI.\n\n")
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
@@ -679,12 +869,25 @@ func buildSystemPrompt(project store.Project, session store.Session, segmentSize
 	}
 	fmt.Fprintf(&b, "\nAllowed tools in %s mode: %s\n", session.Mode, strings.Join(allowed, ", "))
 	b.WriteString("Never call a tool outside this list. Disallowed calls are blocked before execution and reported back to you.\n")
-	fmt.Fprintf(&b, `
+	b.WriteString("Tool calls must use the native tool-calling interface. Never write <tool_call>, <function=...>, XML, or JSON tool calls in the response text; they are not executed.\n")
+	b.WriteString("Batch independent tool calls in the same response. One round can contain several reads or searches; use that to conserve the budget.\n")
+	if session.Mode == "PLAN" {
+		fmt.Fprintf(&b, `
+PLAN research budget:
+- This turn allows %d tool rounds and %d tool calls. The harness stops after the round that reaches either limit and requires the final plan.
+- Every response counts as one round even when it contains several tool calls. Batch independent reads and searches in the same response.
+- Stop as soon as you can name the files, the symbols, and the exact changes. Do not try to inspect every line of the project.
+- The research ledger in the current-state message lists what you already read and searched this turn. Never repeat those calls or re-read those ranges; this turn's tool results are preserved in the conversation.
+- If the budget is reached, answer with the best plan you can and state any remaining uncertainty in one short line.
+`, planRounds, planToolCalls)
+	} else {
+		fmt.Fprintf(&b, `
 Step budget:
 - This turn allows up to %d model rounds and is checkpointed every %d rounds; it continues automatically when needed.
 - Every response counts as one round even when it contains several tool calls. Batch independent reads, searches, and edits in the same response to conserve the budget.
 - Do not stop early just because a task is large. When a checkpoint approaches, update the checklist and leave a clear handoff.
 `, turnLimit, segmentSize)
+	}
 	b.WriteString(`
 Operating rules:
 - At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
@@ -692,6 +895,7 @@ Operating rules:
 - read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
 - Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
 - The "NNN | " prefix is display-only. Never include it in patch_file search/replace text; copy the code without the prefix.
+- Do not re-read a file or range you already inspected unless it changed; use the conversation (and, in PLAN, the research ledger) instead of repeating reads.
 - Stay strictly inside the project directory. Never attempt to access paths outside it.
 - SHELL PATHS: every bash call starts in the project root in a fresh shell, so "cd" never persists between calls. Do not probe relative paths. If a command must run in another directory, put a single "cd" in the same invocation using an absolute, quoted literal path, for example: cd "/abs/path" && go test ./... — otherwise stay in the project root and pass paths as quoted literals.
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
@@ -709,7 +913,7 @@ Response style (strict):
 - No preamble, no praise, no restating code, no long explanations.
 `)
 	if session.Mode == "PLAN" {
-		b.WriteString("- PLAN final message: the numbered plan, at most 7 one-line items, then the ready line. No extra commentary.\n")
+		b.WriteString("- PLAN final message: Markdown text only, no tool-call syntax. The numbered plan, at most 7 one-line items, then the ready line. No extra commentary.\n")
 	} else {
 		b.WriteString("- BUILD final message: at most 3 short bullets — (1) what changed, with file paths; (2) what you verified; (3) blockers or next step.\n")
 	}
@@ -740,6 +944,34 @@ func buildStateMessage(checklist []store.ChecklistItem, outline string) string {
 		b.WriteString("Repository outline: unavailable. Use grep_search or list_directory to locate files.\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// buildFinalPlanNote is the last ephemeral message of the forced PLAN answer.
+// It is deliberately blunt: after this point the only acceptable output is the
+// plan in normal response content.
+func buildFinalPlanNote(reason string, planRounds, planToolCalls, usedRounds, usedCalls, attempt int, noTools bool) string {
+	var b strings.Builder
+	b.WriteString("[FINAL ANSWER REQUIRED — PLAN research stopped]\n")
+	if reason == "" {
+		reason = "research budget exhausted"
+	}
+	fmt.Fprintf(&b, "Reason: %s. Used %d/%d tool rounds and %d/%d tool calls.\n",
+		reason, usedRounds, planRounds, usedCalls, planToolCalls)
+	if noTools {
+		b.WriteString("No tools are available in this response. Any tool call is ignored.\n")
+	} else {
+		b.WriteString("Tools are disabled for this response and any tool call is ignored. Do not call any tool.\n")
+	}
+	b.WriteString("Do not write tool calls in the response text: no <tool_call>, <function=...>, XML, or JSON tool-call syntax. They are not executed.\n")
+	b.WriteString("The research phase is over. Use only the information already in the conversation.\n")
+	if attempt > 1 {
+		b.WriteString("Your previous final response was not a usable plan (empty, reasoning-only, or a tool call written as text). This time write the plan in Markdown only.\n")
+	}
+	b.WriteString(`Write the final answer now, in normal response content:
+- The numbered plan of the exact changes (file + concrete change), at most 7 one-line items.
+- Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
+- If something is still uncertain, state it as an assumption or an open question in one short line; do not try to research further.`)
+	return b.String()
 }
 
 func deriveTitle(content string) string {

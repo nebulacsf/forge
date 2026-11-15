@@ -60,6 +60,16 @@ Sessions are stored per project; open tabs are restored after a reload.
 At the start of a new task the agent records it in the checklist before reading
 files or running any other tool, and keeps the list updated as it works.
 
+PLAN is a bounded research turn. It has its own budget (`plan_rounds` and
+`plan_tool_calls`, default 16 rounds / 64 calls, max 24 / 200) and never
+auto-continues. When the budget is reached, Forge requires the final plan. It
+gives the model up to three final attempts, rejects empty answers and
+tool calls written as text (`<tool_call>`, XML or JSON), and removes the tool
+definitions entirely on the last attempt. The current turn's tool results are
+kept unpruned and PLAN raises the per-result cap to 8,000 characters, so the
+model can write the plan from what it already inspected instead of re-reading
+files. BUILD keeps the normal checkpoint/auto-continue behavior.
+
 ### Token-saving behavior
 
 - **Grep first.** The system prompt requires the agent to locate a target with
@@ -121,11 +131,17 @@ already arrived.
 
 ### Long turns and checkpoints
 
-A **round** is one model call and may run several tools. Forge checkpoints every
+A **round** is one model call and may run several tools. BUILD checkpoints every
 `max_tool_rounds` rounds (default **24**) and keeps going automatically until
 `max_turn_rounds` (default **96**) when **auto-continue** is enabled. A
 checkpoint never loses work: every tool result is already persisted, and a
 paused turn shows a **Continue** action.
+
+PLAN does not use checkpoints or auto-continue. It has a separate research
+budget (`plan_rounds` / `plan_tool_calls`), keeps this turn's tool results
+unpruned with an 8,000-character per-result floor, and forces a final plan when
+the budget is spent. The final answer must be real Markdown; empty answers,
+reasoning-only replies, and tool calls written as text are rejected and retried.
 
 A loop guard runs alongside the budget. It fingerprints each tool call together
 with its result and stops the turn when the same call produces the same result
@@ -184,6 +200,8 @@ system shortcuts.
     "bash_timeout_sec": 30,
     "max_tool_rounds": 24,
     "max_turn_rounds": 96,
+    "plan_rounds": 16,
+    "plan_tool_calls": 64,
     "auto_continue": true,
     "max_turn_cost_usd": 0,
     "history_keep_recent_rounds": 4,
