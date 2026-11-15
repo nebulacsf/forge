@@ -90,10 +90,10 @@ func Default() Config {
 			PlanToolCalls:     32,
 			AutoContinue:      boolPtr(true),
 			MaxTurnCostUSD:    0,
-			HistoryKeepRecent: 12,
-			HistoryMaxResult:  8000,
+			HistoryKeepRecent: 32,
+			HistoryMaxResult:  16000,
 			HistoryMaxArg:     4000,
-			HistoryPruneChunk: 8,
+			HistoryPruneChunk: 16,
 		},
 	}
 }
@@ -296,8 +296,8 @@ func normalize(c Config) Config {
 	if c.Defaults.HistoryKeepRecent <= 0 {
 		c.Defaults.HistoryKeepRecent = d.Defaults.HistoryKeepRecent
 	}
-	if c.Defaults.HistoryKeepRecent > 20 {
-		c.Defaults.HistoryKeepRecent = 20
+	if c.Defaults.HistoryKeepRecent > 40 {
+		c.Defaults.HistoryKeepRecent = 40
 	}
 	// 0 disables the cap; negative values fall back to the shipped default.
 	if c.Defaults.HistoryMaxResult < 0 {

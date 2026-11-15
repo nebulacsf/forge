@@ -66,9 +66,10 @@ auto-continues. When the budget is reached, Forge requires the final plan. It
 gives the model up to three final attempts, rejects empty answers and
 tool calls written as text (`<tool_call>`, XML or JSON), and removes the tool
 definitions entirely on the last attempt. The current turn's tool results are
-kept unpruned and PLAN raises the per-result cap to 8,000 characters, so the
-model can write the plan from what it already inspected instead of re-reading
-files. BUILD keeps the normal checkpoint/auto-continue behavior.
+kept unpruned and PLAN never lowers the per-result cap below 8,000 characters
+(the shipped default is 16,000), so the model can write the plan from what it
+already inspected instead of re-reading files. BUILD keeps the normal
+checkpoint/auto-continue behavior.
 
 ### Token-saving behavior
 
@@ -139,9 +140,10 @@ paused turn shows a **Continue** action.
 
 PLAN does not use checkpoints or auto-continue. It has a separate research
 budget (`plan_rounds` / `plan_tool_calls`), keeps this turn's tool results
-unpruned with an 8,000-character per-result floor, and forces a final plan when
-the budget is spent. The final answer must be real Markdown; empty answers,
-reasoning-only replies, and tool calls written as text are rejected and retried.
+unpruned with an 8,000-character per-result floor (the shipped default is
+already 16,000), and forces a final plan when the budget is spent. The final
+answer must be real Markdown; empty answers, reasoning-only replies, and tool
+calls written as text are rejected and retried.
 
 A loop guard runs alongside the budget. It fingerprints each tool call together
 with its result and stops the turn when the same call produces the same result
@@ -204,10 +206,10 @@ system shortcuts.
     "plan_tool_calls": 64,
     "auto_continue": true,
     "max_turn_cost_usd": 0,
-    "history_keep_recent_rounds": 4,
-    "history_max_result_chars": 4000,
+    "history_keep_recent_rounds": 32,
+    "history_max_result_chars": 16000,
     "history_max_arg_chars": 4000,
-    "history_prune_chunk_rounds": 4
+    "history_prune_chunk_rounds": 16
   }
 }
 ```
