@@ -201,4 +201,13 @@ func TestOpenAddsCachedTokensColumn(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("cached_tokens column count = %d, want 1", count)
 	}
+	for table, column := range map[string]string{"sessions": "duration_ms", "messages": "duration_ms"} {
+		if err := st.db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("%s.%s column count = %d, want 1", table, column, count)
+		}
+	}
 }

@@ -41,11 +41,18 @@ const state = {
   turnSegment: 1,
   turnSegmentSize: 0,
   messageIndex: -1,
+  sessionTimeBase: 0,
+  turnBaseTime: 0,
+  turnStartedAt: 0,
+  turnElapsedMs: 0,
+  turnClock: null,
+  turnTimerEl: null,
 };
 
 let projectModal = null;
 let settingsModal = null;
 let contentTimer = null;
+let checklistDoneOpen = false;
 
 const PALETTE = ['#6c8cff', '#22c55e', '#f59e0b', '#ec4899', '#06b6d4', '#a855f7', '#ef4444', '#14b8a6'];
 
@@ -57,6 +64,9 @@ async function init() {
   if (window.marked) {
     marked.setOptions({ gfm: true, breaks: false });
   }
+  applyTheme(localStorage.getItem('forge.theme') || 'dark', { persist: false });
+  initFilesCard();
+  setPanelHidden(localStorage.getItem('forge.panelHidden') === '1', { persist: false });
   bindEvents();
   if (window.bootstrap) {
     projectModal = new bootstrap.Modal($('projectModal'));
@@ -178,6 +188,54 @@ function randomPaletteColor() {
   return PALETTE[Math.floor(Math.random() * PALETTE.length)];
 }
 
+/* ── Theme, panel, collapsible cards ─────────────────────────────── */
+
+function applyTheme(theme, { persist = true } = {}) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  document.documentElement.setAttribute('data-bs-theme', next);
+  const dark = $('hljsDark');
+  const light = $('hljsLight');
+  if (dark) dark.disabled = next !== 'dark';
+  if (light) light.disabled = next !== 'light';
+  const btn = $('themeBtn');
+  if (btn) {
+    const icon = btn.querySelector('i');
+    if (icon) icon.className = next === 'dark' ? 'bi bi-sun' : 'bi bi-moon-stars';
+    btn.title = next === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
+    btn.setAttribute('aria-label', btn.title);
+  }
+  if (persist) {
+    try { localStorage.setItem('forge.theme', next); } catch { /* ignore */ }
+  }
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+  applyTheme(current === 'dark' ? 'light' : 'dark');
+}
+
+function setPanelHidden(hidden, { persist = true } = {}) {
+  const panel = $('contextPanel');
+  const show = $('showPanelBtn');
+  if (panel) panel.classList.toggle('panel-hidden', hidden);
+  if (show) show.classList.toggle('d-none', !hidden);
+  if (persist) {
+    try { localStorage.setItem('forge.panelHidden', hidden ? '1' : '0'); } catch { /* ignore */ }
+  }
+}
+
+function initFilesCard() {
+  const card = $('filesCard');
+  if (!card) return;
+  let open = false;
+  try { open = localStorage.getItem('forge.filesOpen') === '1'; } catch { /* ignore */ }
+  card.open = open;
+  card.addEventListener('toggle', () => {
+    try { localStorage.setItem('forge.filesOpen', card.open ? '1' : '0'); } catch { /* ignore */ }
+  });
+}
+
 /* ── Sessions ────────────────────────────────────────────────────── */
 
 async function selectProject(id, { autoCreate = false } = {}) {
@@ -248,6 +306,12 @@ async function loadSession(id) {
     state.toolCards = new Map();
     state.currentRound = null;
     state.sawCancelled = false;
+    state.sessionTimeBase = Number(data.session.duration_ms || 0);
+    state.turnBaseTime = state.sessionTimeBase;
+    state.turnStartedAt = 0;
+    state.turnElapsedMs = 0;
+    state.turnTimerEl = null;
+    stopTurnClock(false);
     state.usage = {
       sessionIn: data.session.tokens_in || 0,
       sessionOut: data.session.tokens_out || 0,
@@ -283,6 +347,12 @@ function clearSession() {
     sessionIn: 0, sessionOut: 0, sessionCost: 0, projectCost: 0,
     contextTokens: 0, contextExact: false, cached: 0,
   };
+  stopTurnClock(false);
+  state.sessionTimeBase = 0;
+  state.turnBaseTime = 0;
+  state.turnStartedAt = 0;
+  state.turnElapsedMs = 0;
+  state.turnTimerEl = null;
   if (state.activeProjectId) localStorage.removeItem(`forge.session.${state.activeProjectId}`);
   $('messages').innerHTML = '';
   $('modelInput').value = state.config?.defaults?.model || '';
@@ -484,22 +554,27 @@ function renderAssistantHistory(msg) {
     const contentEl = ensureContentEl(round);
     renderMarkdownInto(contentEl, msg.content, true);
   }
+  if (Number(msg.duration_ms) > 0) {
+    addHistoricalTurnTime(round, Number(msg.duration_ms));
+  }
   return true;
 }
 
 function makeRoundElement() {
   const el = document.createElement('div');
   el.className = 'assistant-round msg';
-  el.innerHTML = '<div class="round-avatar">F</div><div class="round-main"><div class="round-events"></div></div>';
+  el.innerHTML = '<div class="round-avatar">F</div><div class="round-main"><div class="round-events"></div><div class="round-footer"></div></div>';
   return {
     el,
     main: el.querySelector('.round-main'),
     events: el.querySelector('.round-events'),
+    footer: el.querySelector('.round-footer'),
     reasoning: null,
     contentEl: null,
     rawContent: '',
     thinking: null,
     timer: null,
+    timerEl: null,
     hasEvents: false,
     num: 0,
   };
@@ -557,6 +632,7 @@ async function runTurn({ content = '', isContinue = false, userText = content })
   state.turnSegmentSize = 0;
   const modeAtSend = state.session?.mode === 'BUILD' ? 'BUILD' : 'PLAN';
   setStreamingUI(true);
+  startTurnClock();
   beginRound(0);
   const controller = new AbortController();
   state.abort = controller;
@@ -602,6 +678,7 @@ async function runTurn({ content = '', isContinue = false, userText = content })
       toast(err.message || 'Request failed', 'error');
     }
   } finally {
+    stopTurnClock(true);
     finalizeRound();
     state.streaming = false;
     state.abort = null;
@@ -778,6 +855,7 @@ function handleEvent(ev) {
       break;
     case 'done':
       if (ev.session) syncSession(ev.session);
+      stopTurnClock(true);
       if (state.currentRound) removeThinking(state.currentRound);
       if (ev.reasoning_only) {
         const round = state.currentRound;
@@ -795,11 +873,13 @@ function handleEvent(ev) {
       }
       break;
     case 'limit':
+      stopTurnClock(true);
       if (state.currentRound) removeThinking(state.currentRound);
       addLimitNotice(ev);
       break;
     case 'cancelled':
       state.sawCancelled = true;
+      stopTurnClock(true);
       addNotice('Stopped', 'stopped');
       break;
     case 'error':
@@ -816,12 +896,14 @@ function beginRound(num) {
     state.currentRound.num = num || 1;
     return state.currentRound;
   }
+  if (state.currentRound) detachTurnTimer(state.currentRound);
   finalizeRound();
   const round = makeRoundElement();
   round.num = num || 0;
   $('messages').appendChild(round.el);
   round.thinking = addThinkingRow(round);
   state.currentRound = round;
+  if (state.streaming) attachTurnTimer(round);
   maybeScroll();
   return round;
 }
@@ -848,7 +930,105 @@ function finalizeRound() {
   } else {
     renderContent(round, true);
   }
+  round.el.classList.remove('is-working');
   state.currentRound = null;
+}
+
+/* ── Turn timers ─────────────────────────────────────────────────── */
+
+function attachTurnTimer(round) {
+  if (!round || !round.footer) return;
+  detachTurnTimer(round);
+  const el = document.createElement('div');
+  el.className = 'round-time';
+  el.title = 'Elapsed time for this response, including planning and tool calls';
+  const icon = document.createElement('i');
+  icon.className = 'bi bi-stopwatch';
+  const label = document.createElement('span');
+  label.textContent = formatElapsed(state.turnElapsedMs || 0);
+  el.appendChild(icon);
+  el.appendChild(label);
+  round.footer.appendChild(el);
+  round.timerEl = el;
+  round.el.classList.add('is-working');
+  state.turnTimerEl = label;
+}
+
+function detachTurnTimer(round) {
+  if (!round) return;
+  if (state.turnTimerEl && round.timerEl && round.timerEl.contains(state.turnTimerEl)) {
+    state.turnTimerEl = null;
+  }
+  if (round.timerEl) {
+    round.timerEl.remove();
+    round.timerEl = null;
+  }
+  round.el.classList.remove('is-working');
+}
+
+function addHistoricalTurnTime(round, ms) {
+  if (!round || !round.footer) return;
+  const el = document.createElement('div');
+  el.className = 'round-time';
+  el.title = 'Total elapsed time for this response';
+  const icon = document.createElement('i');
+  icon.className = 'bi bi-stopwatch';
+  const label = document.createElement('span');
+  label.textContent = formatElapsed(ms);
+  el.appendChild(icon);
+  el.appendChild(label);
+  round.footer.appendChild(el);
+}
+
+function startTurnClock() {
+  stopTurnClock(false);
+  const persisted = Math.max(Number(state.session?.duration_ms || 0), Number(state.sessionTimeBase || 0));
+  state.turnBaseTime = persisted;
+  state.sessionTimeBase = persisted;
+  state.turnStartedAt = Date.now();
+  state.turnElapsedMs = 0;
+  state.turnClock = setInterval(tickTurnClock, 500);
+  updateSessionTimeUI();
+}
+
+function tickTurnClock() {
+  if (!state.turnStartedAt) return;
+  state.turnElapsedMs = Date.now() - state.turnStartedAt;
+  if (state.turnTimerEl) state.turnTimerEl.textContent = formatElapsed(state.turnElapsedMs);
+  updateSessionTimeUI();
+}
+
+function stopTurnClock(finalize = true) {
+  if (state.turnClock) {
+    clearInterval(state.turnClock);
+    state.turnClock = null;
+  }
+  if (state.turnStartedAt) {
+    state.turnElapsedMs = Date.now() - state.turnStartedAt;
+    state.turnStartedAt = 0;
+  }
+  if (finalize && state.turnTimerEl) {
+    state.turnTimerEl.textContent = formatElapsed(state.turnElapsedMs);
+    state.turnTimerEl = null;
+  }
+  if (finalize && state.currentRound) {
+    state.currentRound.el.classList.remove('is-working');
+  }
+  if (finalize) {
+    const persisted = Number(state.session?.duration_ms || 0);
+    state.sessionTimeBase = Math.max(state.turnBaseTime + state.turnElapsedMs, persisted);
+  }
+  updateSessionTimeUI();
+}
+
+function updateSessionTimeUI() {
+  const el = $('sessionTime');
+  if (!el) return;
+  let total = Math.max(Number(state.sessionTimeBase || 0), Number(state.session?.duration_ms || 0));
+  if (state.streaming && state.turnStartedAt) {
+    total = state.turnBaseTime + (Date.now() - state.turnStartedAt);
+  }
+  el.textContent = total > 0 ? formatElapsed(total) : '0s';
 }
 
 function addThinkingRow(round) {
@@ -879,7 +1059,8 @@ function ensureContentEl(round) {
   if (!round.contentEl) {
     round.contentEl = document.createElement('div');
     round.contentEl.className = 'md';
-    round.main.appendChild(round.contentEl);
+    if (round.footer) round.main.insertBefore(round.contentEl, round.footer);
+    else round.main.appendChild(round.contentEl);
   }
   return round.contentEl;
 }
@@ -1252,6 +1433,7 @@ function updateUsageUI() {
     'Cache hits require an identical prompt prefix and the same upstream provider.';
   $('sessionCost').textContent = formatCost(state.usage.sessionCost);
   $('projectCost').textContent = formatCost(state.usage.projectCost);
+  updateSessionTimeUI();
   const status = $('sessionStatus');
   if (status) status.textContent = state.session ? formatLimit(limit) + ' ctx' : '';
 }
@@ -1334,13 +1516,18 @@ function renderChecklist() {
     list.appendChild(empty);
     return;
   }
-  for (const item of state.checklist) {
-    const row = document.createElement('label');
+
+  const pending = state.checklist.filter((i) => !i.is_done);
+  const completed = state.checklist.filter((i) => i.is_done);
+
+  const makeRow = (item) => {
+    const row = document.createElement('div');
     row.className = 'check-item' + (item.is_done ? ' done' : '');
 
     const box = document.createElement('input');
     box.type = 'checkbox';
     box.checked = !!item.is_done;
+    box.setAttribute('aria-label', item.task_text);
     box.addEventListener('change', () => toggleChecklist(item, box.checked));
 
     const text = document.createElement('span');
@@ -1351,6 +1538,7 @@ function renderChecklist() {
     del.type = 'button';
     del.className = 'check-del';
     del.title = 'Remove task';
+    del.setAttribute('aria-label', 'Remove task');
     del.innerHTML = '<i class="bi bi-x-lg"></i>';
     del.addEventListener('click', (e) => {
       e.preventDefault();
@@ -1361,7 +1549,39 @@ function renderChecklist() {
     row.appendChild(box);
     row.appendChild(text);
     row.appendChild(del);
-    list.appendChild(row);
+    return row;
+  };
+
+  if (pending.length) {
+    for (const item of pending) list.appendChild(makeRow(item));
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'checklist-empty';
+    empty.textContent = 'All tasks are done.';
+    list.appendChild(empty);
+  }
+
+  if (completed.length) {
+    const details = document.createElement('details');
+    details.className = 'checklist-done';
+    details.open = checklistDoneOpen;
+    details.addEventListener('toggle', () => {
+      checklistDoneOpen = details.open;
+    });
+    const summary = document.createElement('summary');
+    const label = document.createElement('span');
+    label.textContent = 'Completed';
+    const count = document.createElement('span');
+    count.className = 'done-count';
+    count.textContent = String(completed.length);
+    const chevron = document.createElement('i');
+    chevron.className = 'bi bi-chevron-right done-chev';
+    summary.appendChild(label);
+    summary.appendChild(count);
+    summary.appendChild(chevron);
+    details.appendChild(summary);
+    for (const item of completed) details.appendChild(makeRow(item));
+    list.appendChild(details);
   }
 }
 
@@ -1505,6 +1725,17 @@ function formatDuration(ms) {
   if (ms < 1000) return ms + 'ms';
   if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + 's';
   return Math.floor(ms / 60000) + 'm ' + Math.round((ms % 60000) / 1000) + 's';
+}
+
+// Timers are shown in whole seconds: 0s, 12s, 1m 05s, 1h 02m.
+function formatElapsed(ms) {
+  const total = Math.max(0, Math.round(Number(ms || 0) / 1000));
+  if (total < 60) return total + 's';
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  if (minutes < 60) return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
 function formatChars(n) {
@@ -1759,6 +1990,9 @@ function toast(message, type = 'error') {
 
 function bindEvents() {
   $('addProjectBtn').addEventListener('click', openProjectModal);
+  $('themeBtn').addEventListener('click', toggleTheme);
+  $('collapsePanelBtn').addEventListener('click', () => setPanelHidden(true));
+  $('showPanelBtn').addEventListener('click', () => setPanelHidden(false));
   $('settingsBtn').addEventListener('click', openSettings);
   $('newSessionBtn').addEventListener('click', () => createSession());
   $('sendBtn').addEventListener('click', sendMessage);

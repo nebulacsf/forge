@@ -77,6 +77,11 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	if n > 1 {
+		// Give the turn a measurable duration without slowing the test down.
+		time.Sleep(20 * time.Millisecond)
+	}
+
 	if n == 1 {
 		// Verify plan tools are present and build tools are not.
 		names := map[string]bool{}
@@ -233,6 +238,7 @@ func TestChatStreamToolLoop(t *testing.T) {
 					TokensOut:    int64(raw["tokens_out"].(float64)),
 					CachedTokens: int64(raw["cached_tokens"].(float64)),
 					CostUSD:      raw["cost_usd"].(float64),
+					DurationMS:   int64(raw["duration_ms"].(float64)),
 				}
 			}
 		}
@@ -278,6 +284,12 @@ func TestChatStreamToolLoop(t *testing.T) {
 	if msgs[0].Role != "user" || !strings.Contains(msgs[1].ToolCalls, `"call_read"`) {
 		t.Errorf("unexpected persisted messages: %+v", msgs)
 	}
+	if msgs[1].DurationMS != 0 {
+		t.Errorf("intermediate assistant duration = %d, want 0", msgs[1].DurationMS)
+	}
+	if msgs[2].DurationMS <= 0 {
+		t.Errorf("final assistant duration = %d, want > 0", msgs[2].DurationMS)
+	}
 	items, _ := st.ListChecklist(session.ID)
 	if len(items) != 1 || !strings.Contains(items[0].TaskText, "Report") {
 		t.Errorf("checklist not persisted: %+v", items)
@@ -288,6 +300,15 @@ func TestChatStreamToolLoop(t *testing.T) {
 	}
 	if final.Mode != "PLAN" || final.CostUSD < 0.0014 {
 		t.Errorf("session state = %+v", final)
+	}
+	if final.DurationMS <= 0 {
+		t.Errorf("session duration = %d, want > 0", final.DurationMS)
+	}
+	if sessionEvent == nil || sessionEvent.DurationMS != final.DurationMS {
+		t.Errorf("done session duration = %+v, persisted = %d", sessionEvent, final.DurationMS)
+	}
+	if final.DurationMS != msgs[2].DurationMS {
+		t.Errorf("session duration = %d, final message duration = %d; want equal", final.DurationMS, msgs[2].DurationMS)
 	}
 }
 

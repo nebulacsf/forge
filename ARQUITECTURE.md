@@ -193,8 +193,8 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
 
 ```
 projects: id, name, path(UNIQUE), icon_color, last_opened_at, total_cost_usd, session_count
-sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), tokens_in/out, cached_tokens, cost_usd, is_open, updated_at
-messages: id, session_id(FK), role(user|assistant|tool), reasoning, content, tool_calls(JSON), created_at
+sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), tokens_in/out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
+messages: id, session_id(FK), role(user|assistant|tool), reasoning, content, tool_calls(JSON), duration_ms, created_at
 checklists: id, session_id(FK), task_text, is_done, position
 repo_outline: project_path, file_path, language, mtime_ns, size_bytes, symbols, updated_at
               PRIMARY KEY(project_path, file_path)
@@ -233,9 +233,11 @@ transaction.
 
 ## Frontend (`web/`)
 **Vanilla ES6 SPA** (Bootstrap 5, marked.js, highlight.js):
-- **Left:** Project rail + add/settings buttons
+- **Left:** Project rail + add/theme/settings buttons
 - **Center:** Session tabs + chat (messages + composer)
-- **Right (XL+):** Sidebar with usage/cost, active files, checklist
+- **Right (XL+):** Collapsible inspector with usage/cost, active files, checklist
+- **Themes:** `data-theme` / `data-bs-theme` drive custom tokens, Bootstrap, and highlight.js; preference stored in `localStorage`
+- **Timers:** Live session and per-response timers; persisted as `sessions.duration_ms` and `messages.duration_ms`
 - **Modals:** Add Project, Settings
 - **SSE:** `EventSource` parses typed events → incremental DOM updates
 
@@ -310,7 +312,7 @@ internal/
 web/
   index.html                 # SPA structure, modals, CDN deps
   js/app.js                  # Frontend logic (state, SSE, rendering)
-  css/app.css                # Custom styles (dark theme)
+  css/app.css                # Custom styles (dark and light themes)
 ```
 
 ---

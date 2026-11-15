@@ -529,19 +529,20 @@ func messageDTOs(messages []store.Message) []messageDTO {
 		}
 		dtos = append(dtos, messageDTO{
 			ID: m.ID, Role: m.Role, Reasoning: m.Reasoning, Content: m.Content,
-			ToolCalls: raw, CreatedAt: m.CreatedAt,
+			ToolCalls: raw, DurationMS: m.DurationMS, CreatedAt: m.CreatedAt,
 		})
 	}
 	return dtos
 }
 
 type messageDTO struct {
-	ID        int64           `json:"id"`
-	Role      string          `json:"role"`
-	Reasoning string          `json:"reasoning"`
-	Content   string          `json:"content"`
-	ToolCalls json.RawMessage `json:"tool_calls"`
-	CreatedAt string          `json:"created_at"`
+	ID         int64           `json:"id"`
+	Role       string          `json:"role"`
+	Reasoning  string          `json:"reasoning"`
+	Content    string          `json:"content"`
+	ToolCalls  json.RawMessage `json:"tool_calls"`
+	DurationMS int64           `json:"duration_ms"`
+	CreatedAt  string          `json:"created_at"`
 }
 
 func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {

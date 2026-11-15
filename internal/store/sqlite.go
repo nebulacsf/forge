@@ -37,18 +37,20 @@ type Session struct {
 	TokensOut    int64   `json:"tokens_out"`
 	CachedTokens int64   `json:"cached_tokens"`
 	CostUSD      float64 `json:"cost_usd"`
+	DurationMS   int64   `json:"duration_ms"`
 	IsOpen       bool    `json:"is_open"`
 	UpdatedAt    string  `json:"updated_at"`
 }
 
 type Message struct {
-	ID        int64  `json:"id"`
-	SessionID int64  `json:"session_id"`
-	Role      string `json:"role"`
-	Reasoning string `json:"reasoning"`
-	Content   string `json:"content"`
-	ToolCalls string `json:"tool_calls"`
-	CreatedAt string `json:"created_at"`
+	ID         int64  `json:"id"`
+	SessionID  int64  `json:"session_id"`
+	Role       string `json:"role"`
+	Reasoning  string `json:"reasoning"`
+	Content    string `json:"content"`
+	ToolCalls  string `json:"tool_calls"`
+	DurationMS int64  `json:"duration_ms"`
+	CreatedAt  string `json:"created_at"`
 }
 
 type ChecklistItem struct {
@@ -207,6 +209,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 	tokens_out INTEGER NOT NULL DEFAULT 0,
 	cached_tokens INTEGER NOT NULL DEFAULT 0,
 	cost_usd   REAL NOT NULL DEFAULT 0,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
 	is_open    INTEGER NOT NULL DEFAULT 1,
 	updated_at TEXT NOT NULL
 );
@@ -218,6 +221,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	reasoning  TEXT NOT NULL DEFAULT '',
 	content    TEXT NOT NULL DEFAULT '',
 	tool_calls TEXT,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
 	created_at TEXT NOT NULL
 );
 
@@ -249,6 +253,13 @@ CREATE INDEX IF NOT EXISTS idx_checklists_session ON checklists(session_id, posi
 	}
 	// Databases created before cached-token accounting need the new column.
 	if err := ensureColumn(db, "sessions", "cached_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Turn timers are persisted so session totals survive a reload.
+	if err := ensureColumn(db, "sessions", "duration_ms", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "messages", "duration_ms", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	return nil
@@ -393,7 +404,7 @@ func (s *Store) CreateSession(projectID int64, title, model, mode string) (Sessi
 }
 
 func (s *Store) ListSessions(projectID int64, openOnly bool) ([]Session, error) {
-	query := `SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, is_open, updated_at
+	query := `SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
 		FROM sessions WHERE project_id = ?`
 	if openOnly {
 		query += ` AND is_open = 1`
@@ -416,7 +427,7 @@ func (s *Store) ListSessions(projectID int64, openOnly bool) ([]Session, error) 
 }
 
 func (s *Store) GetSession(id int64) (Session, error) {
-	row := s.db.QueryRow(`SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, is_open, updated_at
+	row := s.db.QueryRow(`SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
 		FROM sessions WHERE id = ?`, id)
 	sess, err := scanSession(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -435,7 +446,7 @@ func scanSession(r rowScanner) (Session, error) {
 		isOpen int
 	)
 	if err := r.Scan(&sess.ID, &sess.ProjectID, &sess.Title, &sess.Model, &sess.Mode,
-		&sess.TokensIn, &sess.TokensOut, &sess.CachedTokens, &sess.CostUSD, &isOpen, &sess.UpdatedAt); err != nil {
+		&sess.TokensIn, &sess.TokensOut, &sess.CachedTokens, &sess.CostUSD, &sess.DurationMS, &isOpen, &sess.UpdatedAt); err != nil {
 		return Session{}, err
 	}
 	sess.IsOpen = isOpen != 0
@@ -491,6 +502,17 @@ func (s *Store) AddUsage(sessionID, tokensIn, tokensOut, cachedTokens int64, cos
 	return err
 }
 
+// AddSessionDuration accumulates the wall-clock time spent in agent turns.
+func (s *Store) AddSessionDuration(sessionID, durationMS int64) error {
+	if durationMS <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`
+		UPDATE sessions SET duration_ms = duration_ms + ?, updated_at = ? WHERE id = ?`,
+		durationMS, now(), sessionID)
+	return err
+}
+
 func (s *Store) DeleteSession(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
 	return err
@@ -516,7 +538,7 @@ func (s *Store) AddMessage(sessionID int64, role, reasoning, content, toolCalls 
 
 func (s *Store) ListMessages(sessionID int64) ([]Message, error) {
 	rows, err := s.db.Query(`
-		SELECT id, session_id, role, reasoning, content, COALESCE(tool_calls, ''), created_at
+		SELECT id, session_id, role, reasoning, content, COALESCE(tool_calls, ''), duration_ms, created_at
 		FROM messages WHERE session_id = ? ORDER BY id ASC`, sessionID)
 	if err != nil {
 		return nil, err
@@ -525,12 +547,21 @@ func (s *Store) ListMessages(sessionID int64) ([]Message, error) {
 	out := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Reasoning, &m.Content, &m.ToolCalls, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Reasoning, &m.Content, &m.ToolCalls, &m.DurationMS, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// SetMessageDuration records how long the turn that produced a message took.
+func (s *Store) SetMessageDuration(id, durationMS int64) error {
+	if id == 0 || durationMS < 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE messages SET duration_ms = ? WHERE id = ?`, durationMS, id)
+	return err
 }
 
 // ReplaceMessages replaces a session's transcript with a summary message
@@ -546,8 +577,8 @@ func (s *Store) ReplaceMessages(sessionID int64, summary string, keep []Message)
 	}
 	ts := now()
 	if _, err := tx.Exec(`
-		INSERT INTO messages (session_id, role, reasoning, content, tool_calls, created_at)
-		VALUES (?, 'assistant', '', ?, '', ?)`, sessionID, summary, ts); err != nil {
+		INSERT INTO messages (session_id, role, reasoning, content, tool_calls, duration_ms, created_at)
+		VALUES (?, 'assistant', '', ?, '', 0, ?)`, sessionID, summary, ts); err != nil {
 		return err
 	}
 	for _, m := range keep {
@@ -555,9 +586,9 @@ func (s *Store) ReplaceMessages(sessionID int64, summary string, keep []Message)
 			continue
 		}
 		if _, err := tx.Exec(`
-			INSERT INTO messages (session_id, role, reasoning, content, tool_calls, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)`,
-			sessionID, m.Role, m.Reasoning, m.Content, m.ToolCalls, ts); err != nil {
+			INSERT INTO messages (session_id, role, reasoning, content, tool_calls, duration_ms, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			sessionID, m.Role, m.Reasoning, m.Content, m.ToolCalls, m.DurationMS, ts); err != nil {
 			return err
 		}
 	}

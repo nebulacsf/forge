@@ -160,6 +160,38 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	turnStart := time.Now()
 	logx.Info("turn start", "session", session.ID, "project", project.ID, "model", session.Model, "mode", session.Mode)
 
+	// A turn may span several rounds and end from many branches. Record the
+	// wall-clock duration once, before the final session snapshot is sent, so
+	// the UI can show both the per-response timer and the session total.
+	var lastAssistantID int64
+	timingSaved := false
+	saveTurnTiming := func() {
+		if timingSaved {
+			return
+		}
+		timingSaved = true
+		elapsed := time.Since(turnStart).Milliseconds()
+		if lastAssistantID > 0 {
+			if err := s.store.SetMessageDuration(lastAssistantID, elapsed); err != nil {
+				logx.Error("persist message duration failed", "session", session.ID, "error", err)
+			}
+		}
+		if err := s.store.AddSessionDuration(session.ID, elapsed); err != nil {
+			logx.Error("persist session duration failed", "session", session.ID, "error", err)
+		}
+	}
+	finish := func(reasoningOnly bool) {
+		saveTurnTiming()
+		s.sendDone(stream, session.ID, reasoningOnly)
+	}
+	cancelTurn := func(reasoning, content string) {
+		if id := s.persistPartial(session.ID, reasoning, content); id > 0 {
+			lastAssistantID = id
+		}
+		_ = stream.send(chatEvent{Type: "cancelled", Message: "Stopped"})
+		finish(false)
+	}
+
 	// Persist the user message first.
 	if _, err := s.store.AddMessage(session.ID, "user", "", body.Content, ""); err != nil {
 		stream.fail("Could not save message: " + err.Error())
@@ -221,14 +253,14 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		for segRound := 1; segRound <= segmentSize && totalRounds < turnLimit; segRound++ {
 			totalRounds++
 			if ctx.Err() != nil {
-				s.finishCancelled(stream, session.ID, "", "")
+				cancelTurn("", "")
 				return
 			}
 			if err := stream.send(chatEvent{
 				Type: "round_start", Round: totalRounds, Limit: turnLimit,
 				Segment: segment, SegmentSize: segmentSize,
 			}); err != nil {
-				s.persistPartial(session.ID, "", "")
+				saveTurnTiming()
 				return
 			}
 
@@ -242,6 +274,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			rows, err := s.store.ListMessages(session.ID)
 			if err != nil {
 				stream.fail("Could not load conversation: " + err.Error())
+				saveTurnTiming()
 				return
 			}
 			history, hstats := buildHistory(rows, system, historyOptions{
@@ -290,16 +323,19 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 			if streamErr != nil {
 				if ctx.Err() != nil || errors.Is(streamErr, context.Canceled) {
-					if result != nil {
-						s.persistPartial(session.ID, result.Reasoning, result.Content)
-					}
 					logx.Info("turn cancelled", "session", session.ID, "round", totalRounds,
 						"duration", time.Since(turnStart).Round(time.Millisecond).String())
-					s.finishCancelled(stream, session.ID, "", "")
+					if result != nil {
+						cancelTurn(result.Reasoning, result.Content)
+					} else {
+						cancelTurn("", "")
+					}
 					return
 				}
 				if result != nil {
-					s.persistPartial(session.ID, result.Reasoning, result.Content)
+					if id := s.persistPartial(session.ID, result.Reasoning, result.Content); id > 0 {
+						lastAssistantID = id
+					}
 				}
 				msg := streamErr.Error()
 				if errors.Is(streamErr, context.DeadlineExceeded) {
@@ -310,13 +346,13 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				}
 				logx.Warn("provider stream failed", "session", session.ID, "round", totalRounds, "error", msg)
 				stream.fail(msg)
-				s.sendDone(stream, session.ID, false)
+				finish(false)
 				return
 			}
 			if result == nil {
 				logx.Warn("provider returned no result", "session", session.ID, "round", totalRounds)
 				stream.fail("The provider returned an empty response.")
-				s.sendDone(stream, session.ID, false)
+				finish(false)
 				return
 			}
 
@@ -361,7 +397,10 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				SessionCostUSD:      session.CostUSD,
 				ProjectCostUSD:      projectCost,
 			}); err != nil {
-				s.persistPartial(session.ID, result.Reasoning, result.Content)
+				if id := s.persistPartial(session.ID, result.Reasoning, result.Content); id > 0 {
+					lastAssistantID = id
+				}
+				saveTurnTiming()
 				return
 			}
 
@@ -371,14 +410,17 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				if !hasContent && !hasReasoning {
 					logx.Warn("empty completion", "session", session.ID, "round", totalRounds, "model", session.Model)
 					stream.fail("The model returned an empty response. Try another model or send the message again.")
-					s.sendDone(stream, session.ID, false)
+					finish(false)
 					return
 				}
-				if _, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, ""); err != nil {
+				msg, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, "")
+				if err != nil {
 					logx.Error("persist assistant response failed", "session", session.ID, "error", err)
 					stream.fail("Could not save response: " + err.Error())
+					saveTurnTiming()
 					return
 				}
+				lastAssistantID = msg.ID
 				if !hasContent && hasReasoning {
 					logx.Warn("model returned reasoning without a final answer",
 						"session", session.ID, "round", totalRounds, "model", session.Model)
@@ -387,7 +429,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					"reasoning_only", !hasContent && hasReasoning,
 					"duration", time.Since(turnStart).Round(time.Millisecond).String(),
 					"tokens_in", session.TokensIn, "tokens_out", session.TokensOut, "cost", session.CostUSD)
-				s.sendDone(stream, session.ID, !hasContent && hasReasoning)
+				finish(!hasContent && hasReasoning)
 				return
 			}
 
@@ -412,7 +454,10 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 						Type: "tool_blocked", Round: totalRounds, ID: call.ID, Name: call.Function.Name,
 						Message: reason, Status: "blocked",
 					}); err != nil {
-						s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
+						if id, _ := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); id > 0 {
+							lastAssistantID = id
+						}
+						saveTurnTiming()
 						return
 					}
 					if verdict := guard.observe(*call, tools.Result{Content: reason, IsError: true}); verdict.Action != guardOK {
@@ -430,7 +475,10 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					Type: "tool_start", Round: totalRounds, ID: call.ID, Name: call.Function.Name,
 					Arguments: call.Function.Arguments, Status: "running",
 				}); err != nil {
-					s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
+					if id, _ := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); id > 0 {
+						lastAssistantID = id
+					}
+					saveTurnTiming()
 					return
 				}
 				started := time.Now()
@@ -463,7 +511,10 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					Result: toolResult.Content, IsError: toolResult.IsError, DurationMS: elapsed,
 					Status: call.Status, Files: toolResult.Files,
 				}); err != nil {
-					s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls)
+					if id, _ := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); id > 0 {
+						lastAssistantID = id
+					}
+					saveTurnTiming()
 					return
 				}
 				if toolResult.ChecklistChanged {
@@ -473,12 +524,15 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if _, err := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); err != nil {
+			if id, err := s.persistToolCalls(session.ID, result.Reasoning, result.Content, calls); err != nil {
 				stream.fail("Could not save tool results: " + err.Error())
+				saveTurnTiming()
 				return
+			} else if id > 0 {
+				lastAssistantID = id
 			}
 			if ctx.Err() != nil {
-				s.finishCancelled(stream, session.ID, "", "")
+				cancelTurn("", "")
 				return
 			}
 
@@ -492,7 +546,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					Segment: segment, SegmentSize: segmentSize,
 					Reason: abortReason, Message: abortMessage,
 				})
-				s.sendDone(stream, session.ID, false)
+				finish(false)
 				return
 			}
 			if turnCostLimit > 0 && turnCost >= turnCostLimit {
@@ -504,7 +558,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 					Reason:  "cost_budget",
 					Message: fmt.Sprintf("Paused after $%.4f (turn budget $%.4f). Send another message to continue.", turnCost, turnCostLimit),
 				})
-				s.sendDone(stream, session.ID, false)
+				finish(false)
 				return
 			}
 		}
@@ -512,7 +566,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		// The segment finished. Either the turn budget is spent or the model was
 		// still working, in which case we either pause or continue automatically.
 		if ctx.Err() != nil {
-			s.finishCancelled(stream, session.ID, "", "")
+			cancelTurn("", "")
 			return
 		}
 		if totalRounds >= turnLimit {
@@ -526,7 +580,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				Segment: segment, SegmentSize: segmentSize, Reason: "paused",
 				Message: fmt.Sprintf("Checkpoint at %d rounds. Continue when ready.", totalRounds),
 			})
-			s.sendDone(stream, session.ID, false)
+			finish(false)
 			return
 		}
 		segment++
@@ -546,16 +600,19 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		Segment: segment, SegmentSize: segmentSize, Reason: "turn_budget",
 		Message: fmt.Sprintf("Paused after %d rounds (turn budget). Send another message or press Continue to keep going.", turnLimit),
 	})
-	s.sendDone(stream, session.ID, false)
+	finish(false)
 }
 
-func (s *Server) persistPartial(sessionID int64, reasoning, content string) {
+func (s *Server) persistPartial(sessionID int64, reasoning, content string) int64 {
 	if strings.TrimSpace(reasoning) == "" && strings.TrimSpace(content) == "" {
-		return
+		return 0
 	}
-	if _, err := s.store.AddMessage(sessionID, "assistant", reasoning, content, ""); err != nil {
+	msg, err := s.store.AddMessage(sessionID, "assistant", reasoning, content, "")
+	if err != nil {
 		logx.Error("persist partial response failed", "session", sessionID, "error", err)
+		return 0
 	}
+	return msg.ID
 }
 
 func (s *Server) persistToolCalls(sessionID int64, reasoning, content string, calls []llm.ToolCall) (int64, error) {
@@ -568,12 +625,6 @@ func (s *Server) persistToolCalls(sessionID int64, reasoning, content string, ca
 		return 0, err
 	}
 	return msg.ID, nil
-}
-
-func (s *Server) finishCancelled(stream *sseWriter, sessionID int64, reasoning, content string) {
-	s.persistPartial(sessionID, reasoning, content)
-	_ = stream.send(chatEvent{Type: "cancelled", Message: "Stopped"})
-	s.sendDone(stream, sessionID, false)
 }
 
 func (s *Server) sendDone(stream *sseWriter, sessionID int64, reasoningOnly bool) {

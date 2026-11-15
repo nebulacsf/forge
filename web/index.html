@@ -1,14 +1,26 @@
 <!doctype html>
-<html lang="en" data-bs-theme="dark">
+<html lang="en" data-bs-theme="dark" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="dark light">
   <title>Forge</title>
+  <script>
+    // Apply the saved theme before the first paint to avoid a flash.
+    (function () {
+      var theme = 'dark';
+      try { theme = localStorage.getItem('forge.theme') || 'dark'; } catch (e) {}
+      if (theme !== 'light') theme = 'dark';
+      document.documentElement.setAttribute('data-theme', theme);
+      document.documentElement.setAttribute('data-bs-theme', theme);
+    })();
+  </script>
   <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="icon" type="image/png" href="images/favicon.png">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css" rel="stylesheet">
+  <link id="hljsDark" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css" rel="stylesheet">
+  <link id="hljsLight" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css" rel="stylesheet" disabled>
   <link href="css/app.css" rel="stylesheet">
 </head>
 <body class="vh-100 overflow-hidden">
@@ -16,11 +28,16 @@
 
   <!-- ── Project rail ─────────────────────────────────────────────── -->
   <aside class="project-rail d-flex flex-column align-items-center flex-shrink-0">
-    <div class="forge-mark" title="Forge">F</div>
+    <div class="forge-mark text-center" title="Forge">
+        <img src="images/logo.png" alt="logo" width="100%">
+    </div>
     <div id="projectList" class="project-list d-flex flex-column align-items-center flex-grow-1 w-100"></div>
     <div class="rail-actions d-flex flex-column align-items-center gap-2">
       <button id="addProjectBtn" class="rail-btn" type="button" title="Register a local project">
         <i class="bi bi-plus-lg"></i>
+      </button>
+      <button id="themeBtn" class="rail-btn" type="button" title="Switch to light theme" aria-label="Switch to light theme">
+        <i class="bi bi-sun"></i>
       </button>
       <button id="settingsBtn" class="rail-btn" type="button" title="Settings (Ctrl+Shift+,)">
         <i class="bi bi-gear"></i>
@@ -38,6 +55,9 @@
         <i class="bi bi-plus-lg"></i>
       </button>
       <div id="projectPathLabel" class="project-path-label flex-shrink-0" title="Active project path"></div>
+      <button id="showPanelBtn" class="panel-reopen d-none flex-shrink-0" type="button" title="Show inspector panel">
+        <i class="bi bi-layout-sidebar-inset"></i>
+      </button>
     </header>
 
     <div class="workspace-body d-flex flex-grow-1 min-h-0">
@@ -114,59 +134,74 @@
       </main>
 
       <!-- Right sidebar -->
-      <aside class="context-panel d-none d-xl-flex flex-column flex-shrink-0">
-        <section class="side-card">
+      <aside id="contextPanel" class="context-panel d-none d-xl-flex flex-column flex-shrink-0">
+        <div class="panel-top">
+          <span class="panel-title">Inspector</span>
+          <button id="collapsePanelBtn" class="panel-icon-btn" type="button" title="Hide inspector panel" aria-label="Hide inspector panel">
+            <i class="bi bi-layout-sidebar-inset-reverse"></i>
+          </button>
+        </div>
+
+        <section class="side-card usage-card">
           <div class="side-card-head">
             <span>Usage &amp; cost</span>
             <i class="bi bi-activity"></i>
           </div>
-          <div class="usage-top">
-            <span title="Share of the model's context window occupied by the current request.">Context window</span>
-            <span id="contextPct">0%</span>
-          </div>
-          <div class="progress context-progress" role="progressbar" aria-label="Context usage">
-            <div id="ctxBar" class="progress-bar"></div>
-          </div>
-          <div id="contextMeta" class="usage-sub" title="Tokens in the current context: the prompt sent to the model plus the response it just generated.">0 / 128k tokens</div>
+          <div class="side-card-body">
+            <div class="usage-top">
+              <span title="Share of the model's context window occupied by the current request.">Context window</span>
+              <span id="contextPct">0%</span>
+            </div>
+            <div class="progress context-progress" role="progressbar" aria-label="Context usage">
+              <div id="ctxBar" class="progress-bar"></div>
+            </div>
+            <div id="contextMeta" class="usage-sub" title="Tokens in the current context: the prompt sent to the model plus the response it just generated.">0 / 128k tokens</div>
 
-          <div class="usage-grid">
-            <div class="usage-stat" title="Cumulative input tokens billed across every model request in this session. Each tool round resends the full context, so this total is normally much larger than the context gauge.">
-              <strong id="tokensIn">0</strong>
-              <span>input (session)</span>
+            <div class="usage-grid">
+              <div class="usage-stat" title="Cumulative input tokens billed across every model request in this session. Each tool round resends the full context, so this total is normally much larger than the context gauge.">
+                <strong id="tokensIn">0</strong>
+                <span>input</span>
+              </div>
+              <div class="usage-stat" title="Cumulative output tokens generated across every model request in this session.">
+                <strong id="tokensOut">0</strong>
+                <span>output</span>
+              </div>
+              <div class="usage-stat" title="Cumulative prompt tokens served from the provider cache in this session.">
+                <strong id="cachedTokens">0</strong>
+                <span>cached</span>
+              </div>
             </div>
-            <div class="usage-stat" title="Cumulative output tokens generated across every model request in this session.">
-              <strong id="tokensOut">0</strong>
-              <span>output (session)</span>
-            </div>
-            <div class="usage-stat" title="Cumulative prompt tokens served from the provider cache in this session.">
-              <strong id="cachedTokens">0</strong>
-              <span>cached (session)</span>
-            </div>
-          </div>
-          <div class="usage-note">Session input/output totals add every tool round; the gauge shows only the current context. Cached tokens are provider-reported.</div>
 
-          <div class="cost-line">
-            <span>Session cost</span>
-            <strong id="sessionCost">$0.0000</strong>
-          </div>
-          <div class="cost-line">
-            <span>Project cost</span>
-            <strong id="projectCost">$0.0000</strong>
+            <div class="cost-line">
+              <span title="Cumulative time the agent spent working in this session.">Session time</span>
+              <strong id="sessionTime">0s</strong>
+            </div>
+            <div class="cost-line">
+              <span>Session cost</span>
+              <strong id="sessionCost">$0.0000</strong>
+            </div>
+            <div class="cost-line">
+              <span>Project cost</span>
+              <strong id="projectCost">$0.0000</strong>
+            </div>
           </div>
         </section>
 
-        <section class="side-card files-card">
-          <div class="side-card-head">
+        <details id="filesCard" class="side-card files-card">
+          <summary class="side-card-head">
             <span>Active context</span>
-            <span id="fileCount" class="count-pill">0</span>
-          </div>
+            <span class="head-meta">
+              <span id="fileCount" class="count-pill">0</span>
+              <i class="bi bi-chevron-down files-chevron"></i>
+            </span>
+          </summary>
           <div id="fileList" class="file-list"></div>
-        </section>
+        </details>
 
         <section class="side-card checklist-card d-flex flex-column">
           <div class="side-card-head">
             <span>Checklist</span>
-            <span id="checklistCount" class="count-pill">0/0</span>
+            <span class="head-meta"><span id="checklistCount" class="count-pill">0/0</span></span>
           </div>
           <div class="progress checklist-progress">
             <div id="checklistBar" class="progress-bar"></div>

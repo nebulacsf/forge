@@ -89,15 +89,30 @@ checks for paths that do not exist yet. Writes are atomic.
 
 ## UI
 
-- Left rail: projects, add project, settings
+- Left rail: projects, add project, theme toggle, settings
 - Top: open session tabs
 - Center: chat with auto-resizing composer, **Send** and **Stop**
-- Right: usage/cost, active files, checklist
+- Right: collapsible inspector with usage/cost, active files, checklist
+
+Forge ships with dark and light themes. The theme can be switched from the left
+rail; the choice is stored in `localStorage` and applied before the first paint
+to avoid a flash. The initial theme is dark.
+
+The right panel can be collapsed from its header and reopened from the session
+bar. The active-files list is collapsed by default and remembers whether it was
+open. Completed checklist items are grouped under a collapsed **Completed**
+section, so the remaining work stays visible.
+
+The inspector shows two timers. **Session time** is the accumulated wall-clock
+time the agent spent working in the session, persisted in SQLite. Each assistant
+response also shows the time spent on that turn, including planning, reasoning,
+and tool calls. Timer values use whole seconds (`0s`, `12s`, `1m 05s`,
+`1h 02m`).
 
 The context gauge shows the current request only (prompt + response). The
-**input (session)** and **output (session)** counters are cumulative: every
-tool round resends the whole conversation, so they normally grow much faster
-than the context gauge. Both views are expected to differ.
+**input**, **output**, and **cached** counters are cumulative: every tool round
+resends the whole conversation, so they normally grow much faster than the
+context gauge. Both views are expected to differ.
 
 Every reasoning step and tool call is a collapsed accordion by default
 (`🧠 Thinking…`, `📄 Reading main.go`, `⚡ Running: go test ./...`). Click to
