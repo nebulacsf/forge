@@ -16,6 +16,7 @@ const state = {
   activeProjectId: null,
   activeProject: null,
   sessions: [],
+  allSessions: [],
   activeSessionId: null,
   session: null,
   checklist: [],
@@ -52,6 +53,8 @@ const state = {
 
 let projectModal = null;
 let settingsModal = null;
+let sessionsModal = null;
+let dragTabId = null;
 let contentTimer = null;
 let checklistDoneOpen = false;
 
@@ -72,6 +75,7 @@ async function init() {
   if (window.bootstrap) {
     projectModal = new bootstrap.Modal($('projectModal'));
     settingsModal = new bootstrap.Modal($('settingsModal'));
+    sessionsModal = new bootstrap.Modal($('sessionsModal'));
   }
   try {
     await loadConfig();
@@ -174,6 +178,10 @@ function renderProjects() {
     btn.addEventListener('click', () => {
       if (project.id !== state.activeProjectId) selectProject(project.id, { autoCreate: true });
     });
+    btn.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openProjectModal(project);
+    });
     list.appendChild(btn);
   }
 }
@@ -183,6 +191,28 @@ function initials(name) {
   if (!words.length) return '?';
   if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
   return (words[0][0] + words[1][0]).toUpperCase();
+}
+
+// Human-friendly label for the active project: its title/name when set,
+// falling back to the last path segment, and finally to the raw path.
+function projectLabel(project) {
+  if (!project) return '';
+  const name = String(project.name || '').trim();
+  if (name) return name;
+  const path = String(project.path || '').trim();
+  if (!path) return '';
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : path;
+}
+
+function setProjectPathLabel(project) {
+  const el = $('projectPathLabel');
+  if (!el) return;
+  const path = project && project.path ? String(project.path) : '';
+  el.textContent = projectLabel(project);
+  el.title = path;
+  if (path) el.setAttribute('aria-label', `${projectLabel(project)} — ${path}`);
+  else el.removeAttribute('aria-label');
 }
 
 function randomPaletteColor() {
@@ -248,8 +278,7 @@ async function selectProject(id, { autoCreate = false } = {}) {
   state.activeProject = project;
   localStorage.setItem('forge.project', String(id));
   renderProjects();
-  $('projectPathLabel').textContent = project.path;
-  $('projectPathLabel').title = project.path;
+  setProjectPathLabel(project);
 
   try {
     const data = await api(`/api/projects/${id}/sessions`);
@@ -258,6 +287,7 @@ async function selectProject(id, { autoCreate = false } = {}) {
     toast(err.message, 'error');
     state.sessions = [];
   }
+  sortSessionsByOrder();
   renderTabs();
 
   const savedSession = Number(localStorage.getItem(`forge.session.${id}`) || 0);
@@ -282,7 +312,8 @@ async function createSession({ silent = false } = {}) {
       method: 'POST',
       body: JSON.stringify({}),
     });
-    state.sessions.unshift(data.session);
+    state.sessions.push(data.session);
+    persistTabOrder();
     renderTabs();
     await loadSession(data.session.id);
     if (!silent) toast('New chat started', 'success');
@@ -300,8 +331,10 @@ async function loadSession(id) {
     state.session = data.session;
     state.activeProject = data.project;
     state.activeProjectId = data.project.id;
-    state.sessions = state.sessions.filter((s) => s.id !== id);
-    state.sessions.unshift(data.session);
+    // Opening a tab must never reorder the bar: update the entry where it is.
+    const tabIndex = state.sessions.findIndex((s) => s.id === id);
+    if (tabIndex >= 0) state.sessions[tabIndex] = { ...state.sessions[tabIndex], ...data.session };
+    else state.sessions.push(data.session);
     state.checklist = data.checklist || [];
     state.files = new Map();
     state.toolCards = new Map();
@@ -367,6 +400,47 @@ function clearSession() {
   document.title = 'Forge';
 }
 
+function tabOrderKey() {
+  return `forge.tabOrder.${state.activeProjectId || 'none'}`;
+}
+
+// Tab order is a per-project preference. Without it the bar keeps whatever
+// order the server returned (most recently updated first).
+function sortSessionsByOrder() {
+  let order = [];
+  try {
+    order = JSON.parse(localStorage.getItem(tabOrderKey()) || '[]');
+  } catch {
+    order = [];
+  }
+  if (!Array.isArray(order) || !order.length) return;
+  const rank = new Map(order.map((id, i) => [Number(id), i]));
+  state.sessions.sort((a, b) => {
+    const ra = rank.has(a.id) ? rank.get(a.id) : Number.MAX_SAFE_INTEGER;
+    const rb = rank.has(b.id) ? rank.get(b.id) : Number.MAX_SAFE_INTEGER;
+    if (ra !== rb) return ra - rb;
+    return b.id - a.id;
+  });
+}
+
+function persistTabOrder() {
+  if (!state.activeProjectId) return;
+  try {
+    localStorage.setItem(tabOrderKey(), JSON.stringify(state.sessions.map((s) => s.id)));
+  } catch { /* ignore */ }
+}
+
+function moveTab(fromId, toId) {
+  if (!fromId || !toId || fromId === toId) return;
+  const from = state.sessions.findIndex((s) => s.id === fromId);
+  const to = state.sessions.findIndex((s) => s.id === toId);
+  if (from < 0 || to < 0) return;
+  const [moved] = state.sessions.splice(from, 1);
+  state.sessions.splice(to, 0, moved);
+  persistTabOrder();
+  renderTabs();
+}
+
 function renderTabs() {
   const bar = $('sessionTabs');
   bar.innerHTML = '';
@@ -381,7 +455,10 @@ function renderTabs() {
   for (const session of state.sessions) {
     const tab = document.createElement('div');
     tab.className = 'session-tab' + (session.id === state.activeSessionId ? ' active' : '');
-    tab.title = session.title;
+    tab.title = `${session.title || 'New Chat'} — drag to reorder, double-click to rename`;
+    tab.draggable = true;
+    tab.dataset.id = String(session.id);
+    // Click only opens the chat; it never moves the tab.
     tab.addEventListener('click', () => {
       if (session.id !== state.activeSessionId) {
         if (state.streaming) stopStream();
@@ -389,15 +466,47 @@ function renderTabs() {
       }
     });
 
+    tab.addEventListener('dragstart', (e) => {
+      dragTabId = session.id;
+      tab.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      try {
+        e.dataTransfer.setData('text/plain', String(session.id));
+      } catch { /* ignore */ }
+    });
+    tab.addEventListener('dragend', () => {
+      dragTabId = null;
+      tab.classList.remove('dragging');
+      bar.querySelectorAll('.session-tab').forEach((el) => el.classList.remove('drag-over'));
+    });
+    tab.addEventListener('dragover', (e) => {
+      if (!dragTabId || dragTabId === session.id) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      tab.classList.add('drag-over');
+    });
+    tab.addEventListener('dragleave', () => tab.classList.remove('drag-over'));
+    tab.addEventListener('drop', (e) => {
+      e.preventDefault();
+      tab.classList.remove('drag-over');
+      const from = dragTabId || Number(e.dataTransfer.getData('text/plain') || 0);
+      dragTabId = null;
+      moveTab(from, session.id);
+    });
+
     const title = document.createElement('span');
     title.className = 'tab-title';
     title.textContent = session.title || 'New Chat';
+    title.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      startTabRename(title, session);
+    });
     tab.appendChild(title);
 
     const close = document.createElement('button');
     close.type = 'button';
     close.className = 'tab-close';
-    close.title = 'Close chat';
+    close.title = 'Close chat (keeps it in Manage chats)';
     close.innerHTML = '<i class="bi bi-x-lg"></i>';
     close.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -408,12 +517,66 @@ function renderTabs() {
   }
 }
 
+// Inline rename: the tab stays in place, the title is persisted via PATCH.
+function startTabRename(label, session) {
+  const input = document.createElement('input');
+  input.className = 'tab-rename';
+  input.type = 'text';
+  input.value = session.title || '';
+  input.spellcheck = false;
+  // A draggable ancestor blocks text selection, so pause dragging while editing.
+  const tab = label.closest('.session-tab');
+  if (tab) tab.draggable = false;
+  label.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    label.textContent = session.title || 'New Chat';
+    input.replaceWith(label);
+    if (tab) tab.draggable = true;
+    if (!commit || !next || next === session.title) return;
+    try {
+      const data = await api(`/api/sessions/${session.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title: next }),
+      });
+      syncSession(data.session);
+      if (session.id === state.activeSessionId && data.session.title) {
+        document.title = `${data.session.title} · Forge`;
+      }
+      if ($('sessionsModal')?.classList.contains('show')) renderSessionsList();
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+  input.addEventListener('dblclick', (e) => e.stopPropagation());
+}
+
 async function closeSession(id) {
   if (state.streaming && id === state.activeSessionId) stopStream();
   try {
     await api(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ is_open: false }) });
     state.sessions = state.sessions.filter((s) => s.id !== id);
+    const all = state.allSessions.find((s) => s.id === id);
+    if (all) all.is_open = false;
     if (id === state.activeSessionId) localStorage.removeItem(`forge.session.${state.activeProjectId}`);
+    persistTabOrder();
     renderTabs();
     if (id === state.activeSessionId) {
       if (state.sessions.length) await loadSession(state.sessions[0].id);
@@ -429,7 +592,7 @@ function syncSession(session) {
   state.session = { ...(state.session || {}), ...session };
   const idx = state.sessions.findIndex((s) => s.id === session.id);
   if (idx >= 0) state.sessions[idx] = { ...state.sessions[idx], ...session };
-  else if (session.is_open) state.sessions.unshift(session);
+  else if (session.is_open) state.sessions.push(session);
   renderTabs();
 }
 
@@ -1673,6 +1836,8 @@ function updateControls() {
   for (const btn of $('modeToggle').querySelectorAll('button')) btn.disabled = state.streaming || !hasSession;
   $('promptInput').disabled = !hasSession;
   $('newSessionBtn').disabled = !state.activeProjectId;
+  $('manageProjectBtn').disabled = !state.activeProjectId;
+  $('manageSessionsBtn').disabled = !state.activeProjectId;
   updateSendState();
   updateUsageUI();
 }
@@ -2062,9 +2227,44 @@ function resetDefaults() {
   toast('Defaults restored — click Save settings to persist', 'success');
 }
 
-function openProjectModal() {
-  $('projectForm').reset();
-  $('projectColor').value = randomPaletteColor();
+// `create` opens a blank form; otherwise the given project (or the active one)
+// is loaded for editing.
+function openProjectModal(project = null, { create = false } = {}) {
+  const form = $('projectForm');
+  form.reset();
+  const editing = create ? null : (project || (
+    state.activeProjectId
+      ? state.projects.find((p) => p.id === state.activeProjectId) || state.activeProject
+      : null
+  ));
+  const meta = $('projectMeta');
+  if (editing) {
+    $('projectId').value = String(editing.id);
+    $('projectModalTitle').textContent = 'Project settings';
+    $('projectModalIcon').className = 'bi bi-sliders me-2';
+    $('projectSubmitBtn').textContent = 'Save changes';
+    $('deleteProjectBtn').classList.remove('d-none');
+    $('projectPath').value = editing.path || '';
+    $('projectName').value = editing.name || '';
+    $('projectColor').value = editing.icon_color || randomPaletteColor();
+    meta.classList.remove('d-none');
+    meta.innerHTML = '';
+    const info = document.createElement('div');
+    info.textContent = `${Number(editing.session_count || 0)} chats · ${formatCost(editing.total_cost_usd)} spent`;
+    meta.appendChild(info);
+    const hint = document.createElement('div');
+    hint.textContent = 'Changing the directory keeps this project and its chats.';
+    meta.appendChild(hint);
+  } else {
+    $('projectId').value = '';
+    $('projectModalTitle').textContent = 'Register a project';
+    $('projectModalIcon').className = 'bi bi-folder-plus me-2';
+    $('projectSubmitBtn').textContent = 'Register project';
+    $('deleteProjectBtn').classList.add('d-none');
+    $('projectColor').value = randomPaletteColor();
+    meta.classList.add('d-none');
+    meta.innerHTML = '';
+  }
   if (projectModal) projectModal.show();
   setTimeout(() => $('projectPath').focus(), 180);
 }
@@ -2073,23 +2273,323 @@ async function saveProject(e) {
   e.preventDefault();
   const path = $('projectPath').value.trim();
   if (!path) return;
+  const id = Number($('projectId').value || 0);
+  const payload = {
+    path,
+    name: $('projectName').value.trim(),
+    icon_color: $('projectColor').value,
+  };
+  const btn = $('projectSubmitBtn');
+  btn.disabled = true;
   try {
-    const data = await api('/api/projects', {
-      method: 'POST',
-      body: JSON.stringify({
-        path,
-        name: $('projectName').value.trim(),
-        icon_color: $('projectColor').value,
-      }),
-    });
-    state.projects = data.projects || [data.project];
-    renderProjects();
+    if (id) {
+      const data = await api(`/api/projects/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      });
+      state.projects = data.projects || state.projects;
+      renderProjects();
+      if (data.project.id === state.activeProjectId) {
+        state.activeProject = data.project;
+        setProjectPathLabel(data.project);
+      }
+      if (projectModal) projectModal.hide();
+      toast(`Updated ${data.project.name}`, 'success');
+    } else {
+      const data = await api('/api/projects', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      state.projects = data.projects || [data.project];
+      renderProjects();
+      if (projectModal) projectModal.hide();
+      toast(`Added ${data.project.name}`, 'success');
+      await selectProject(data.project.id, { autoCreate: true });
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteProject() {
+  const id = Number($('projectId').value || 0);
+  const project = state.projects.find((p) => p.id === id);
+  if (!id || !project) return;
+  const ok = window.confirm(
+    `Delete "${project.name}" and all of its chats? This cannot be undone.`
+  );
+  if (!ok) return;
+  try {
+    const data = await api(`/api/projects/${id}`, { method: 'DELETE' });
+    state.projects = data?.projects || state.projects.filter((p) => p.id !== id);
+    try { localStorage.removeItem(`forge.tabOrder.${id}`); } catch { /* ignore */ }
+    try { localStorage.removeItem(`forge.session.${id}`); } catch { /* ignore */ }
     if (projectModal) projectModal.hide();
-    toast(`Added ${data.project.name}`, 'success');
-    await selectProject(data.project.id, { autoCreate: true });
+    toast(`Deleted ${project.name}`, 'success');
+    if (id === state.activeProjectId) {
+      state.activeProjectId = null;
+      state.activeProject = null;
+      state.sessions = [];
+      clearSession();
+      setProjectPathLabel(null);
+      const next = state.projects[0];
+      if (next) await selectProject(next.id, { autoCreate: true });
+      else {
+        renderProjects();
+        clearSession();
+        showEmpty('project');
+      }
+    }
+    renderProjects();
   } catch (err) {
     toast(err.message, 'error');
   }
+}
+
+/* ── Manage chats ────────────────────────────────────────────────── */
+
+async function openSessionsModal() {
+  if (!state.activeProjectId) {
+    toast('Select a project first', 'error');
+    return;
+  }
+  $('sessionSearch').value = '';
+  try {
+    // Default to every chat so closed ones are discoverable.
+    $('sessionsShowAll').checked = localStorage.getItem('forge.showClosed') !== '0';
+  } catch { /* ignore */ }
+  if (sessionsModal) sessionsModal.show();
+  await loadAllSessions();
+}
+
+async function loadAllSessions() {
+  if (!state.activeProjectId) return;
+  const list = $('sessionsList');
+  list.innerHTML = '<div class="manage-empty">Loading…</div>';
+  try {
+    const data = await api(`/api/projects/${state.activeProjectId}/sessions?all=1`);
+    state.allSessions = data.sessions || [];
+  } catch (err) {
+    state.allSessions = [];
+    toast(err.message, 'error');
+  }
+  renderSessionsList();
+}
+
+function sessionMatchesFilter(session) {
+  if (!$('sessionsShowAll').checked && !session.is_open) return false;
+  const q = $('sessionSearch').value.trim().toLowerCase();
+  if (!q) return true;
+  return `${session.title || ''} ${session.model || ''}`.toLowerCase().includes(q);
+}
+
+function renderSessionsList() {
+  const list = $('sessionsList');
+  if (!list) return;
+  list.innerHTML = '';
+  const all = Array.isArray(state.allSessions) ? state.allSessions : [];
+  const rows = all.filter(sessionMatchesFilter);
+  $('sessionsCount').textContent = `${rows.length} of ${all.length} chats`;
+
+  if (!rows.length) {
+    const empty = document.createElement('div');
+    empty.className = 'manage-empty';
+    empty.textContent = all.length ? 'No chat matches this filter.' : 'This project has no chats yet.';
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const session of rows) {
+    const row = document.createElement('div');
+    row.className = 'manage-row' + (session.id === state.activeSessionId ? ' active' : '')
+      + (session.is_open ? '' : ' closed');
+
+    const main = document.createElement('div');
+    main.className = 'manage-row-main';
+
+    const titleRow = document.createElement('div');
+    titleRow.className = 'manage-row-title';
+
+    const title = document.createElement('span');
+    title.className = 'manage-row-name';
+    title.textContent = session.title || 'New Chat';
+    title.title = 'Double-click to rename';
+    title.addEventListener('dblclick', () => startRowRename(title, session));
+    titleRow.appendChild(title);
+
+    if (session.is_open) {
+      const badge = document.createElement('span');
+      badge.className = 'manage-badge';
+      badge.textContent = 'open';
+      titleRow.appendChild(badge);
+    }
+    if (session.id === state.activeSessionId) {
+      const badge = document.createElement('span');
+      badge.className = 'manage-badge accent';
+      badge.textContent = 'active';
+      titleRow.appendChild(badge);
+    }
+    main.appendChild(titleRow);
+
+    const meta = document.createElement('div');
+    meta.className = 'manage-row-meta';
+    meta.textContent = [
+      session.mode || 'PLAN',
+      session.model || 'no model',
+      `${formatNum(session.tokens_in)} in / ${formatNum(session.tokens_out)} out`,
+      formatCost(session.cost_usd),
+      session.updated_at ? formatWhen(session.updated_at) : '',
+    ].filter(Boolean).join(' · ');
+    main.appendChild(meta);
+    row.appendChild(main);
+
+    const actions = document.createElement('div');
+    actions.className = 'manage-row-actions';
+
+    const renameBtn = document.createElement('button');
+    renameBtn.type = 'button';
+    renameBtn.className = 'manage-icon-btn';
+    renameBtn.title = 'Rename chat';
+    renameBtn.innerHTML = '<i class="bi bi-pencil"></i>';
+    renameBtn.addEventListener('click', () => startRowRename(title, session));
+    actions.appendChild(renameBtn);
+
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'manage-icon-btn';
+    openBtn.title = session.is_open ? 'Switch to this chat' : 'Reopen chat';
+    openBtn.innerHTML = '<i class="bi bi-box-arrow-in-right"></i>';
+    openBtn.addEventListener('click', () => openSessionFromModal(session));
+    actions.appendChild(openBtn);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'manage-icon-btn';
+    closeBtn.title = 'Close tab (keeps the chat)';
+    closeBtn.innerHTML = '<i class="bi bi-x-lg"></i>';
+    closeBtn.disabled = !session.is_open;
+    closeBtn.addEventListener('click', async () => {
+      await closeSession(session.id);
+      await loadAllSessions();
+    });
+    actions.appendChild(closeBtn);
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'manage-icon-btn danger';
+    deleteBtn.title = 'Delete chat permanently';
+    deleteBtn.innerHTML = '<i class="bi bi-trash3"></i>';
+    deleteBtn.addEventListener('click', () => deleteSession(session));
+    actions.appendChild(deleteBtn);
+
+    row.appendChild(actions);
+    list.appendChild(row);
+  }
+}
+
+function startRowRename(label, session) {
+  const input = document.createElement('input');
+  input.className = 'manage-rename-input';
+  input.type = 'text';
+  input.value = session.title || '';
+  input.spellcheck = false;
+  label.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    label.textContent = session.title || 'New Chat';
+    input.replaceWith(label);
+    if (!commit || !next || next === session.title) return;
+    try {
+      const data = await api(`/api/sessions/${session.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title: next }),
+      });
+      syncSession(data.session);
+      if (session.id === state.activeSessionId && data.session.title) {
+        document.title = `${data.session.title} · Forge`;
+      }
+      await loadAllSessions();
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener('blur', () => finish(true));
+}
+
+async function openSessionFromModal(session) {
+  try {
+    if (!session.is_open) {
+      const data = await api(`/api/sessions/${session.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_open: true }),
+      });
+      const exists = state.sessions.some((s) => s.id === session.id);
+      if (!exists) {
+        state.sessions.push(data.session);
+        persistTabOrder();
+      }
+    }
+    if (state.streaming) stopStream();
+    if (sessionsModal) sessionsModal.hide();
+    await loadSession(session.id);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function deleteSession(session) {
+  const ok = window.confirm(`Delete "${session.title || 'New Chat'}" permanently? This cannot be undone.`);
+  if (!ok) return;
+  if (state.streaming && session.id === state.activeSessionId) stopStream();
+  try {
+    await api(`/api/sessions/${session.id}`, { method: 'DELETE' });
+    state.sessions = state.sessions.filter((s) => s.id !== session.id);
+    state.allSessions = state.allSessions.filter((s) => s.id !== session.id);
+    if (session.id === state.activeSessionId) {
+      localStorage.removeItem(`forge.session.${state.activeProjectId}`);
+      renderTabs();
+      if (state.sessions.length) await loadSession(state.sessions[0].id);
+      else clearSession();
+    } else {
+      renderTabs();
+    }
+    persistTabOrder();
+    renderSessionsList();
+    toast('Chat deleted', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+function formatWhen(iso) {
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return '';
+  const diff = Date.now() - ts;
+  const min = Math.round(diff / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  const hours = Math.round(min / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(ts).toLocaleDateString();
 }
 
 /* ── Toasts ──────────────────────────────────────────────────────── */
@@ -2118,12 +2618,27 @@ function toast(message, type = 'error') {
 /* ── Events ──────────────────────────────────────────────────────── */
 
 function bindEvents() {
-  $('addProjectBtn').addEventListener('click', openProjectModal);
+  // Wrapped so the click event is not mistaken for a project argument.
+  $('addProjectBtn').addEventListener('click', () => openProjectModal(null, { create: true }));
   $('themeBtn').addEventListener('click', toggleTheme);
   $('collapsePanelBtn').addEventListener('click', () => setPanelHidden(true));
   $('showPanelBtn').addEventListener('click', () => setPanelHidden(false));
   $('settingsBtn').addEventListener('click', openSettings);
+  $('manageProjectBtn').addEventListener('click', () => {
+    if (!state.activeProjectId) {
+      toast('Register or select a project first', 'error');
+      return;
+    }
+    openProjectModal();
+  });
   $('newSessionBtn').addEventListener('click', () => createSession());
+  $('manageSessionsBtn').addEventListener('click', openSessionsModal);
+  $('deleteProjectBtn').addEventListener('click', deleteProject);
+  $('sessionSearch').addEventListener('input', renderSessionsList);
+  $('sessionsShowAll').addEventListener('change', () => {
+    localStorage.setItem('forge.showClosed', $('sessionsShowAll').checked ? '1' : '0');
+    renderSessionsList();
+  });
   $('sendBtn').addEventListener('click', sendMessage);
   $('stopBtn').addEventListener('click', () => {
     $('stopBtn').disabled = true;

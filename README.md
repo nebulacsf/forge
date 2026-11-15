@@ -274,7 +274,8 @@ can reduce the hit rate.
 | `GET/PUT /api/config` | Read/update config (API key is masked on read) |
 | `GET /api/models` | Provider model catalog with real context lengths (`?refresh=1` bypasses the cache) |
 | `GET/POST /api/projects` | List/register projects |
-| `GET/POST /api/projects/{id}/sessions` | List/create sessions |
+| `PATCH/DELETE /api/projects/{id}` | Rename/recolor/move a project, or delete it with its chats |
+| `GET/POST /api/projects/{id}/sessions` | List (`?all=1` includes closed)/create sessions |
 | `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/close |
 | `POST /api/sessions/{id}/compact` | Summarize the transcript and keep the last exchange |
 | `POST /api/chat/stream` | SSE agent turn (reasoning, content, tool, usage, checklist, done) |

@@ -36,6 +36,9 @@
       <button id="addProjectBtn" class="rail-btn" type="button" title="Register a local project">
         <i class="bi bi-plus-lg"></i>
       </button>
+      <button id="manageProjectBtn" class="rail-btn" type="button" title="Manage active project (path, name, color)">
+        <i class="bi bi-sliders"></i>
+      </button>
       <button id="themeBtn" class="rail-btn" type="button" title="Switch to light theme" aria-label="Switch to light theme">
         <i class="bi bi-sun"></i>
       </button>
@@ -54,7 +57,10 @@
       <button id="newSessionBtn" class="tabs-add flex-shrink-0" type="button" title="New chat">
         <i class="bi bi-plus-lg"></i>
       </button>
-      <div id="projectPathLabel" class="project-path-label flex-shrink-0" title="Active project path"></div>
+      <button id="manageSessionsBtn" class="tabs-add flex-shrink-0" type="button" title="Manage all chats">
+        <i class="bi bi-list-ul"></i>
+      </button>
+      <div id="projectPathLabel" class="project-path-label flex-shrink-0" title=""></div>
       <button id="showPanelBtn" class="panel-reopen d-none flex-shrink-0" type="button" title="Show inspector panel">
         <i class="bi bi-layout-sidebar-inset"></i>
       </button>
@@ -218,19 +224,21 @@
   </div>
 </div>
 
-<!-- ── Add project modal ───────────────────────────────────────────── -->
+<!-- ── Project modal (register / manage) ───────────────────────────── -->
 <div class="modal fade" id="projectModal" tabindex="-1" aria-hidden="true">
   <form id="projectForm" class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
     <div class="modal-content">
+      <input type="hidden" id="projectId" value="">
       <div class="modal-header">
-        <h5 class="modal-title"><i class="bi bi-folder-plus me-2"></i>Register a project</h5>
+        <h5 class="modal-title"><i id="projectModalIcon" class="bi bi-folder-plus me-2"></i><span id="projectModalTitle">Register a project</span></h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
         <div class="mb-3">
           <label for="projectPath" class="form-label">Local directory</label>
-          <input id="projectPath" class="form-control" placeholder="/home/you/code/my-project" required>
-          <div class="form-text">Forge is scoped to this working directory. Absolute paths or <code>~/…</code>.</div>
+          <input id="projectPath" class="form-control" placeholder="/home/you/code/my-project" required spellcheck="false">
+          <div class="form-text">Forge is scoped to this working directory. Absolute paths or <code>~/…</code>.
+            Moved the project? Update the path here to keep its chats.</div>
         </div>
         <div class="row g-3">
           <div class="col-8">
@@ -242,13 +250,44 @@
             <input id="projectColor" type="color" class="form-control form-control-color w-100" value="#6c8cff">
           </div>
         </div>
+        <div id="projectMeta" class="manage-meta d-none mt-3"></div>
       </div>
       <div class="modal-footer">
+        <button type="button" id="deleteProjectBtn" class="btn btn-danger-ghost me-auto d-none">
+          <i class="bi bi-trash3 me-1"></i>Delete project
+        </button>
         <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
-        <button type="submit" class="btn btn-accent">Register project</button>
+        <button type="submit" id="projectSubmitBtn" class="btn btn-accent">Register project</button>
       </div>
     </div>
   </form>
+</div>
+
+<!-- ── Manage sessions modal ───────────────────────────────────────── -->
+<div class="modal fade" id="sessionsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-list-ul me-2"></i>Manage chats</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="manage-toolbar d-flex align-items-center gap-2">
+          <input id="sessionSearch" class="form-control form-control-sm" type="search"
+            placeholder="Filter chats by title or model…" autocomplete="off">
+          <div class="form-check form-switch manage-switch flex-shrink-0">
+            <input id="sessionsShowAll" class="form-check-input" type="checkbox">
+            <label class="form-check-label" for="sessionsShowAll">Show closed</label>
+          </div>
+        </div>
+        <div id="sessionsList" class="manage-list"></div>
+      </div>
+      <div class="modal-footer">
+        <span id="sessionsCount" class="manage-count me-auto"></span>
+        <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- ── Settings modal ──────────────────────────────────────────────── -->

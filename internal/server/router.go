@@ -61,6 +61,8 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
+	mux.HandleFunc("PATCH /api/projects/{id}", s.handlePatchProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", s.handleDeleteProject)
 	mux.HandleFunc("GET /api/projects/{id}/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/projects/{id}/sessions", s.handleCreateSession)
 
@@ -356,6 +358,95 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	go s.warmRepoOutline(project)
 	projects, _ := s.store.ListProjects()
 	writeJSON(w, http.StatusCreated, map[string]any{"project": project, "projects": projects})
+}
+
+func (s *Server) handlePatchProject(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var body struct {
+		Path      *string `json:"path"`
+		Name      *string `json:"name"`
+		IconColor *string `json:"icon_color"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.IconColor != nil {
+		color := strings.TrimSpace(*body.IconColor)
+		if !validColor(color) {
+			apiError(w, http.StatusBadRequest, "color must be a hex value like #6c8cff")
+			return
+		}
+		body.IconColor = &color
+	}
+	current, err := s.store.GetProject(id)
+	if errors.Is(err, store.ErrNotFound) {
+		apiError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	moved := false
+	if body.Path != nil {
+		abs, err := normalizeProjectPath(*body.Path)
+		if err != nil {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		moved = abs != current.Path
+		body.Path = &abs
+	}
+	// An empty display name falls back to the directory name, like create does.
+	if body.Name != nil {
+		name := strings.TrimSpace(*body.Name)
+		if name == "" {
+			target := current.Path
+			if body.Path != nil {
+				target = *body.Path
+			}
+			name = filepath.Base(target)
+		}
+		body.Name = &name
+	}
+	project, err := s.store.UpdateProject(id, body.Name, body.Path, body.IconColor)
+	if errors.Is(err, store.ErrNotFound) {
+		apiError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	if err != nil {
+		apiError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if moved {
+		go s.warmRepoOutline(project)
+	}
+	logx.Info("project updated", "project", project.ID, "path", project.Path, "moved", moved)
+	projects, _ := s.store.ListProjects()
+	writeJSON(w, http.StatusOK, map[string]any{"project": project, "projects": projects})
+}
+
+func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.store.DeleteProject(id); errors.Is(err, store.ErrNotFound) {
+		apiError(w, http.StatusNotFound, "project not found")
+		return
+	} else if err != nil {
+		apiError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logx.Info("project deleted", "project", id)
+	projects, _ := s.store.ListProjects()
+	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
 }
 
 // warmRepoOutline builds the local repository map in the background so the

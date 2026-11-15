@@ -240,7 +240,8 @@ transaction.
 | GET/PUT | `/api/config` | Config |
 | GET | `/api/models` | Model catalog |
 | GET/POST | `/api/projects` | Projects |
-| GET/POST | `/api/projects/{id}/sessions` | Sessions |
+| PATCH/DELETE | `/api/projects/{id}` | Project rename/recolor/move, delete (cascades chats) |
+| GET/POST | `/api/projects/{id}/sessions` | Sessions (`?all=1` includes closed tabs) |
 | GET/PATCH/DELETE | `/api/sessions/{id}` | Session CRUD |
 | POST | `/api/sessions/{id}/compact` | Compact |
 | GET | `/api/sessions/{id}/messages` | History |

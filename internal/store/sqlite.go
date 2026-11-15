@@ -377,6 +377,81 @@ func (s *Store) TouchProject(id int64) error {
 	return err
 }
 
+// UpdateProject applies any non-nil fields and returns the refreshed project.
+// Moving a project to a new path drops the stale repository outline cache.
+func (s *Store) UpdateProject(id int64, name, path, color *string) (Project, error) {
+	current, err := s.GetProject(id)
+	if err != nil {
+		return Project{}, err
+	}
+	sets := []string{}
+	args := []any{}
+	if name != nil {
+		n := strings.TrimSpace(*name)
+		if n == "" {
+			return Project{}, fmt.Errorf("project name cannot be empty")
+		}
+		sets = append(sets, "name = ?")
+		args = append(args, n)
+	}
+	movedFrom := ""
+	if path != nil {
+		p := strings.TrimSpace(*path)
+		if p == "" {
+			return Project{}, fmt.Errorf("project path cannot be empty")
+		}
+		if p != current.Path {
+			movedFrom = current.Path
+			sets = append(sets, "path = ?")
+			args = append(args, p)
+		}
+	}
+	if color != nil {
+		c := strings.TrimSpace(*color)
+		if c == "" {
+			return Project{}, fmt.Errorf("project color cannot be empty")
+		}
+		sets = append(sets, "icon_color = ?")
+		args = append(args, c)
+	}
+	if len(sets) == 0 {
+		return current, nil
+	}
+	args = append(args, id)
+	if _, err := s.db.Exec(`UPDATE projects SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return Project{}, fmt.Errorf("this project path is already registered")
+		}
+		return Project{}, err
+	}
+	if movedFrom != "" {
+		_ = s.DeleteRepoOutline(movedFrom)
+	}
+	return s.GetProject(id)
+}
+
+// DeleteProject removes a project along with its sessions, messages, checklists
+// and cached repository outline.
+func (s *Store) DeleteProject(id int64) error {
+	var path string
+	err := s.db.QueryRow(`SELECT path FROM projects WHERE id = ?`, id).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`DELETE FROM projects WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	_ = s.DeleteRepoOutline(path)
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 
