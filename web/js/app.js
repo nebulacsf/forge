@@ -1637,6 +1637,10 @@ function openSettings() {
   $('maxToolRounds').value = cfg.defaults.max_tool_rounds || 24;
   $('maxTurnRounds').value = cfg.defaults.max_turn_rounds || 96;
   $('maxTurnCost').value = cfg.defaults.max_turn_cost_usd ?? 0;
+  $('historyKeepRecent').value = cfg.defaults.history_keep_recent_rounds ?? 4;
+  $('historyMaxResult').value = cfg.defaults.history_max_result_chars ?? 4000;
+  $('historyMaxArg').value = cfg.defaults.history_max_arg_chars ?? 4000;
+  $('historyPruneChunk').value = cfg.defaults.history_prune_chunk_rounds ?? 4;
   $('autoContinue').checked = cfg.defaults.auto_continue !== false;
   $('serverHost').value = cfg.server.host || '127.0.0.1';
   $('serverPort').value = cfg.server.port || 7890;
@@ -1661,6 +1665,16 @@ async function saveSettings(e) {
   cfg.defaults.max_tool_rounds = Number($('maxToolRounds').value) || 24;
   cfg.defaults.max_turn_rounds = Number($('maxTurnRounds').value) || 96;
   cfg.defaults.max_turn_cost_usd = Number($('maxTurnCost').value) || 0;
+  const numOr = (id, fallback) => {
+    const raw = $(id).value.trim();
+    if (raw === '') return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  cfg.defaults.history_keep_recent_rounds = numOr('historyKeepRecent', 4);
+  cfg.defaults.history_max_result_chars = numOr('historyMaxResult', 4000);
+  cfg.defaults.history_max_arg_chars = numOr('historyMaxArg', 4000);
+  cfg.defaults.history_prune_chunk_rounds = numOr('historyPruneChunk', 4);
   cfg.defaults.auto_continue = $('autoContinue').checked;
   cfg.server.host = $('serverHost').value.trim();
   cfg.server.port = Number($('serverPort').value) || 7890;

@@ -50,6 +50,14 @@ type DefaultsConfig struct {
 	MaxTurnRounds    int     `json:"max_turn_rounds"`
 	AutoContinue     *bool   `json:"auto_continue"`
 	MaxTurnCostUSD   float64 `json:"max_turn_cost_usd"`
+
+	// History pruning keeps recent tool output verbatim and stubs older rounds
+	// in place before each provider request. Volatile state (checklist, outline)
+	// lives in a trailing message so the stable prompt prefix stays cacheable.
+	HistoryKeepRecent int `json:"history_keep_recent_rounds"`
+	HistoryMaxResult  int `json:"history_max_result_chars"`
+	HistoryMaxArg     int `json:"history_max_arg_chars"`
+	HistoryPruneChunk int `json:"history_prune_chunk_rounds"`
 }
 
 // Default returns the shipped configuration.
@@ -67,14 +75,18 @@ func Default() Config {
 			},
 		},
 		Defaults: DefaultsConfig{
-			Model:            DefaultModel,
-			Mode:             "PLAN",
-			MaxFileReadChars: 25000,
-			BashTimeoutSec:   30,
-			MaxToolRounds:    24,
-			MaxTurnRounds:    96,
-			AutoContinue:     boolPtr(true),
-			MaxTurnCostUSD:   0,
+			Model:             DefaultModel,
+			Mode:              "PLAN",
+			MaxFileReadChars:  25000,
+			BashTimeoutSec:    30,
+			MaxToolRounds:     24,
+			MaxTurnRounds:     96,
+			AutoContinue:      boolPtr(true),
+			MaxTurnCostUSD:    0,
+			HistoryKeepRecent: 4,
+			HistoryMaxResult:  4000,
+			HistoryMaxArg:     4000,
+			HistoryPruneChunk: 4,
 		},
 	}
 }
@@ -261,6 +273,37 @@ func normalize(c Config) Config {
 	}
 	if c.Defaults.MaxTurnCostUSD < 0 {
 		c.Defaults.MaxTurnCostUSD = 0
+	}
+	if c.Defaults.HistoryKeepRecent <= 0 {
+		c.Defaults.HistoryKeepRecent = d.Defaults.HistoryKeepRecent
+	}
+	if c.Defaults.HistoryKeepRecent > 20 {
+		c.Defaults.HistoryKeepRecent = 20
+	}
+	// 0 disables the cap; negative values fall back to the shipped default.
+	if c.Defaults.HistoryMaxResult < 0 {
+		c.Defaults.HistoryMaxResult = d.Defaults.HistoryMaxResult
+	}
+	if c.Defaults.HistoryMaxResult > 0 && c.Defaults.HistoryMaxResult < 500 {
+		c.Defaults.HistoryMaxResult = 500
+	}
+	if c.Defaults.HistoryMaxResult > 25000 {
+		c.Defaults.HistoryMaxResult = 25000
+	}
+	if c.Defaults.HistoryMaxArg < 0 {
+		c.Defaults.HistoryMaxArg = d.Defaults.HistoryMaxArg
+	}
+	if c.Defaults.HistoryMaxArg > 0 && c.Defaults.HistoryMaxArg < 200 {
+		c.Defaults.HistoryMaxArg = 200
+	}
+	if c.Defaults.HistoryMaxArg > 25000 {
+		c.Defaults.HistoryMaxArg = 25000
+	}
+	if c.Defaults.HistoryPruneChunk <= 0 {
+		c.Defaults.HistoryPruneChunk = d.Defaults.HistoryPruneChunk
+	}
+	if c.Defaults.HistoryPruneChunk > 20 {
+		c.Defaults.HistoryPruneChunk = 20
 	}
 	return c
 }

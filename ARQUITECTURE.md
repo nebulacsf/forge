@@ -138,9 +138,40 @@ Forge builds a zero-AI outline of the project and stores one row per file in
   Ruby, PHP, and HTML.
 - The walk skips vendor/build/hidden directories, binary files, and files
   larger than 512 KB; only files whose mtime/size changed are reparsed.
-- The rendered outline is capped at ~2,000 runes (~450–500 tokens) and injected
-  into the system prompt. It is refreshed on project creation and on each chat
-  turn; `write_file`/`patch_file` refresh just the affected file.
+- The rendered outline is capped at ~2,000 runes (~450–500 tokens). It is
+  refreshed on project creation and on each chat turn; `write_file`/`patch_file`
+  refresh just the affected file.
+- The outline and checklist are **not** part of the system prompt. They are
+  injected in a trailing ephemeral user message (see 3.2) so the system prompt
+  stays byte-stable and cacheable.
+
+### 3.2 History Pruning (`server/history.go`)
+Every provider round rebuilds the request from persisted rows. Before sending,
+Forge prunes tool traffic so a long turn does not re-inject every prior result:
+
+- The last `history_keep_recent_rounds` tool rounds (default 4) are sent
+  verbatim, except that each result is clipped head+tail to
+  `history_max_result_chars` (default 4,000) and oversized arguments are
+  replaced with a compact, valid JSON summary (`history_max_arg_chars`, default
+  4,000). A large `write_file` payload is therefore never re-sent.
+- Older rounds are **stubbed in place**: the assistant tool call remains at its
+  original position with compacted arguments, and its tool result becomes a
+  one-line `[pruned] tool target → outcome` digest. Nothing is removed,
+  reordered, or merged, so the message count and `tool_call_id` pairing stay
+  valid. Old errors keep a short `ERROR:` digest.
+- Pruning advances in chunks of `history_prune_chunk_rounds` (default 4). Within
+  a chunk the request is strictly append-only; only when a whole chunk becomes
+  old do those rounds switch to stubs. This keeps most consecutive requests as
+  an exact prefix of the next one, which is what provider prompt caching needs.
+- The system prompt contains only stable content (project, mode, rules). The
+  volatile checklist, repository outline, continue note, and guard note are
+  appended as the final ephemeral `user` message of each request and are never
+  persisted. Changing them cannot invalidate the cached prefix.
+- Setting a max to `0` disables that cap; negative values fall back to defaults.
+- Full results remain in SQLite and in the UI (`/api/sessions/{id}/messages`);
+  only the provider request is trimmed. Each round logs `messages`, `chars`,
+  `est_tokens`, `pruned_rounds`, `pruned_chars`, `cached_tokens`, and
+  `cache_ratio`.
 
 ### 4. Compaction (`compact.go`)
 `POST /api/sessions/{id}/compact` → Summarize history with LLM → Replace in DB: summary + last 1-2 exchanges → Return new list.
@@ -148,6 +179,7 @@ Forge builds a zero-AI outline of the project and stores one row per file in
 ### 5. Config (`config.go`)
 - `Manager` with `RWMutex`, atomic writes (temp → chmod 600 → rename)
 - Validation + normalization on every `Update()`
+- `defaults.history_*` control history pruning (see 3.2)
 - Hot-reload: invalidates model cache if API key/base URL changes
 
 ### 6. Model Catalog (`router.go`)
@@ -269,6 +301,7 @@ internal/
   llm/models.go              # Model catalog fetch + builtin fallback
   server/router.go           # HTTP routes, middleware, APIs config/models/projects/sessions/checklist
   server/stream.go           # handleChatStream — core agent loop
+  server/history.go          # History pruning: recent rounds verbatim, older rounds stubbed in place
   server/guard.go            # Per-turn loop / error-streak detector
   server/compact.go          # Conversation summarization
   tools/tools.go             # Tool defs + execution (read/grep/list/git/patch/write/bash/checklist)

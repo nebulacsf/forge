@@ -238,21 +238,39 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			checklist, _ := s.store.ListChecklist(session.ID)
-			system := buildSystemPrompt(project, session, checklist, outline, segmentSize, turnLimit)
-			history, err := s.buildHistory(session.ID, system)
+			system := buildSystemPrompt(project, session, segmentSize, turnLimit)
+			rows, err := s.store.ListMessages(session.ID)
 			if err != nil {
 				stream.fail("Could not load conversation: " + err.Error())
 				return
 			}
-			// Notes below are ephemeral: they steer the next request without
-			// polluting the persisted conversation.
+			history, hstats := buildHistory(rows, system, historyOptions{
+				KeepRecent:     cfg.Defaults.HistoryKeepRecent,
+				MaxResultChars: cfg.Defaults.HistoryMaxResult,
+				MaxArgChars:    cfg.Defaults.HistoryMaxArg,
+				ChunkRounds:    cfg.Defaults.HistoryPruneChunk,
+			})
+			logx.Debug("history built", "session", session.ID, "round", totalRounds,
+				"messages", hstats.Messages, "chars", hstats.Chars,
+				"est_tokens", hstats.Chars/4, "pruned_rounds", hstats.PrunedRounds,
+				"pruned_chars", hstats.PrunedChars)
+			// Volatile state and steering notes are ephemeral: they live at the
+			// very end of the request so the stable prefix stays cacheable and
+			// the persisted conversation is never polluted.
+			var tail []string
 			if continueNote != "" {
-				history = append(history, llm.Message{Role: "user", Content: continueNote})
+				tail = append(tail, continueNote)
 				continueNote = ""
 			}
+			if state := buildStateMessage(checklist, outline); state != "" {
+				tail = append(tail, state)
+			}
 			if guardNote != "" {
-				history = append(history, llm.Message{Role: "user", Content: guardNote})
+				tail = append(tail, guardNote)
 				guardNote = ""
+			}
+			if len(tail) > 0 {
+				history = append(history, llm.Message{Role: "user", Content: strings.Join(tail, "\n\n")})
 			}
 			req := llm.ChatRequest{
 				Model:    session.Model,
@@ -310,9 +328,15 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			turnCost += result.Usage.Cost
+			cacheRatio := 0.0
+			if result.Usage.PromptTokens > 0 {
+				cacheRatio = float64(result.Usage.PromptTokensDetails.CachedTokens) / float64(result.Usage.PromptTokens)
+			}
 			logx.Debug("round finished", "session", session.ID, "round", totalRounds,
 				"content_chars", len(result.Content), "reasoning_chars", len(result.Reasoning),
 				"tool_calls", len(result.ToolCalls), "prompt_tokens", result.Usage.PromptTokens,
+				"cached_tokens", result.Usage.PromptTokensDetails.CachedTokens,
+				"cache_ratio", fmt.Sprintf("%.2f", cacheRatio),
 				"completion_tokens", result.Usage.CompletionTokens, "cost", result.Usage.Cost)
 			if fresh, err := s.store.GetSession(session.ID); err == nil {
 				session = fresh
@@ -583,63 +607,11 @@ func looksLikeContextOverflow(msg string) bool {
 	return false
 }
 
-// buildHistory reconstructs OpenAI-compatible messages from persisted rows.
-func (s *Server) buildHistory(sessionID int64, system string) ([]llm.Message, error) {
-	rows, err := s.store.ListMessages(sessionID)
-	if err != nil {
-		return nil, err
-	}
-	out := []llm.Message{{Role: "system", Content: system}}
-	for _, m := range rows {
-		switch m.Role {
-		case "user":
-			out = append(out, llm.Message{Role: "user", Content: m.Content})
-		case "assistant":
-			var calls []llm.ToolCall
-			if strings.TrimSpace(m.ToolCalls) != "" {
-				_ = json.Unmarshal([]byte(m.ToolCalls), &calls)
-			}
-			for i := range calls {
-				if calls[i].ID == "" {
-					calls[i].ID = fmt.Sprintf("call_%d_%d", m.ID, i)
-				}
-				if calls[i].Type == "" {
-					calls[i].Type = "function"
-				}
-			}
-			wire := make([]llm.ToolCall, 0, len(calls))
-			for _, c := range calls {
-				if c.Function.Name == "" {
-					continue
-				}
-				wire = append(wire, llm.ToolCall{
-					ID: c.ID, Type: c.Type,
-					Function: llm.ToolFunction{Name: c.Function.Name, Arguments: c.Function.Arguments},
-				})
-			}
-			if strings.TrimSpace(m.Content) == "" && len(wire) == 0 {
-				continue
-			}
-			out = append(out, llm.Message{Role: "assistant", Content: m.Content, ToolCalls: wire})
-			for _, c := range calls {
-				if c.Function.Name == "" {
-					continue
-				}
-				result := c.Result
-				if c.Status == "error" {
-					result = "ERROR: " + result
-				}
-				if strings.TrimSpace(result) == "" {
-					result = "(no result recorded)"
-				}
-				out = append(out, llm.Message{Role: "tool", ToolCallID: c.ID, Name: c.Function.Name, Content: result})
-			}
-		}
-	}
-	return out, nil
-}
-
-func buildSystemPrompt(project store.Project, session store.Session, checklist []store.ChecklistItem, outline string, segmentSize, turnLimit int) string {
+// buildSystemPrompt assembles the stable instruction prefix. It intentionally
+// excludes volatile state (checklist, repository outline) so the provider's
+// prompt cache can reuse this prefix across rounds. Volatile state is injected
+// as a trailing ephemeral message by buildStateMessage.
+func buildSystemPrompt(project store.Project, session store.Session, segmentSize, turnLimit int) string {
 	var b strings.Builder
 	b.WriteString("You are Forge, an expert autonomous coding agent operating on a local project through a web UI.\n\n")
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
@@ -665,7 +637,7 @@ Step budget:
 	b.WriteString(`
 Operating rules:
 - At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
-- GREP-FIRST RULE: before any read_file call, locate the target with the repository outline below or with grep_search. Never read a file blindly.
+- GREP-FIRST RULE: before any read_file call, locate the target with the Repository outline in the current-state message at the end of the request, or with grep_search. Never read a file blindly.
 - read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
 - Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
 - The "NNN | " prefix is display-only. Never include it in patch_file search/replace text; copy the code without the prefix.
@@ -674,23 +646,33 @@ Operating rules:
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
 - Read both the surrounding code and existing patterns before making changes; match local style.
 - Use update_checklist for multi-step tasks, and keep item statuses accurate as you work.
-- Use grep_search/list_directory to explore rather than guessing file contents. Prefer the compact repository outline; use grep_search to confirm symbols before reading.
-- The outline is refreshed when Forge writes files. After bash commands or external edits, verify with grep_search before relying on cached line numbers.
+- Use grep_search/list_directory to explore rather than guessing file contents. Prefer the compact Repository outline in the current-state message; use grep_search to confirm symbols before reading.
+- The Repository outline is refreshed when Forge writes files. After bash commands or external edits, verify with grep_search before relying on cached line numbers.
 - Run focused tests or builds when appropriate. Never claim a test passed unless you ran it.
-- Tool output and reasoning are rendered as collapsed accordions in the UI, so do not repeat large tool output in your final answer.
-- Be concise. When finished, summarize what changed, what was verified, and any remaining risks.
+- Tool output and reasoning are rendered as collapsed accordions in the UI, so never repeat tool output in your answer.
 `)
-	// Keep volatile content (repository outline and checklist) at the end so
-	// stable instructions form a long, reusable prompt-cache prefix.
-	if strings.TrimSpace(outline) != "" {
-		b.WriteString("\nRepository outline (compact; line numbers refer to the current files):\n")
-		b.WriteString(strings.TrimSpace(outline))
-		b.WriteString("\nEnd of repository outline.\n")
+	b.WriteString(`
+Response style (strict):
+- Do not narrate tool use ("Now I will…", "Let me check…"); the UI already shows every call and result.
+- Only the final message (the one without tool calls) is written for the user.
+- No preamble, no praise, no restating code, no long explanations.
+`)
+	if session.Mode == "PLAN" {
+		b.WriteString("- PLAN final message: the numbered plan, at most 7 one-line items, then the ready line. No extra commentary.\n")
 	} else {
-		b.WriteString("\nRepository outline: unavailable. Use grep_search or list_directory to locate files.\n")
+		b.WriteString("- BUILD final message: at most 3 short bullets — (1) what changed, with file paths; (2) what you verified; (3) blockers or next step.\n")
 	}
+	return strings.TrimSpace(b.String())
+}
+
+// buildStateMessage renders the volatile session state. It is injected as the
+// final ephemeral message of each request (never persisted), so changing it
+// does not invalidate the cached prompt prefix.
+func buildStateMessage(checklist []store.ChecklistItem, outline string) string {
+	var b strings.Builder
+	b.WriteString("[Current session state — refreshed automatically; this is context, not a new request]\n")
 	if len(checklist) > 0 {
-		b.WriteString("\nCurrent checklist:\n")
+		b.WriteString("Checklist:\n")
 		for _, it := range checklist {
 			mark := "[ ]"
 			if it.IsDone {
@@ -698,6 +680,13 @@ Operating rules:
 			}
 			fmt.Fprintf(&b, "%s #%d %s\n", mark, it.ID, it.TaskText)
 		}
+	}
+	if strings.TrimSpace(outline) != "" {
+		b.WriteString("Repository outline (compact; line numbers refer to the current files):\n")
+		b.WriteString(strings.TrimSpace(outline))
+		b.WriteString("\nEnd of repository outline.\n")
+	} else {
+		b.WriteString("Repository outline: unavailable. Use grep_search or list_directory to locate files.\n")
 	}
 	return strings.TrimSpace(b.String())
 }

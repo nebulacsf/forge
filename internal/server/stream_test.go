@@ -53,6 +53,7 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		!strings.Contains(req.Messages[0].Content, "FIRST action must be update_checklist") ||
 		!strings.Contains(req.Messages[0].Content, "Repository outline") ||
 		!strings.Contains(req.Messages[0].Content, "GREP-FIRST RULE") ||
+		!strings.Contains(req.Messages[0].Content, "Response style (strict)") ||
 		!strings.Contains(req.Messages[0].Content, "SHELL PATHS") {
 		http.Error(w, "PLAN system prompt missing required guidance", http.StatusBadRequest)
 		return
@@ -1166,5 +1167,44 @@ func TestChatStreamContinueFlag(t *testing.T) {
 	}
 	if msgs[0].Role != "user" || msgs[0].Content != continuePrompt {
 		t.Errorf("first message = %+v, want the continue prompt", msgs[0])
+	}
+}
+
+func TestBuildSystemPromptIsStableAndStateFree(t *testing.T) {
+	project := store.Project{Name: "demo", Path: "/tmp/demo"}
+	session := store.Session{Mode: "PLAN"}
+	outline := "FILE internal/volatile.go"
+
+	first := buildSystemPrompt(project, session, 12, 96)
+	second := buildSystemPrompt(project, session, 12, 96)
+	if first != second {
+		t.Fatal("buildSystemPrompt is not deterministic")
+	}
+	if strings.Contains(first, outline) {
+		t.Error("repository outline leaked into the cacheable system prompt")
+	}
+	if strings.Contains(first, "Current checklist") {
+		t.Error("checklist leaked into the cacheable system prompt")
+	}
+	if !strings.Contains(first, "Response style (strict)") {
+		t.Error("system prompt is missing the response-style rules")
+	}
+}
+
+func TestBuildStateMessageCarriesVolatileState(t *testing.T) {
+	checklist := []store.ChecklistItem{
+		{ID: 1, TaskText: "write tests", IsDone: true},
+		{ID: 2, TaskText: "run build", IsDone: false},
+	}
+	state := buildStateMessage(checklist, "FILE internal/demo.go")
+	for _, want := range []string{
+		"not a new request",
+		"[x] #1 write tests",
+		"[ ] #2 run build",
+		"FILE internal/demo.go",
+	} {
+		if !strings.Contains(state, want) {
+			t.Errorf("state message missing %q:\n%s", want, state)
+		}
 	}
 }

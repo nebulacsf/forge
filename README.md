@@ -170,7 +170,11 @@ system shortcuts.
     "max_tool_rounds": 24,
     "max_turn_rounds": 96,
     "auto_continue": true,
-    "max_turn_cost_usd": 0
+    "max_turn_cost_usd": 0,
+    "history_keep_recent_rounds": 4,
+    "history_max_result_chars": 4000,
+    "history_max_arg_chars": 4000,
+    "history_prune_chunk_rounds": 4
   }
 }
 ```
