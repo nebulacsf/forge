@@ -164,7 +164,10 @@
         <section class="side-card usage-card">
           <div class="side-card-head">
             <span>Usage &amp; cost</span>
-            <i class="bi bi-activity"></i>
+            <span class="head-meta">
+              <span id="prunePill" class="count-pill prune-pill d-none" role="button" tabindex="0" title="Tool rounds stubbed out of the context sent to the model">0 pruned</span>
+              <i class="bi bi-activity"></i>
+            </span>
           </div>
           <div class="side-card-body">
             <div class="usage-top">
@@ -176,33 +179,56 @@
             </div>
             <div id="contextMeta" class="usage-sub" title="Tokens in the current context: the prompt sent to the model plus the response it just generated.">0 / 128k tokens</div>
 
-            <div class="usage-grid">
-              <div class="usage-stat" title="Cumulative input tokens billed across every model request in this session. Each tool round resends the full context, so this total is normally much larger than the context gauge.">
-                <strong id="tokensIn">0</strong>
-                <span>total input</span>
-              </div>
-              <div class="usage-stat" title="Cumulative output tokens generated across every model request in this session.">
-                <strong id="tokensOut">0</strong>
-                <span>total output</span>
-              </div>
-              <div class="usage-stat" title="Cumulative prompt tokens served from the provider cache in this session.">
-                <strong id="cachedTokens">0</strong>
-                <span>cached</span>
-              </div>
-            </div>
+            <details id="usageDetails" class="usage-details">
+              <summary class="usage-details-head">
+                <span>Session totals</span>
+                <i class="bi bi-chevron-down files-chevron"></i>
+              </summary>
 
-            <div class="cost-line">
-              <span title="Cumulative time the agent spent working in this session.">Session time</span>
-              <strong id="sessionTime">0s</strong>
-            </div>
-            <div class="cost-line">
-              <span>Session cost</span>
-              <strong id="sessionCost">$0.0000</strong>
-            </div>
-            <div class="cost-line">
-              <span>Project cost</span>
-              <strong id="projectCost">$0.0000</strong>
-            </div>
+              <div class="usage-grid">
+                <div class="usage-stat" title="Cumulative input tokens billed across every model request in this session. Each tool round resends the full context, so this total is normally much larger than the context gauge.">
+                  <strong id="tokensIn">0</strong>
+                  <span>total input</span>
+                </div>
+                <div class="usage-stat" title="Cumulative output tokens generated across every model request in this session.">
+                  <strong id="tokensOut">0</strong>
+                  <span>total output</span>
+                </div>
+                <div class="usage-stat" title="Cumulative prompt tokens served from the provider cache in this session.">
+                  <strong id="cachedTokens">0</strong>
+                  <span>cached</span>
+                </div>
+                <div class="usage-stat" title="Tool rounds in the current context. Each point in the pruning matrix below is one of these rounds.">
+                  <strong id="roundsCount">0</strong>
+                  <span>rounds</span>
+                </div>
+              </div>
+
+              <div class="prune-block">
+                <div class="prune-head">
+                  <span title="Older tool rounds are replaced with short stubs before each model request. The matrix shows the state of the context sent in the last request.">Context pruning</span>
+                  <span id="pruneMeta" class="prune-meta">no rounds yet</span>
+                </div>
+                <div id="pruneDots" class="prune-dots" role="img" aria-label="No tool rounds in context"></div>
+                <div class="prune-legend">
+                  <span><i class="prune-swatch full"></i>sent in full</span>
+                  <span><i class="prune-swatch pruned"></i>pruned</span>
+                </div>
+              </div>
+
+              <div class="cost-line">
+                <span title="Cumulative time the agent spent working in this session.">Session time</span>
+                <strong id="sessionTime">0s</strong>
+              </div>
+              <div class="cost-line">
+                <span>Session cost</span>
+                <strong id="sessionCost">$0.0000</strong>
+              </div>
+              <div class="cost-line">
+                <span>Project cost</span>
+                <strong id="projectCost">$0.0000</strong>
+              </div>
+            </details>
           </div>
         </section>
 

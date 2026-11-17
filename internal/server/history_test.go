@@ -50,6 +50,9 @@ func TestBuildHistoryKeepsRecentRoundsFull(t *testing.T) {
 	if stats.PrunedRounds != 4 {
 		t.Errorf("PrunedRounds = %d, want 4", stats.PrunedRounds)
 	}
+	if stats.Rounds != 6 {
+		t.Errorf("Rounds = %d, want 6", stats.Rounds)
+	}
 	if stats.PrunedChars <= 0 {
 		t.Error("PrunedChars should be positive")
 	}

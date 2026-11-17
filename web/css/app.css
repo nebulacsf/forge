@@ -1168,21 +1168,98 @@ kbd {
 .progress-bar { background: var(--accent); width: 0; transition: width .35s ease; }
 .usage-sub { margin-top: 4px; color: var(--muted-2); font-family: var(--mono); font-size: 9.5px; font-variant-numeric: tabular-nums; }
 
+/* Totals live in a nested accordion so the card only shows the context gauge
+   and the pruning pill by default. */
+.usage-details { margin-top: 9px; border-top: 1px solid var(--border-soft); }
+.usage-details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 0 0;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.usage-details > summary::-webkit-details-marker { display: none; }
+.usage-details > summary:hover { color: var(--text-soft); }
+.usage-details[open] > summary { margin-bottom: 7px; }
+.usage-details[open] .files-chevron { transform: rotate(180deg); }
+.usage-details .usage-grid { margin: 0 0 8px; }
+
+.prune-pill {
+  background: color-mix(in srgb, var(--amber) 15%, transparent);
+  color: var(--amber);
+  cursor: pointer;
+}
+.prune-pill:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
 .usage-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 5px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
   margin: 10px 0 8px;
 }
 .usage-stat {
-  padding: 6px 5px;
+  padding: 6px 3px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
   background: var(--surface-2);
   text-align: center;
 }
-.usage-stat strong { display: block; color: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.usage-stat span { display: block; margin-top: 2px; color: var(--muted-2); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
+.usage-stat strong { display: block; color: var(--text); font-family: var(--mono); font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.usage-stat span { display: block; margin-top: 2px; color: var(--muted-2); font-size: 8.5px; text-transform: uppercase; letter-spacing: .04em; }
+
+.prune-block {
+  margin: 0 0 6px;
+  padding: 8px 0 6px;
+  border-top: 1px solid var(--border-soft);
+}
+.prune-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.prune-meta {
+  color: var(--muted-2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.prune-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin: 7px 0 6px;
+  max-height: 92px;
+  overflow-y: auto;
+}
+.prune-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.prune-dot.pruned { background: var(--amber); }
+.prune-empty { color: var(--muted-2); font-size: 10px; line-height: 1.4; }
+.prune-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--muted-2);
+  font-size: 9px;
+}
+.prune-legend > span { display: inline-flex; align-items: center; gap: 4px; }
+.prune-swatch { width: 6px; height: 6px; border-radius: 50%; }
+.prune-swatch.full { background: var(--accent); }
+.prune-swatch.pruned { background: var(--amber); }
 
 .cost-line {
   display: flex;

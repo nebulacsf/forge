@@ -57,6 +57,7 @@ type historyOptions struct {
 type historyStats struct {
 	Messages     int
 	Chars        int
+	Rounds       int // tool rounds found in the persisted history
 	PrunedRounds int
 	PrunedChars  int
 }

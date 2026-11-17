@@ -61,6 +61,12 @@ type chatEvent struct {
 	SessionCachedTokens int64   `json:"session_cached_tokens,omitempty"`
 	SessionCostUSD      float64 `json:"session_cost_usd,omitempty"`
 	ProjectCostUSD      float64 `json:"project_cost_usd,omitempty"`
+	// History pruning snapshot for the request that produced this usage
+	// event: total tool rounds in the session history, how many were stubbed,
+	// and how many characters the stubs/clipping saved.
+	HistoryRounds int `json:"history_rounds,omitempty"`
+	PrunedRounds  int `json:"pruned_rounds,omitempty"`
+	PrunedChars   int `json:"pruned_chars,omitempty"`
 
 	Checklist     *[]store.ChecklistItem `json:"checklist,omitempty"`
 	Files         []tools.FileAction     `json:"files,omitempty"`
@@ -515,6 +521,9 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				SessionCachedTokens: session.CachedTokens,
 				SessionCostUSD:      session.CostUSD,
 				ProjectCostUSD:      projectCost,
+				HistoryRounds:       hstats.Rounds,
+				PrunedRounds:        hstats.PrunedRounds,
+				PrunedChars:         hstats.PrunedChars,
 			}); err != nil {
 				if id := s.persistPartial(session.ID, result.Reasoning, result.Content); id > 0 {
 					lastAssistantID = id

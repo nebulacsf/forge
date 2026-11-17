@@ -1190,6 +1190,42 @@ func TestChatStreamAutoContinues(t *testing.T) {
 	}
 }
 
+func TestChatStreamReportsHistoryPruning(t *testing.T) {
+	mock := &toolLoopMock{tool: "read_file", args: func(n int) string {
+		return fmt.Sprintf(`{"path":"main.go","start_line":%d,"end_line":%d}`, n, n+20)
+	}}
+	// A tiny token ceiling forces every older tool round to be stubbed, which
+	// is what the inspector's pruning matrix renders.
+	app, _, session := chatBudgetFixture(t, "BUILD", mock, func(c *config.Config) {
+		c.Defaults.MaxToolRounds = 3
+		c.Defaults.MaxTurnRounds = 3
+		c.Defaults.AutoContinue = boolValue(false)
+		c.Defaults.HistoryPruneMaxTokens = 5
+	})
+
+	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "work"})
+
+	var sawPruned bool
+	for _, ev := range events {
+		if ev["type"] != "usage" {
+			continue
+		}
+		rounds, _ := ev["history_rounds"].(float64)
+		pruned, _ := ev["pruned_rounds"].(float64)
+		chars, _ := ev["pruned_chars"].(float64)
+		if rounds <= 0 || pruned <= 0 || chars <= 0 {
+			continue
+		}
+		if pruned > rounds {
+			t.Errorf("pruned_rounds = %v > history_rounds = %v", pruned, rounds)
+		}
+		sawPruned = true
+	}
+	if !sawPruned {
+		t.Fatal("no usage event reported a pruned history")
+	}
+}
+
 func TestChatStreamLoopGuardStopsRepeatedCall(t *testing.T) {
 	mock := &toolLoopMock{tool: "read_file", args: func(int) string {
 		return `{"path":"main.go","start_line":1,"end_line":20}`
