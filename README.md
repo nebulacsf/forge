@@ -211,10 +211,12 @@ system shortcuts.
     "plan_tool_calls": 64,
     "auto_continue": true,
     "max_turn_cost_usd": 0,
-    "history_keep_recent_rounds": 36,
+    "history_prune_percent": 70,
+    "history_prune_max_tokens": 120000,
+    "history_keep_recent_rounds": 0,
     "history_max_result_chars": 16000,
     "history_max_arg_chars": 4000,
-    "history_prune_chunk_rounds": 24
+    "history_prune_chunk_rounds": 0
   }
 }
 ```

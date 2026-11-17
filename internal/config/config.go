@@ -62,10 +62,17 @@ type DefaultsConfig struct {
 	// History pruning keeps recent tool output verbatim and stubs older rounds
 	// in place before each provider request. Volatile state (checklist, outline)
 	// lives in a trailing message so the stable prompt prefix stays cacheable.
-	HistoryKeepRecent int `json:"history_keep_recent_rounds"`
-	HistoryMaxResult  int `json:"history_max_result_chars"`
-	HistoryMaxArg     int `json:"history_max_arg_chars"`
-	HistoryPruneChunk int `json:"history_prune_chunk_rounds"`
+	//
+	// Pruning is budget driven by default: the conversation must fit in
+	// min(model context length * HistoryPrunePercent, HistoryPruneMaxTokens)
+	// tokens. The round-based knobs below stay available but are disabled (0)
+	// unless the token budget itself is disabled.
+	HistoryPrunePercent   int `json:"history_prune_percent"`
+	HistoryPruneMaxTokens int `json:"history_prune_max_tokens"`
+	HistoryKeepRecent     int `json:"history_keep_recent_rounds"`
+	HistoryMaxResult      int `json:"history_max_result_chars"`
+	HistoryMaxArg         int `json:"history_max_arg_chars"`
+	HistoryPruneChunk     int `json:"history_prune_chunk_rounds"`
 }
 
 // Default returns the shipped configuration.
@@ -83,20 +90,25 @@ func Default() Config {
 			},
 		},
 		Defaults: DefaultsConfig{
-			Model:             DefaultModel,
-			Mode:              "PLAN",
-			MaxFileReadChars:  25000,
-			BashTimeoutSec:    30,
-			MaxToolRounds:     16,
-			MaxTurnRounds:     64,
-			PlanRounds:        16,
-			PlanToolCalls:     32,
-			AutoContinue:      boolPtr(true),
-			MaxTurnCostUSD:    0,
-			HistoryKeepRecent: 36,
+			Model:            DefaultModel,
+			Mode:             "PLAN",
+			MaxFileReadChars: 25000,
+			BashTimeoutSec:   30,
+			MaxToolRounds:    16,
+			MaxTurnRounds:    64,
+			PlanRounds:       16,
+			PlanToolCalls:    32,
+			AutoContinue:     boolPtr(true),
+			MaxTurnCostUSD:   0,
+			// Budget-driven pruning is the default: the request may use up to
+			// 70% of the model's context window, capped at 120k tokens.
+			HistoryPrunePercent:   70,
+			HistoryPruneMaxTokens: 120000,
+			// Round-based pruning stays available but is off by default.
+			HistoryKeepRecent: 0,
 			HistoryMaxResult:  16000,
 			HistoryMaxArg:     4000,
-			HistoryPruneChunk: 24,
+			HistoryPruneChunk: 0,
 		},
 	}
 }
@@ -296,8 +308,24 @@ func normalize(c Config) Config {
 	if c.Defaults.MaxTurnCostUSD < 0 {
 		c.Defaults.MaxTurnCostUSD = 0
 	}
-	if c.Defaults.HistoryKeepRecent <= 0 {
-		c.Defaults.HistoryKeepRecent = d.Defaults.HistoryKeepRecent
+	// Token-budget pruning: 0 disables the budget and re-enables the legacy
+	// round-based knobs. Negative values fall back to the shipped default.
+	if c.Defaults.HistoryPrunePercent < 0 {
+		c.Defaults.HistoryPrunePercent = d.Defaults.HistoryPrunePercent
+	}
+	if c.Defaults.HistoryPrunePercent > 100 {
+		c.Defaults.HistoryPrunePercent = 100
+	}
+	if c.Defaults.HistoryPruneMaxTokens < 0 {
+		c.Defaults.HistoryPruneMaxTokens = d.Defaults.HistoryPruneMaxTokens
+	}
+	if c.Defaults.HistoryPruneMaxTokens > 2_000_000 {
+		c.Defaults.HistoryPruneMaxTokens = 2_000_000
+	}
+	// Legacy round-based knobs: 0 keeps them disabled, which is the shipped
+	// state now that the token budget drives pruning.
+	if c.Defaults.HistoryKeepRecent < 0 {
+		c.Defaults.HistoryKeepRecent = 0
 	}
 	if c.Defaults.HistoryKeepRecent > 100 {
 		c.Defaults.HistoryKeepRecent = 100
@@ -321,13 +349,32 @@ func normalize(c Config) Config {
 	if c.Defaults.HistoryMaxArg > 25000 {
 		c.Defaults.HistoryMaxArg = 25000
 	}
-	if c.Defaults.HistoryPruneChunk <= 0 {
-		c.Defaults.HistoryPruneChunk = d.Defaults.HistoryPruneChunk
+	if c.Defaults.HistoryPruneChunk < 0 {
+		c.Defaults.HistoryPruneChunk = 0
 	}
 	if c.Defaults.HistoryPruneChunk > 100 {
 		c.Defaults.HistoryPruneChunk = 100
 	}
 	return c
+}
+
+// PruneTokenBudget returns the token ceiling a provider request must fit in:
+//
+//	min(model context length * history_prune_percent, history_prune_max_tokens)
+//
+// A zero result means budget-driven pruning is disabled, in which case the
+// legacy round-based knobs (history_keep_recent_rounds, history_prune_chunk_rounds)
+// decide the window instead. An unknown model context length (0) falls back to
+// the token cap alone.
+func (d DefaultsConfig) PruneTokenBudget(contextLength int) int {
+	limit := 0
+	if contextLength > 0 && d.HistoryPrunePercent > 0 {
+		limit = contextLength * d.HistoryPrunePercent / 100
+	}
+	if d.HistoryPruneMaxTokens > 0 && (limit <= 0 || d.HistoryPruneMaxTokens < limit) {
+		limit = d.HistoryPruneMaxTokens
+	}
+	return limit
 }
 
 func boolPtr(v bool) *bool { return &v }

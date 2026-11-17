@@ -24,6 +24,12 @@ const (
 	defaultHistoryMaxArg     = 4000
 	defaultHistoryChunk      = 4
 
+	// historyCharsPerToken is the cheap estimation used everywhere in the
+	// harness (buildHistory stats, the UI meter). It deliberately over-estimates
+	// for prose and under-estimates for dense code, so the token budget keeps a
+	// safety margin before the provider's real tokenizer is involved.
+	historyCharsPerToken = 4
+
 	stubPrefix      = "[pruned] "
 	oldContentLimit = 600
 )
@@ -33,6 +39,19 @@ type historyOptions struct {
 	MaxResultChars int // 0 disables the cap
 	MaxArgChars    int // 0 disables the cap
 	ChunkRounds    int // 1 prunes every round; >1 prunes in stable chunks
+	// TokenBudget is the estimated token ceiling for the whole request
+	// (system prompt + tool definitions + conversation). When positive it
+	// drives pruning and the round-based knobs are ignored. 0 disables the
+	// budget and falls back to KeepRecent/ChunkRounds.
+	TokenBudget int
+	// ReservedChars is request overhead that is neither the system prompt nor
+	// the conversation (tool definitions, for example). It is subtracted from
+	// the token budget before any tool round is kept verbatim.
+	ReservedChars int
+	// MinRecent is the number of newest tool rounds kept verbatim even when a
+	// single oversized round blows past TokenBudget. PLAN uses it so the current
+	// research turn is never pruned; 0 lets the budget decide alone.
+	MinRecent int
 }
 
 type historyStats struct {
@@ -78,6 +97,128 @@ func pruneBoundary(toolRounds, keep, chunk int) int {
 	return (excess / chunk) * chunk
 }
 
+// budgetBoundary returns how many of the oldest tool rounds must be stubbed so
+// the request fits in opts.TokenBudget. Rounds are kept verbatim from the newest
+// backwards until the ceiling is reached. The boundary advances in chunks of
+// opts.ChunkRounds so consecutive requests keep an identical prefix, which is
+// what the provider's prompt cache needs to hit.
+func budgetBoundary(rows []store.Message, system string, opts historyOptions) int {
+	limit := opts.TokenBudget*historyCharsPerToken -
+		utf8.RuneCountInString(system) - opts.ReservedChars
+
+	rounds := make([]int, 0, len(rows))
+	base := 0
+	for _, m := range rows {
+		calls := parseToolCalls(m)
+		if m.Role == "assistant" && len(calls) > 0 {
+			rounds = append(rounds, messageFullChars(m))
+			continue
+		}
+		base += messageFullChars(m)
+	}
+	limit -= base
+	if limit <= 0 || len(rounds) == 0 {
+		return len(rounds)
+	}
+
+	used := 0
+	keep := 0
+	for i := len(rounds) - 1; i >= 0; i-- {
+		if used+rounds[i] > limit {
+			break
+		}
+		used += rounds[i]
+		keep++
+	}
+	boundary := len(rounds) - keep
+
+	// Round the boundary UP to the next chunk: stubbing a little more than
+	// strictly needed keeps the request inside the ceiling and freezes the
+	// boundary for the next ChunkRounds rounds, so the prompt prefix stays
+	// cacheable instead of shifting on every request.
+	chunk := opts.ChunkRounds
+	if chunk < 1 {
+		chunk = 1
+	}
+	boundary = ((boundary + chunk - 1) / chunk) * chunk
+	if boundary > len(rounds) {
+		boundary = len(rounds)
+	}
+	return boundary
+}
+
+// renderToolRound renders one assistant tool round plus its tool results.
+func renderToolRound(m store.Message, calls []llm.ToolCall, stubbed bool, opts historyOptions) []llm.Message {
+	content := m.Content
+	if stubbed && utf8.RuneCountInString(content) > oldContentLimit {
+		content = clipRunes(content, oldContentLimit)
+	}
+	wire := make([]llm.ToolCall, 0, len(calls))
+	for _, c := range calls {
+		wire = append(wire, llm.ToolCall{
+			ID:   c.ID,
+			Type: c.Type,
+			Function: llm.ToolFunction{
+				Name:      c.Function.Name,
+				Arguments: compactToolArguments(c.Function.Arguments, opts.MaxArgChars, stubbed),
+			},
+		})
+	}
+	if strings.TrimSpace(content) == "" && len(wire) == 0 {
+		return nil
+	}
+	out := []llm.Message{{Role: "assistant", Content: content, ToolCalls: wire}}
+	for _, c := range calls {
+		result := c.Result
+		if stubbed {
+			result = stubPrefix + digestToolCall(c)
+		} else {
+			if c.Status == "error" {
+				result = "ERROR: " + result
+			}
+			if strings.TrimSpace(result) == "" {
+				result = "(no result recorded)"
+			}
+			result = clipToolResult(result, opts.MaxResultChars)
+		}
+		out = append(out, llm.Message{
+			Role:       "tool",
+			ToolCallID: c.ID,
+			Name:       c.Function.Name,
+			Content:    result,
+		})
+	}
+	return out
+}
+
+// toolSpecsChars estimates the characters the tool definitions occupy on the
+// wire. They travel with every request but are not part of the conversation, so
+// the token budget must subtract them before deciding how much history fits.
+func toolSpecsChars(specs []llm.Tool) int {
+	total := 0
+	for _, spec := range specs {
+		total += utf8.RuneCountInString(spec.Function.Name)
+		total += utf8.RuneCountInString(spec.Function.Description)
+		if raw, err := json.Marshal(spec.Function.Parameters); err == nil {
+			total += len(raw)
+		}
+	}
+	return total
+}
+
+// messagesChars estimates the characters a rendered history occupies, which is
+// the number the token budget is compared against (4 chars ≈ 1 token).
+func messagesChars(msgs []llm.Message) int {
+	total := 0
+	for _, msg := range msgs {
+		total += utf8.RuneCountInString(msg.Content)
+		for _, c := range msg.ToolCalls {
+			total += utf8.RuneCountInString(c.Function.Arguments)
+		}
+	}
+	return total
+}
+
 // buildHistory reconstructs OpenAI-compatible messages from persisted rows,
 // stubbing old tool output so each round sends a bounded context.
 func buildHistory(rows []store.Message, system string, opts historyOptions) ([]llm.Message, historyStats) {
@@ -91,7 +232,22 @@ func buildHistory(rows []store.Message, system string, opts historyOptions) ([]l
 			toolRounds++
 		}
 	}
-	collapseBefore := pruneBoundary(toolRounds, opts.KeepRecent, opts.ChunkRounds)
+	var collapseBefore int
+	if opts.TokenBudget > 0 {
+		// Budget-driven pruning: keep as many recent rounds verbatim as the
+		// token ceiling allows, so large-context models actually get used.
+		collapseBefore = budgetBoundary(rows, system, opts)
+	} else {
+		collapseBefore = pruneBoundary(toolRounds, opts.KeepRecent, opts.ChunkRounds)
+	}
+	// PLAN keeps its whole research turn verbatim even if one huge read blows
+	// past the budget by itself; the findings must survive to the final plan.
+	if floor := opts.MinRecent; floor > 0 && collapseBefore > toolRounds-floor {
+		collapseBefore = toolRounds - floor
+		if collapseBefore < 0 {
+			collapseBefore = 0
+		}
+	}
 
 	out := make([]llm.Message, 0, len(rows)+1)
 	out = append(out, llm.Message{Role: "system", Content: system})
@@ -111,58 +267,21 @@ func buildHistory(rows []store.Message, system string, opts historyOptions) ([]l
 		case "user":
 			out = append(out, llm.Message{Role: "user", Content: m.Content})
 		case "assistant":
-			content := m.Content
-			if stubbed && utf8.RuneCountInString(content) > oldContentLimit {
-				content = clipRunes(content, oldContentLimit)
-			}
-			wire := make([]llm.ToolCall, 0, len(calls))
-			for _, c := range calls {
-				wire = append(wire, llm.ToolCall{
-					ID:   c.ID,
-					Type: c.Type,
-					Function: llm.ToolFunction{
-						Name:      c.Function.Name,
-						Arguments: compactToolArguments(c.Function.Arguments, opts.MaxArgChars, stubbed),
-					},
-				})
-			}
-			if strings.TrimSpace(content) == "" && len(wire) == 0 {
+			if !isToolRound {
+				if strings.TrimSpace(m.Content) == "" {
+					continue
+				}
+				out = append(out, llm.Message{Role: "assistant", Content: m.Content})
 				continue
 			}
-			out = append(out, llm.Message{Role: "assistant", Content: content, ToolCalls: wire})
-			for _, c := range calls {
-				result := c.Result
-				if stubbed {
-					result = stubPrefix + digestToolCall(c)
-				} else {
-					if c.Status == "error" {
-						result = "ERROR: " + result
-					}
-					if strings.TrimSpace(result) == "" {
-						result = "(no result recorded)"
-					}
-					result = clipToolResult(result, opts.MaxResultChars)
-				}
-				out = append(out, llm.Message{
-					Role:       "tool",
-					ToolCallID: c.ID,
-					Name:       c.Function.Name,
-					Content:    result,
-				})
-			}
+			out = append(out, renderToolRound(m, calls, stubbed, opts)...)
 			if stubbed {
 				stats.PrunedRounds++
 			}
 		}
 	}
 
-	sentChars := 0
-	for _, msg := range out {
-		sentChars += utf8.RuneCountInString(msg.Content)
-		for _, c := range msg.ToolCalls {
-			sentChars += utf8.RuneCountInString(c.Function.Arguments)
-		}
-	}
+	sentChars := messagesChars(out)
 	if fullChars < sentChars {
 		fullChars = sentChars
 	}

@@ -374,8 +374,16 @@
                 <input id="planToolCalls" type="number" min="1" max="200" class="form-control">
               </div>
               <div class="col-md-4">
+                <label for="historyPrunePercent" class="form-label">Prune at % of context</label>
+                <input id="historyPrunePercent" type="number" min="0" max="100" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <label for="historyPruneMaxTokens" class="form-label">Prune token cap</label>
+                <input id="historyPruneMaxTokens" type="number" min="0" max="2000000" step="1000" class="form-control">
+              </div>
+              <div class="col-md-4">
                 <label for="historyKeepRecent" class="form-label">Keep recent tool rounds</label>
-                <input id="historyKeepRecent" type="number" min="1" max="100" class="form-control">
+                <input id="historyKeepRecent" type="number" min="0" max="100" class="form-control">
               </div>
               <div class="col-md-4">
                 <label for="historyMaxResult" class="form-label">Max tool result (chars)</label>
@@ -387,7 +395,7 @@
               </div>
               <div class="col-md-4">
                 <label for="historyPruneChunk" class="form-label">Prune every N rounds</label>
-                <input id="historyPruneChunk" type="number" min="1" max="100" class="form-control">
+                <input id="historyPruneChunk" type="number" min="0" max="100" class="form-control">
               </div>
               <div class="col-12">
                 <div class="form-check form-switch">
@@ -400,8 +408,10 @@
                   PLAN has its own research budget: when it is reached, tools are disabled and Forge requires
                   the final plan in up to three attempts, rejecting empty answers and tool calls written as text.
                   Auto-continue applies to BUILD only. Older tool output is stubbed in place;
-                  only the most recent rounds are sent in full. Pruning every N rounds keeps the prompt prefix
-                  stable longer (better provider caching). Set a max to 0 to disable that cap.
+                  only the newest rounds that fit the token budget are sent in full. The budget is
+                  min(context window × prune %, token cap) — 70% and 120,000 tokens by default, so the
+                  stricter limit wins: small windows keep 70% of their size, huge windows stop at 120k.
+                  Set either budget value to 0 to fall back to the round-based window below.
                 </div>
               </div>
             </div>

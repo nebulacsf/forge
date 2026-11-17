@@ -32,6 +32,22 @@ func BuiltinModels() []ModelInfo {
 	}
 }
 
+// BuiltinContextLength returns the built-in context window for a model ID.
+// It reports 0 when the model is unknown, so callers can fall back to a fixed
+// token cap instead of guessing.
+func BuiltinContextLength(modelID string) int {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return 0
+	}
+	for _, m := range BuiltinModels() {
+		if strings.EqualFold(m.ID, modelID) {
+			return m.ContextLength
+		}
+	}
+	return 0
+}
+
 // FetchModels lists the models advertised by the configured provider.
 func (c *Client) FetchModels(ctx context.Context) ([]ModelInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)

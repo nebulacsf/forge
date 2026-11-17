@@ -6,11 +6,11 @@ func boolValue(v bool) *bool { return &v }
 
 func TestNormalizeRoundBudgetDefaults(t *testing.T) {
 	got := normalize(Config{})
-	if got.Defaults.MaxToolRounds != 24 {
-		t.Errorf("max_tool_rounds = %d, want 24", got.Defaults.MaxToolRounds)
+	if got.Defaults.MaxToolRounds != 16 {
+		t.Errorf("max_tool_rounds = %d, want 16", got.Defaults.MaxToolRounds)
 	}
-	if got.Defaults.MaxTurnRounds != 96 {
-		t.Errorf("max_turn_rounds = %d, want 96", got.Defaults.MaxTurnRounds)
+	if got.Defaults.MaxTurnRounds != 64 {
+		t.Errorf("max_turn_rounds = %d, want 64", got.Defaults.MaxTurnRounds)
 	}
 	if got.Defaults.AutoContinue == nil || !*got.Defaults.AutoContinue {
 		t.Error("auto_continue should default to true")
@@ -21,8 +21,8 @@ func TestNormalizeRoundBudgetDefaults(t *testing.T) {
 	if got.Defaults.PlanRounds != 16 {
 		t.Errorf("plan_rounds = %d, want 16", got.Defaults.PlanRounds)
 	}
-	if got.Defaults.PlanToolCalls != 64 {
-		t.Errorf("plan_tool_calls = %d, want 64", got.Defaults.PlanToolCalls)
+	if got.Defaults.PlanToolCalls != 32 {
+		t.Errorf("plan_tool_calls = %d, want 32", got.Defaults.PlanToolCalls)
 	}
 }
 
@@ -42,7 +42,7 @@ func TestNormalizeClampsPlanBudget(t *testing.T) {
 	c.Defaults.PlanRounds = -2
 	c.Defaults.PlanToolCalls = -2
 	got = normalize(c)
-	if got.Defaults.PlanRounds != 16 || got.Defaults.PlanToolCalls != 64 {
+	if got.Defaults.PlanRounds != 16 || got.Defaults.PlanToolCalls != 32 {
 		t.Errorf("negative plan budget should fall back to defaults, got rounds=%d calls=%d",
 			got.Defaults.PlanRounds, got.Defaults.PlanToolCalls)
 	}
@@ -91,17 +91,24 @@ func TestNormalizeRejectsNegativeCostCap(t *testing.T) {
 
 func TestNormalizeHistoryPruningDefaults(t *testing.T) {
 	got := normalize(Default())
-	if got.Defaults.HistoryKeepRecent != 36 {
-		t.Errorf("history_keep_recent_rounds = %d, want 36", got.Defaults.HistoryKeepRecent)
+	if got.Defaults.HistoryPrunePercent != 70 {
+		t.Errorf("history_prune_percent = %d, want 70", got.Defaults.HistoryPrunePercent)
+	}
+	if got.Defaults.HistoryPruneMaxTokens != 120000 {
+		t.Errorf("history_prune_max_tokens = %d, want 120000", got.Defaults.HistoryPruneMaxTokens)
+	}
+	// Round-based pruning ships disabled: the token budget drives the window.
+	if got.Defaults.HistoryKeepRecent != 0 {
+		t.Errorf("history_keep_recent_rounds = %d, want 0 (disabled)", got.Defaults.HistoryKeepRecent)
+	}
+	if got.Defaults.HistoryPruneChunk != 0 {
+		t.Errorf("history_prune_chunk_rounds = %d, want 0 (disabled)", got.Defaults.HistoryPruneChunk)
 	}
 	if got.Defaults.HistoryMaxResult != 16000 {
 		t.Errorf("history_max_result_chars = %d, want 16000", got.Defaults.HistoryMaxResult)
 	}
 	if got.Defaults.HistoryMaxArg != 4000 {
 		t.Errorf("history_max_arg_chars = %d, want 4000", got.Defaults.HistoryMaxArg)
-	}
-	if got.Defaults.HistoryPruneChunk != 24 {
-		t.Errorf("history_prune_chunk_rounds = %d, want 24", got.Defaults.HistoryPruneChunk)
 	}
 }
 
@@ -126,15 +133,61 @@ func TestNormalizeClampsHistoryPruning(t *testing.T) {
 	}
 }
 
-func TestNormalizeHistoryPruneChunkFallsBack(t *testing.T) {
+func TestNormalizeHistoryLegacyChunkStaysDisabled(t *testing.T) {
 	c := Default()
 	c.Defaults.HistoryPruneChunk = 0
-	if got := normalize(c); got.Defaults.HistoryPruneChunk != 24 {
-		t.Errorf("history_prune_chunk_rounds = %d, want default 24 for zero input", got.Defaults.HistoryPruneChunk)
+	if got := normalize(c); got.Defaults.HistoryPruneChunk != 0 {
+		t.Errorf("history_prune_chunk_rounds = %d, want 0 (disabled) for zero input", got.Defaults.HistoryPruneChunk)
 	}
 	c.Defaults.HistoryPruneChunk = -3
-	if got := normalize(c); got.Defaults.HistoryPruneChunk != 24 {
-		t.Errorf("history_prune_chunk_rounds = %d, want default 24 for negative input", got.Defaults.HistoryPruneChunk)
+	if got := normalize(c); got.Defaults.HistoryPruneChunk != 0 {
+		t.Errorf("history_prune_chunk_rounds = %d, want 0 (disabled) for negative input", got.Defaults.HistoryPruneChunk)
+	}
+}
+
+func TestNormalizePruneBudgetBounds(t *testing.T) {
+	c := Default()
+	c.Defaults.HistoryPrunePercent = 500
+	c.Defaults.HistoryPruneMaxTokens = 9_000_000
+	got := normalize(c)
+	if got.Defaults.HistoryPrunePercent != 100 {
+		t.Errorf("history_prune_percent = %d, want 100", got.Defaults.HistoryPrunePercent)
+	}
+	if got.Defaults.HistoryPruneMaxTokens != 2_000_000 {
+		t.Errorf("history_prune_max_tokens = %d, want 2000000", got.Defaults.HistoryPruneMaxTokens)
+	}
+
+	c = Default()
+	c.Defaults.HistoryPrunePercent = -10
+	c.Defaults.HistoryPruneMaxTokens = -1
+	got = normalize(c)
+	if got.Defaults.HistoryPrunePercent != 70 || got.Defaults.HistoryPruneMaxTokens != 120000 {
+		t.Errorf("negative values should fall back to defaults, got percent=%d tokens=%d",
+			got.Defaults.HistoryPrunePercent, got.Defaults.HistoryPruneMaxTokens)
+	}
+}
+
+func TestPruneTokenBudget(t *testing.T) {
+	cases := []struct {
+		name     string
+		percent  int
+		maxToken int
+		context  int
+		want     int
+	}{
+		{"small model wins", 70, 120000, 32768, 22937},
+		{"cap wins on huge model", 70, 120000, 1_048_576, 120000},
+		{"unknown model uses cap", 70, 120000, 0, 120000},
+		{"percent disabled uses cap", 0, 120000, 200000, 120000},
+		{"cap disabled uses percent", 70, 0, 200000, 140000},
+		{"both disabled", 0, 0, 200000, 0},
+		{"unknown model and no cap", 70, 0, 0, 0},
+	}
+	for _, c := range cases {
+		d := DefaultsConfig{HistoryPrunePercent: c.percent, HistoryPruneMaxTokens: c.maxToken}
+		if got := d.PruneTokenBudget(c.context); got != c.want {
+			t.Errorf("%s: PruneTokenBudget(%d) = %d, want %d", c.name, c.context, got, c.want)
+		}
 	}
 }
 

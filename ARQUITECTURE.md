@@ -161,28 +161,40 @@ Forge builds a zero-AI outline of the project and stores one row per file in
 Every provider round rebuilds the request from persisted rows. Before sending,
 Forge prunes tool traffic so a long turn does not re-inject every prior result:
 
-- The last `history_keep_recent_rounds` tool rounds (default 36, max 100) are sent
-  verbatim, except that each result is clipped head+tail to
-  `history_max_result_chars` (default 16,000) and oversized arguments are
-  replaced with a compact, valid JSON summary (`history_max_arg_chars`, default
-  4,000). A large `write_file` payload is therefore never re-sent.
+- Pruning is **budget driven**. The request must fit in
+  `min(model context length × history_prune_percent, history_prune_max_tokens)`
+  tokens, i.e. 70% of the window capped at 120,000 by default. The context
+  length comes from the built-in model table (`llm.BuiltinContextLength`); an
+  unknown model falls back to the token cap alone. The ceiling covers the whole
+  request: system prompt, tool definitions, and conversation. Tool rounds are
+  kept verbatim from the newest backwards until the ceiling is reached, so a
+  large-context model actually gets to use its window.
+- Kept rounds have each result clipped head+tail to `history_max_result_chars`
+  (default 16,000) and oversized arguments replaced with a compact, valid JSON
+  summary (`history_max_arg_chars`, default 4,000). A large `write_file` payload
+  is therefore never re-sent.
+- Setting either budget knob to `0` disables the budget and re-enables the
+  legacy round-based window `history_keep_recent_rounds` (default 0, max 100).
+  Both legacy knobs ship at `0` (disabled) because the budget replaces them.
 - Older rounds are **stubbed in place**: the assistant tool call remains at its
   original position with compacted arguments, and its tool result becomes a
   one-line `[pruned] tool target → outcome` digest. Nothing is removed,
   reordered, or merged, so the message count and `tool_call_id` pairing stay
   valid. Old errors keep a short `ERROR:` digest.
-- Pruning advances in chunks of `history_prune_chunk_rounds` (default 24, max 100). Within
-  a chunk the request is strictly append-only; only when a whole chunk becomes
-  old do those rounds switch to stubs. This keeps most consecutive requests as
-  an exact prefix of the next one, which is what provider prompt caching needs.
+- Pruning advances in chunks of `history_prune_chunk_rounds`. `0` (the shipped
+  value) means "use the built-in chunk of 4", and the same chunk applies to both
+  budget-driven and round-based pruning. Within a chunk the request is strictly
+  append-only; only when a whole chunk becomes oversized do those rounds switch
+  to stubs. This keeps most consecutive requests as an exact prefix of the next
+  one, which is what provider prompt caching needs.
 - The system prompt contains only stable content (project, mode, rules). The
   volatile checklist, repository outline, research ledger, continue note, guard
   note, and forced-final instruction are appended as the final ephemeral `user`
   message of each request and are never persisted. Changing them cannot
   invalidate the cached prefix.
-- In PLAN, `history_keep_recent_rounds` is raised to at least
-  `plan_rounds + 2`, so every tool round of the current bounded research turn is
-  sent unpruned. The per-result cap is also floored at 8,000 characters (unless
+- In PLAN, the budget gets a `MinRecent` floor of `plan_rounds + 2`, so every
+  tool round of the current bounded research turn is sent unpruned even if one
+  oversized read blows past the ceiling by itself. The per-result cap is also floored at 8,000 characters (unless
   the user disabled it with 0), which the shipped 16,000 default already
   exceeds, so a normal 100-line read is not clipped in half. Older turns are
   pruned normally. This prevents pruning and clipping from erasing the findings

@@ -346,24 +346,18 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			// round of this turn verbatim so pruning cannot erase the findings
 			// that the model needs for the final plan. Older turns are pruned
 			// normally; the budget guarantees the current turn stays small.
-			if session.Mode == "PLAN" && planRounds+2 > keepRecent {
-				keepRecent = planRounds + 2
+			planFloor := 0
+			if session.Mode == "PLAN" {
+				planFloor = planRounds + 2
+				if planFloor > keepRecent {
+					keepRecent = planFloor
+				}
 			}
 			maxResult := effectiveHistoryResultLimit(session.Mode, cfg.Defaults.HistoryMaxResult)
-			history, hstats := buildHistory(rows, system, historyOptions{
-				KeepRecent:     keepRecent,
-				MaxResultChars: maxResult,
-				MaxArgChars:    cfg.Defaults.HistoryMaxArg,
-				ChunkRounds:    cfg.Defaults.HistoryPruneChunk,
-			})
-			logx.Debug("history built", "session", session.ID, "round", totalRounds,
-				"messages", hstats.Messages, "chars", hstats.Chars,
-				"est_tokens", hstats.Chars/4, "pruned_rounds", hstats.PrunedRounds,
-				"pruned_chars", hstats.PrunedChars, "keep_recent", keepRecent,
-				"max_result_chars", maxResult)
 			// Volatile state and steering notes are ephemeral: they live at the
 			// very end of the request so the stable prefix stays cacheable and
-			// the persisted conversation is never polluted.
+			// the persisted conversation is never polluted. They are built before
+			// the history so the token budget can reserve room for them.
 			var tail []string
 			if continueNote != "" {
 				tail = append(tail, continueNote)
@@ -392,8 +386,30 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				tail = append(tail, buildFinalPlanNote(reason, planRounds, planToolCalls,
 					toolRounds, toolCalls, finalAttempts, noTools))
 			}
-			if len(tail) > 0 {
-				history = append(history, llm.Message{Role: "user", Content: strings.Join(tail, "\n\n")})
+			tailText := strings.Join(tail, "\n\n")
+			// Budget-driven pruning: min(context length * percent, max tokens).
+			// A zero budget means the user disabled it, so the legacy round-based
+			// knobs decide the window instead. ReservedChars covers everything the
+			// budget must also pay for: tool definitions and the ephemeral tail.
+			tokenBudget := cfg.Defaults.PruneTokenBudget(llm.BuiltinContextLength(session.Model))
+			reservedChars := toolSpecsChars(specs) + utf8.RuneCountInString(tailText)
+			history, hstats := buildHistory(rows, system, historyOptions{
+				KeepRecent:     keepRecent,
+				MaxResultChars: maxResult,
+				MaxArgChars:    cfg.Defaults.HistoryMaxArg,
+				ChunkRounds:    cfg.Defaults.HistoryPruneChunk,
+				TokenBudget:    tokenBudget,
+				ReservedChars:  reservedChars,
+				MinRecent:      planFloor,
+			})
+			logx.Debug("history built", "session", session.ID, "round", totalRounds,
+				"messages", hstats.Messages, "chars", hstats.Chars,
+				"est_tokens", hstats.Chars/4, "pruned_rounds", hstats.PrunedRounds,
+				"pruned_chars", hstats.PrunedChars, "keep_recent", keepRecent,
+				"max_result_chars", maxResult, "token_budget", tokenBudget,
+				"reserved_chars", reservedChars)
+			if tailText != "" {
+				history = append(history, llm.Message{Role: "user", Content: tailText})
 			}
 			req := llm.ChatRequest{
 				Model:    session.Model,

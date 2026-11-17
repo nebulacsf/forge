@@ -258,6 +258,74 @@ func TestBuildHistoryPrefixStableWithinChunk(t *testing.T) {
 	}
 }
 
+func TestBuildHistoryTokenBudgetKeepsNewestRounds(t *testing.T) {
+	rows := []store.Message{userRow(1, "go")}
+	for i := int64(0); i < 10; i++ {
+		rows = append(rows, toolRow(10+i, "read_file",
+			fmt.Sprintf(`{"path":"f%d.go","start_line":1,"end_line":10}`, i),
+			strings.Repeat("x", 2000)))
+	}
+	// 10 rounds × 2000 chars ≈ 5000 tokens, so a 3000-token budget must stub the
+	// oldest rounds and keep the newest ones verbatim.
+	got, stats := buildHistory(rows, "system", historyOptions{
+		TokenBudget: 3000,
+		ChunkRounds: 4,
+	})
+	if stats.PrunedRounds == 0 {
+		t.Fatal("token budget should have stubbed the oldest rounds")
+	}
+	if stats.PrunedRounds%4 != 0 {
+		t.Errorf("PrunedRounds = %d, want a multiple of the chunk size 4", stats.PrunedRounds)
+	}
+	if stats.Chars/4 > 3000 {
+		t.Errorf("estimated tokens = %d, want <= 3000", stats.Chars/4)
+	}
+	full := len(rows) - 1 - stats.PrunedRounds
+	var kept int
+	for _, m := range got {
+		if m.Role == "tool" && !strings.HasPrefix(m.Content, stubPrefix) {
+			kept++
+		}
+	}
+	if kept != full {
+		t.Errorf("kept %d full tool results, want %d", kept, full)
+	}
+	assertNoOrphanToolMessages(t, got)
+}
+
+func TestBuildHistoryNoTokenBudgetKeepsLegacyBehavior(t *testing.T) {
+	rows := []store.Message{userRow(1, "go")}
+	for i := int64(0); i < 6; i++ {
+		rows = append(rows, toolRow(10+i, "read_file",
+			fmt.Sprintf(`{"path":"f%d.go","start_line":1,"end_line":10}`, i),
+			strings.Repeat("x", 100)))
+	}
+	got, stats := buildHistory(rows, "system", historyOptions{KeepRecent: 2, ChunkRounds: 1})
+	if stats.PrunedRounds != 4 {
+		t.Errorf("PrunedRounds = %d, want 4 from the round-based fallback", stats.PrunedRounds)
+	}
+	assertNoOrphanToolMessages(t, got)
+}
+
+func TestBuildHistoryBudgetMinRecentFloor(t *testing.T) {
+	rows := []store.Message{userRow(1, "go")}
+	for i := int64(0); i < 5; i++ {
+		rows = append(rows, toolRow(10+i, "read_file",
+			fmt.Sprintf(`{"path":"f%d.go","start_line":1,"end_line":10}`, i),
+			strings.Repeat("x", 40000)))
+	}
+	// A budget far too small for the newest rounds must still not prune the
+	// MinRecent floor: PLAN needs its current research turn to survive.
+	_, stats := buildHistory(rows, "system", historyOptions{
+		TokenBudget: 1000,
+		ChunkRounds: 1,
+		MinRecent:   2,
+	})
+	if stats.PrunedRounds != 3 {
+		t.Errorf("PrunedRounds = %d, want 3 (5 rounds minus the 2-round floor)", stats.PrunedRounds)
+	}
+}
+
 func TestBuildHistoryChunkDelaysPruning(t *testing.T) {
 	rows := []store.Message{userRow(1, "go")}
 	for i := int64(0); i < 8; i++ {
