@@ -15,10 +15,11 @@ import (
 // need to re-read ranges that are already present in the conversation. This is
 // intentionally per-turn: a new user message starts a fresh research budget.
 type researchLedger struct {
-	reads  map[string][]readRange
-	greps  map[string]int
-	rounds int
-	calls  int
+	reads   map[string][]readRange
+	greps   map[string]int
+	symbols map[string]int
+	rounds  int
+	calls   int
 }
 
 type readRange struct {
@@ -28,8 +29,9 @@ type readRange struct {
 
 func newResearchLedger() *researchLedger {
 	return &researchLedger{
-		reads: make(map[string][]readRange),
-		greps: make(map[string]int),
+		reads:   make(map[string][]readRange),
+		greps:   make(map[string]int),
+		symbols: make(map[string]int),
 	}
 }
 
@@ -72,6 +74,23 @@ func (l *researchLedger) observe(call llm.ToolCall, res tools.Result) {
 			key += " glob " + a.Glob
 		}
 		l.greps[key]++
+	case "symbol_lookup":
+		var a struct {
+			Query string `json:"query"`
+			Kind  string `json:"kind"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &a); err != nil {
+			return
+		}
+		query := strings.TrimSpace(a.Query)
+		if query == "" {
+			return
+		}
+		key := clipRunes(query, 60)
+		if a.Kind != "" {
+			key += " [" + a.Kind + "]"
+		}
+		l.symbols[key]++
 	}
 }
 
@@ -126,7 +145,7 @@ func (l *researchLedger) render(planRounds, planToolCalls int) string {
 	if remaining <= 2 {
 		b.WriteString(" Tools will be disabled at the budget; start writing the final plan now.")
 	}
-	if len(l.reads) == 0 && len(l.greps) == 0 {
+	if len(l.reads) == 0 && len(l.greps) == 0 && len(l.symbols) == 0 {
 		return clipRunes(strings.TrimSpace(b.String()), 900)
 	}
 
@@ -166,6 +185,23 @@ func (l *researchLedger) render(planRounds, planToolCalls int) string {
 			fmt.Fprintf(&b, "\n- grep %s (x%d)", key, n)
 		} else {
 			fmt.Fprintf(&b, "\n- grep %s", key)
+		}
+	}
+
+	symbols := make([]string, 0, len(l.symbols))
+	for key := range l.symbols {
+		symbols = append(symbols, key)
+	}
+	sort.Strings(symbols)
+	for i, key := range symbols {
+		if i >= 6 {
+			fmt.Fprintf(&b, "\n- …and %d more symbol lookup(s) already run", len(symbols)-i)
+			break
+		}
+		if n := l.symbols[key]; n > 1 {
+			fmt.Fprintf(&b, "\n- symbol %s (x%d)", key, n)
+		} else {
+			fmt.Fprintf(&b, "\n- symbol %s", key)
 		}
 	}
 	return clipRunes(strings.TrimSpace(b.String()), 900)

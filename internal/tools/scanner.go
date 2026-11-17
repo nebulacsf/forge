@@ -10,7 +10,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,7 +18,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"forge/internal/logx"
 	"forge/internal/store"
 )
 
@@ -39,49 +37,60 @@ type outlineSymbol struct {
 	Name string
 }
 
-type outlinePattern struct {
-	re      *regexp.Regexp
-	kind    string
-	topOnly bool
+// fileSymbol is the rich form used by the queryable symbol index. OutlineKind
+// is the coarse label rendered in repo_outline; an empty OutlineKind means the
+// declaration is indexed for symbol_lookup but omitted from the prompt map.
+type fileSymbol struct {
+	Name          string
+	QualifiedName string
+	OutlineName   string
+	Kind          string
+	OutlineKind   string
+	Parent        string
+	StartLine     int
+	EndLine       int
+}
+
+type symbolContainer struct {
+	Name   string
+	Start  int
+	End    int
+	Indent int
 }
 
 var (
 	jsClassRE  = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)`)
 	jsFuncRE   = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)`)
 	jsArrowRE  = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>`)
-	jsTypeRE   = regexp.MustCompile(`^\s*(?:export\s+)?(?:interface|type|enum)\s+([A-Za-z_$][\w$]*)`)
 	jsMethodRE = regexp.MustCompile(`^\s{2,8}(?:(?:public|private|protected|static|async|readonly|get|set)\s+)*([A-Za-z_$][\w$]*)\s*\([^;]*\)\s*(?::\s*[^{]+)?\{\s*$`)
 
 	pyClassRE = regexp.MustCompile(`^\s*class\s+([A-Za-z_]\w*)`)
 	pyDefRE   = regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)`)
 
 	rsFnRE   = regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([A-Za-z_]\w*)`)
-	rsTypeRE = regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|union|type)\s+([A-Za-z_]\w*)`)
 	rsModRE  = regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)`)
 	rsImplRE = regexp.MustCompile(`^\s*impl\s+(?:<[^>]*>\s*)?([A-Za-z_]\w*)`)
 
-	javaTypeRE   = regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|final|abstract|sealed)\s+)*(?:class|interface|enum|record)\s+([A-Za-z_$][\w$]*)`)
 	javaMethodRE = regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|final|abstract|synchronized|native|default)\s+)+(?:[\w<>\[\],.?]+\s+)+([A-Za-z_$][\w$]*)\s*\([^;]*\)\s*(?:throws[^{]+)?\{`)
 
 	rbClassRE  = regexp.MustCompile(`^\s*class\s+([A-Z]\w*(?:::\w+)*)`)
 	rbModuleRE = regexp.MustCompile(`^\s*module\s+([A-Z]\w*(?:::\w+)*)`)
 	rbDefRE    = regexp.MustCompile(`^\s*def\s+(?:self\.)?([A-Za-z_]\w*[?!]?)`)
 
-	phpTypeRE = regexp.MustCompile(`^\s*(?:abstract\s+|final\s+)?(?:class|interface|trait|enum)\s+([A-Za-z_]\w*)`)
 	phpFuncRE = regexp.MustCompile(`^\s*(?:(?:public|protected|private|static|final|abstract)\s+)*function\s+([A-Za-z_]\w*)`)
 
 	htmlHeadingRE = regexp.MustCompile(`(?i)<h[1-3][^>]*>(.*?)</h[1-3]>`)
 	htmlIDRE      = regexp.MustCompile(`(?i)<([a-z][\w-]*)[^>]*\bid=["']([^"']+)["']`)
 	htmlTagRE     = regexp.MustCompile(`(?i)<[^>]+>`)
-)
 
-var jsOutlinePatterns = []outlinePattern{
-	{jsClassRE, "class", true},
-	{jsFuncRE, "func", true},
-	{jsArrowRE, "func", true},
-	{jsTypeRE, "type", true},
-	{jsMethodRE, "method", false},
-}
+	jsTypeDeclRE   = regexp.MustCompile(`^\s*(?:export\s+)?(interface|type|enum)\s+([A-Za-z_$][\w$]*)`)
+	jsVarRE        = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)`)
+	jsFuncAssignRE = regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?function\b`)
+	pyAssignRE     = regexp.MustCompile(`^\s*([A-Za-z_]\w*)\s*=(?:[^=]|$)`)
+	rsTypeDeclRE   = regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(struct|enum|trait|union|type)\s+([A-Za-z_]\w*)`)
+	javaTypeDeclRE = regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|final|abstract|sealed)\s+)*(class|interface|enum|record)\s+([A-Za-z_$][\w$]*)`)
+	phpTypeDeclRE  = regexp.MustCompile(`^\s*(?:abstract\s+|final\s+)?(class|interface|trait|enum)\s+([A-Za-z_]\w*)`)
+)
 
 // Control-flow lines such as "if (x) {" look like methods; skip them.
 var jsControlKeywords = map[string]bool{
@@ -89,34 +98,6 @@ var jsControlKeywords = map[string]bool{
 	"function": true, "return": true, "else": true, "do": true, "try": true,
 	"finally": true, "with": true, "await": true, "yield": true, "throw": true,
 	"new": true, "delete": true, "typeof": true, "void": true, "in": true, "of": true,
-}
-
-var outlinePatterns = map[string][]outlinePattern{
-	"js": jsOutlinePatterns,
-	"ts": jsOutlinePatterns,
-	"py": {
-		{pyClassRE, "class", false},
-		{pyDefRE, "func", false},
-	},
-	"rs": {
-		{rsFnRE, "fn", true},
-		{rsTypeRE, "type", true},
-		{rsModRE, "mod", true},
-		{rsImplRE, "impl", true},
-	},
-	"java": {
-		{javaTypeRE, "type", true},
-		{javaMethodRE, "method", false},
-	},
-	"rb": {
-		{rbClassRE, "class", true},
-		{rbModuleRE, "module", true},
-		{rbDefRE, "def", false},
-	},
-	"php": {
-		{phpTypeRE, "type", true},
-		{phpFuncRE, "func", false},
-	},
 }
 
 var outlineLanguages = map[string]string{
@@ -140,115 +121,9 @@ var outlineLanguages = map[string]string{
 
 // EnsureRepoOutline scans a project, refreshes only the files whose mtime or
 // size changed, persists the result, and returns the compact rendered outline.
+// It is the project-less compatibility wrapper around EnsureProjectIndex.
 func EnsureRepoOutline(ctx context.Context, st *store.Store, root string) (string, error) {
-	absRoot, err := outlineRoot(root)
-	if err != nil {
-		return "", err
-	}
-	started := time.Now()
-
-	var cached []store.RepoOutlineFile
-	if st != nil {
-		cached, err = st.ListRepoOutline(absRoot)
-		if err != nil {
-			return "", err
-		}
-	}
-	cachedByPath := make(map[string]store.RepoOutlineFile, len(cached))
-	for _, f := range cached {
-		cachedByPath[f.FilePath] = f
-	}
-
-	seen := make(map[string]bool, len(cached))
-	upserts := make([]store.RepoOutlineFile, 0)
-	truncated := false
-
-	walkErr := filepath.WalkDir(absRoot, func(p string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if p == absRoot {
-				return nil
-			}
-			name := d.Name()
-			if skipDirs[name] || strings.HasPrefix(name, ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil // never follow symlinked files out of the project
-		}
-		name := d.Name()
-		if strings.HasPrefix(name, ".") {
-			return nil
-		}
-		rel, relErr := filepath.Rel(absRoot, p)
-		if relErr != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		lang, ok := outlineLanguage(rel)
-		if !ok {
-			return nil
-		}
-		info, infoErr := d.Info()
-		if infoErr != nil || info.IsDir() || info.Size() > outlineMaxFileSize {
-			return nil
-		}
-		if seen[rel] {
-			return nil
-		}
-		if len(seen) >= outlineMaxFiles {
-			truncated = true
-			return fs.SkipAll
-		}
-		seen[rel] = true
-		if c, ok := cachedByPath[rel]; ok &&
-			c.MTimeNS == info.ModTime().UnixNano() &&
-			c.SizeBytes == info.Size() {
-			return nil
-		}
-		if row, ok := outlineRow(absRoot, rel, lang, info); ok {
-			upserts = append(upserts, row)
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return "", walkErr
-	}
-
-	deleted := make([]string, 0)
-	for rel := range cachedByPath {
-		if !seen[rel] {
-			deleted = append(deleted, rel)
-		}
-	}
-	sort.Strings(deleted)
-
-	var rows []store.RepoOutlineFile
-	if st != nil {
-		if err := st.SyncRepoOutline(absRoot, upserts, deleted); err != nil {
-			return "", err
-		}
-		rows, err = st.ListRepoOutline(absRoot)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		rows = upserts
-	}
-
-	outline := RenderRepoOutline(rows)
-	logx.Debug("repo outline ensured", "root", absRoot, "files", len(rows),
-		"parsed", len(upserts), "deleted", len(deleted), "truncated", truncated,
-		"chars", utf8.RuneCountInString(outline),
-		"duration", time.Since(started).Round(time.Millisecond).String())
-	return outline, nil
+	return EnsureProjectIndex(ctx, st, 0, root)
 }
 
 // CurrentRepoOutline renders the cached outline without walking the filesystem.
@@ -376,17 +251,42 @@ func outlineRow(root, rel, lang string, info os.FileInfo) (store.RepoOutlineFile
 }
 
 func scanOutlineFile(lang, abs string, data []byte) []outlineSymbol {
+	return outlineSymbolsFrom(scanFileSymbols(lang, abs, data))
+}
+
+func outlineSymbolsFrom(symbols []fileSymbol) []outlineSymbol {
+	out := make([]outlineSymbol, 0, len(symbols))
+	for _, s := range symbols {
+		if s.OutlineKind == "" || s.StartLine <= 0 {
+			continue
+		}
+		name := s.Name
+		if s.OutlineName != "" {
+			name = s.OutlineName
+		}
+		out = append(out, outlineSymbol{Line: s.StartLine, Kind: s.OutlineKind, Name: name})
+	}
+	return limitAndSortSymbols(out)
+}
+
+func formatFileOutline(symbols []fileSymbol) string {
+	return formatOutlineSymbols(outlineSymbolsFrom(symbols))
+}
+
+// scanFileSymbols is the single parsing entry point used by both the compact
+// repository outline and the queryable symbol index.
+func scanFileSymbols(lang, abs string, data []byte) []fileSymbol {
 	switch lang {
 	case "go":
-		return scanGoOutline(abs, data)
+		return scanGoSymbols(abs, data)
 	case "html":
-		return scanHTMLOutline(data)
+		return scanHTMLSymbols(data)
 	default:
-		return scanRegexOutline(lang, data)
+		return scanRegexSymbols(lang, data)
 	}
 }
 
-func scanGoOutline(abs string, data []byte) []outlineSymbol {
+func scanGoSymbols(abs string, data []byte) []fileSymbol {
 	fset := token.NewFileSet()
 	file, _ := parser.ParseFile(fset, abs, data, parser.SkipObjectResolution)
 	if file == nil {
@@ -398,46 +298,81 @@ func scanGoOutline(abs string, data []byte) []outlineSymbol {
 		}
 		return fset.Position(pos).Line
 	}
-	out := make([]outlineSymbol, 0, 16)
+	out := make([]fileSymbol, 0, 16)
 	if file.Name != nil {
-		out = append(out, outlineSymbol{Line: lineOf(file.Package), Kind: "package", Name: file.Name.Name})
+		out = append(out, fileSymbol{
+			Name: file.Name.Name, QualifiedName: file.Name.Name,
+			Kind: "package", OutlineKind: "package",
+			StartLine: lineOf(file.Package), EndLine: lineOf(file.Package),
+		})
 	}
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.GenDecl:
-			if d.Tok != token.TYPE {
-				continue
-			}
-			for _, spec := range d.Specs {
-				ts, ok := spec.(*ast.TypeSpec)
-				if !ok || ts.Name == nil {
-					continue
+			switch d.Tok {
+			case token.TYPE:
+				for _, spec := range d.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok || ts.Name == nil {
+						continue
+					}
+					kind, outlineKind := "type", "type"
+					switch ts.Type.(type) {
+					case *ast.StructType:
+						kind, outlineKind = "struct", "struct"
+					case *ast.InterfaceType:
+						kind, outlineKind = "interface", "interface"
+					}
+					out = append(out, fileSymbol{
+						Name: ts.Name.Name, QualifiedName: ts.Name.Name,
+						Kind: kind, OutlineKind: outlineKind,
+						StartLine: lineOf(ts.Pos()), EndLine: lineOf(ts.End()),
+					})
 				}
-				kind := "type"
-				switch ts.Type.(type) {
-				case *ast.StructType:
-					kind = "struct"
-				case *ast.InterfaceType:
-					kind = "interface"
+			case token.VAR, token.CONST:
+				kind := "variable"
+				if d.Tok == token.CONST {
+					kind = "constant"
 				}
-				out = append(out, outlineSymbol{Line: lineOf(ts.Pos()), Kind: kind, Name: ts.Name.Name})
+				for _, spec := range d.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					start, end := lineOf(vs.Pos()), lineOf(vs.End())
+					for _, n := range vs.Names {
+						if n == nil {
+							continue
+						}
+						out = append(out, fileSymbol{
+							Name: n.Name, QualifiedName: n.Name, Kind: kind,
+							StartLine: start, EndLine: end,
+						})
+					}
+				}
 			}
 		case *ast.FuncDecl:
 			if d.Name == nil {
 				continue
 			}
-			kind := "func"
-			name := d.Name.Name
+			kind, outlineKind := "function", "func"
+			name, qualified, parent := d.Name.Name, d.Name.Name, ""
 			if d.Recv != nil && len(d.Recv.List) > 0 {
-				kind = "method"
+				kind, outlineKind = "method", "method"
 				if recv := receiverTypeName(d.Recv.List[0].Type); recv != "" {
-					name = recv + "." + name
+					parent = recv
+					qualified = recv + "." + name
 				}
 			}
-			out = append(out, outlineSymbol{Line: lineOf(d.Pos()), Kind: kind, Name: name})
+			out = append(out, fileSymbol{
+				Name: name, QualifiedName: qualified, OutlineName: qualified,
+				Kind: kind, OutlineKind: outlineKind,
+				Parent: parent, StartLine: lineOf(d.Pos()), EndLine: lineOf(d.End()),
+			})
 		}
 	}
-	return limitAndSortSymbols(out)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].StartLine < out[j].StartLine })
+	return out
 }
 
 func receiverTypeName(expr ast.Expr) string {
@@ -457,52 +392,294 @@ func receiverTypeName(expr ast.Expr) string {
 	}
 }
 
-func scanRegexOutline(lang string, data []byte) []outlineSymbol {
-	patterns := outlinePatterns[lang]
-	if len(patterns) == 0 {
+func scanRegexSymbols(lang string, data []byte) []fileSymbol {
+	lines := sourceLines(data)
+	switch lang {
+	case "js", "ts":
+		return scanJSSymbols(lines)
+	case "py":
+		return scanPySymbols(lines)
+	case "rs":
+		return scanRustSymbols(lines)
+	case "java":
+		return scanJavaSymbols(lines)
+	case "rb":
+		return scanRubySymbols(lines)
+	case "php":
+		return scanPHPSymbols(lines)
+	default:
 		return nil
 	}
-	out := make([]outlineSymbol, 0, 16)
-	for i, raw := range strings.Split(string(data), "\n") {
-		if len(out) >= outlineMaxSymbols {
-			break
-		}
-		line := strings.TrimSuffix(raw, "\r")
-		if strings.TrimSpace(line) == "" || len(line) > 4000 {
+}
+
+func scanJSSymbols(lines []string) []fileSymbol {
+	out := make([]fileSymbol, 0, 16)
+	containers := make([]symbolContainer, 0, 4)
+	for i, line := range lines {
+		if isCommentLine(line) {
 			continue
 		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-		for _, p := range patterns {
-			if p.topOnly && indent > 0 {
+		indent := lineIndent(line)
+		if m := jsClassRE.FindStringSubmatch(line); len(m) >= 2 && strings.TrimSpace(m[1]) != "" {
+			end := blockEndLine(lines, i)
+			containers = append(containers, symbolContainer{m[1], i + 1, end, indent})
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "class",
+				OutlineKind: "class", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := jsFuncRE.FindStringSubmatch(line); len(m) >= 2 && strings.TrimSpace(m[1]) != "" {
+			end := blockEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "function",
+				OutlineKind: "func", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := jsArrowRE.FindStringSubmatch(line); len(m) >= 2 && strings.TrimSpace(m[1]) != "" {
+			end := blockEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "function",
+				OutlineKind: "func", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := jsTypeDeclRE.FindStringSubmatch(line); len(m) >= 3 {
+			kind := "type"
+			if m[1] == "interface" {
+				kind = "interface"
+			}
+			end := blockEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[2], QualifiedName: m[2], Kind: kind,
+				OutlineKind: "type", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := jsMethodRE.FindStringSubmatch(line); len(m) >= 2 && strings.TrimSpace(m[1]) != "" {
+			name := m[1]
+			if jsControlKeywords[name] {
 				continue
 			}
-			m := p.re.FindStringSubmatch(line)
-			if len(m) < 2 || strings.TrimSpace(m[1]) == "" {
+			if parent := enclosingContainer(containers, i+1, indent); parent != "" {
+				end := blockEndLine(lines, i)
+				out = append(out, fileSymbol{Name: name, QualifiedName: parent + "." + name,
+					Kind: "method", OutlineKind: "method", Parent: parent,
+					StartLine: i + 1, EndLine: end})
 				continue
 			}
-			kind := p.kind
-			if lang == "py" && kind == "func" && indent > 0 {
-				kind = "method"
-			}
-			if lang == "rb" && kind == "def" && indent > 0 {
-				kind = "method"
-			}
-			if kind == "method" && jsControlKeywords[m[1]] {
+		}
+		if indent == 0 {
+			if m := jsFuncAssignRE.FindStringSubmatch(line); len(m) >= 2 {
+				end := blockEndLine(lines, i)
+				out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "function",
+					OutlineKind: "func", StartLine: i + 1, EndLine: end})
 				continue
 			}
-			out = append(out, outlineSymbol{Line: i + 1, Kind: kind, Name: clipOutlineName(m[1])})
-			break
+			if m := jsVarRE.FindStringSubmatch(line); len(m) >= 2 {
+				end := blockEndLine(lines, i)
+				out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "variable",
+					StartLine: i + 1, EndLine: end})
+			}
 		}
 	}
 	return out
 }
 
-func scanHTMLOutline(data []byte) []outlineSymbol {
-	out := make([]outlineSymbol, 0, 8)
-	for i, raw := range strings.Split(string(data), "\n") {
-		if len(out) >= outlineMaxSymbols {
-			break
+func scanPySymbols(lines []string) []fileSymbol {
+	out := make([]fileSymbol, 0, 16)
+	containers := make([]symbolContainer, 0, 4)
+	for i, line := range lines {
+		if isCommentLine(line) {
+			continue
 		}
+		indent := lineIndent(line)
+		if m := pyClassRE.FindStringSubmatch(line); len(m) >= 2 {
+			end := indentEndLine(lines, i)
+			containers = append(containers, symbolContainer{m[1], i + 1, end, indent})
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "class",
+				OutlineKind: "class", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := pyDefRE.FindStringSubmatch(line); len(m) >= 2 {
+			parent := enclosingContainer(containers, i+1, indent)
+			kind, outlineKind := "function", "func"
+			qualified := m[1]
+			if parent != "" {
+				kind, outlineKind = "method", "method"
+				qualified = parent + "." + m[1]
+			}
+			end := indentEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: qualified, Kind: kind,
+				OutlineKind: outlineKind, Parent: parent, StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if indent == 0 {
+			if m := pyAssignRE.FindStringSubmatch(line); len(m) >= 2 {
+				out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "variable",
+					StartLine: i + 1, EndLine: i + 1})
+			}
+		}
+	}
+	return out
+}
+
+func scanRustSymbols(lines []string) []fileSymbol {
+	out := make([]fileSymbol, 0, 16)
+	containers := make([]symbolContainer, 0, 4)
+	for i, line := range lines {
+		if isCommentLine(line) {
+			continue
+		}
+		indent := lineIndent(line)
+		if m := rsImplRE.FindStringSubmatch(line); len(m) >= 2 {
+			end := blockEndLine(lines, i)
+			containers = append(containers, symbolContainer{m[1], i + 1, end, indent})
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "type",
+				OutlineKind: "impl", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := rsFnRE.FindStringSubmatch(line); len(m) >= 2 {
+			parent := enclosingContainer(containers, i+1, indent)
+			kind, outlineKind := "function", "fn"
+			qualified := m[1]
+			if parent != "" {
+				kind, outlineKind = "method", "method"
+				qualified = parent + "." + m[1]
+			}
+			end := blockEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: qualified, Kind: kind,
+				OutlineKind: outlineKind, Parent: parent, StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := rsTypeDeclRE.FindStringSubmatch(line); len(m) >= 3 {
+			kind := "type"
+			switch m[1] {
+			case "struct", "union":
+				kind = "struct"
+			case "trait":
+				kind = "interface"
+			}
+			end := blockEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[2], QualifiedName: m[2], Kind: kind,
+				OutlineKind: "type", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := rsModRE.FindStringSubmatch(line); len(m) >= 2 {
+			end := blockEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "module",
+				OutlineKind: "mod", StartLine: i + 1, EndLine: end})
+		}
+	}
+	return out
+}
+
+func scanJavaSymbols(lines []string) []fileSymbol {
+	out := make([]fileSymbol, 0, 16)
+	containers := make([]symbolContainer, 0, 4)
+	for i, line := range lines {
+		if isCommentLine(line) {
+			continue
+		}
+		indent := lineIndent(line)
+		if m := javaTypeDeclRE.FindStringSubmatch(line); len(m) >= 3 {
+			kind := "class"
+			switch m[1] {
+			case "interface":
+				kind = "interface"
+			case "enum", "record":
+				kind = "type"
+			}
+			end := blockEndLine(lines, i)
+			containers = append(containers, symbolContainer{m[2], i + 1, end, indent})
+			out = append(out, fileSymbol{Name: m[2], QualifiedName: m[2], Kind: kind,
+				OutlineKind: "type", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := javaMethodRE.FindStringSubmatch(line); len(m) >= 2 {
+			if parent := enclosingContainer(containers, i+1, indent); parent != "" {
+				end := blockEndLine(lines, i)
+				out = append(out, fileSymbol{Name: m[1], QualifiedName: parent + "." + m[1],
+					Kind: "method", OutlineKind: "method", Parent: parent,
+					StartLine: i + 1, EndLine: end})
+			}
+		}
+	}
+	return out
+}
+
+func scanRubySymbols(lines []string) []fileSymbol {
+	out := make([]fileSymbol, 0, 16)
+	containers := make([]symbolContainer, 0, 4)
+	for i, line := range lines {
+		if isCommentLine(line) {
+			continue
+		}
+		indent := lineIndent(line)
+		if m := rbClassRE.FindStringSubmatch(line); len(m) >= 2 {
+			end := indentEndLine(lines, i)
+			containers = append(containers, symbolContainer{m[1], i + 1, end, indent})
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "class",
+				OutlineKind: "class", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := rbModuleRE.FindStringSubmatch(line); len(m) >= 2 {
+			end := indentEndLine(lines, i)
+			containers = append(containers, symbolContainer{m[1], i + 1, end, indent})
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: m[1], Kind: "module",
+				OutlineKind: "module", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := rbDefRE.FindStringSubmatch(line); len(m) >= 2 {
+			parent := enclosingContainer(containers, i+1, indent)
+			kind, outlineKind := "function", "def"
+			qualified := m[1]
+			if parent != "" {
+				kind, outlineKind = "method", "method"
+				qualified = parent + "." + m[1]
+			}
+			end := indentEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: qualified, Kind: kind,
+				OutlineKind: outlineKind, Parent: parent, StartLine: i + 1, EndLine: end})
+		}
+	}
+	return out
+}
+
+func scanPHPSymbols(lines []string) []fileSymbol {
+	out := make([]fileSymbol, 0, 16)
+	containers := make([]symbolContainer, 0, 4)
+	for i, line := range lines {
+		if isCommentLine(line) {
+			continue
+		}
+		indent := lineIndent(line)
+		if m := phpTypeDeclRE.FindStringSubmatch(line); len(m) >= 3 {
+			kind := "class"
+			switch m[1] {
+			case "interface":
+				kind = "interface"
+			case "trait", "enum":
+				kind = "type"
+			}
+			end := blockEndLine(lines, i)
+			containers = append(containers, symbolContainer{m[2], i + 1, end, indent})
+			out = append(out, fileSymbol{Name: m[2], QualifiedName: m[2], Kind: kind,
+				OutlineKind: "type", StartLine: i + 1, EndLine: end})
+			continue
+		}
+		if m := phpFuncRE.FindStringSubmatch(line); len(m) >= 2 {
+			parent := enclosingContainer(containers, i+1, indent)
+			kind, outlineKind := "function", "func"
+			qualified := m[1]
+			if parent != "" {
+				kind, outlineKind = "method", "method"
+				qualified = parent + "." + m[1]
+			}
+			end := blockEndLine(lines, i)
+			out = append(out, fileSymbol{Name: m[1], QualifiedName: qualified, Kind: kind,
+				OutlineKind: outlineKind, Parent: parent, StartLine: i + 1, EndLine: end})
+		}
+	}
+	return out
+}
+
+func scanHTMLSymbols(data []byte) []fileSymbol {
+	out := make([]fileSymbol, 0, 8)
+	for i, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSuffix(raw, "\r")
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -510,16 +687,149 @@ func scanHTMLOutline(data []byte) []outlineSymbol {
 		if m := htmlHeadingRE.FindStringSubmatch(line); len(m) >= 2 {
 			name := strings.Join(strings.Fields(htmlTagRE.ReplaceAllString(m[1], " ")), " ")
 			if name != "" {
-				out = append(out, outlineSymbol{Line: i + 1, Kind: "heading", Name: clipOutlineName(name)})
+				out = append(out, fileSymbol{Name: clipOutlineName(name), QualifiedName: clipOutlineName(name),
+					Kind: "heading", OutlineKind: "heading", StartLine: i + 1, EndLine: i + 1})
 				continue
 			}
 		}
 		if m := htmlIDRE.FindStringSubmatch(line); len(m) >= 3 {
-			out = append(out, outlineSymbol{Line: i + 1, Kind: "id",
-				Name: clipOutlineName(strings.ToLower(m[1]) + "#" + m[2])})
+			name := clipOutlineName(strings.ToLower(m[1]) + "#" + m[2])
+			out = append(out, fileSymbol{Name: name, QualifiedName: name,
+				Kind: "id", OutlineKind: "id", StartLine: i + 1, EndLine: i + 1})
 		}
 	}
 	return out
+}
+
+func sourceLines(data []byte) []string {
+	lines := strings.Split(string(data), "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], "\r")
+	}
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func isCommentLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed == "" ||
+		strings.HasPrefix(trimmed, "//") ||
+		strings.HasPrefix(trimmed, "/*") ||
+		strings.HasPrefix(trimmed, "*") ||
+		strings.HasPrefix(trimmed, "#")
+}
+
+func lineIndent(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " \t"))
+}
+
+func enclosingContainer(containers []symbolContainer, line, indent int) string {
+	for i := len(containers) - 1; i >= 0; i-- {
+		c := containers[i]
+		if c.Start < line && line <= c.End && c.Indent < indent {
+			return c.Name
+		}
+	}
+	return ""
+}
+
+// blockEndLine finds the closing line of a brace-delimited declaration. It
+// tolerates multi-line signatures and ignores braces inside comments/strings.
+func blockEndLine(lines []string, start int) int {
+	if start < 0 || start >= len(lines) {
+		return start + 1
+	}
+	var counter braceCounter
+	depth := 0
+	opened := false
+	for i := start; i < len(lines); i++ {
+		delta, sawOpen := counter.count(lines[i])
+		depth += delta
+		opened = opened || sawOpen
+		if opened && depth <= 0 {
+			return i + 1
+		}
+		if !opened && strings.Contains(lines[i], ";") {
+			return i + 1
+		}
+	}
+	if opened {
+		return len(lines)
+	}
+	return start + 1
+}
+
+// indentEndLine finds the last line of an indentation-delimited block.
+func indentEndLine(lines []string, start int) int {
+	if start < 0 || start >= len(lines) {
+		return start + 1
+	}
+	indent := lineIndent(lines[start])
+	last := start
+	for i := start + 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if lineIndent(line) <= indent {
+			break
+		}
+		last = i
+	}
+	return last + 1
+}
+
+type braceCounter struct {
+	blockComment bool
+	quote        byte
+	escaped      bool
+}
+
+func (c *braceCounter) count(line string) (delta int, opened bool) {
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if c.blockComment {
+			if ch == '*' && i+1 < len(line) && line[i+1] == '/' {
+				c.blockComment = false
+				i++
+			}
+			continue
+		}
+		if c.quote != 0 {
+			if c.escaped {
+				c.escaped = false
+				continue
+			}
+			if ch == '\\' {
+				c.escaped = true
+				continue
+			}
+			if ch == c.quote {
+				c.quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '/':
+			if i+1 < len(line) && line[i+1] == '/' {
+				return delta, opened
+			}
+			if i+1 < len(line) && line[i+1] == '*' {
+				c.blockComment = true
+				i++
+			}
+		case '\'', '"', '`':
+			c.quote = ch
+		case '{':
+			delta++
+			opened = true
+		case '}':
+			delta--
+		}
+	}
+	return delta, opened
 }
 
 func formatOutlineSymbols(symbols []outlineSymbol) string {

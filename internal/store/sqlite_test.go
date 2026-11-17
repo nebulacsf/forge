@@ -115,6 +115,80 @@ func TestRepoOutlineSync(t *testing.T) {
 	}
 }
 
+func TestProjectSymbolsSyncAndSearch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	project, err := st.CreateProject("Symbols", "/tmp/symbol-project", "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []ProjectSymbolFile{
+		{ProjectID: project.ID, FilePath: "main.go", Language: "go", MTimeNS: 10, SizeBytes: 100},
+		{ProjectID: project.ID, FilePath: "web/app.js", Language: "js", MTimeNS: 20, SizeBytes: 200},
+	}
+	symbols := []ProjectSymbol{
+		{ProjectID: project.ID, FilePath: "main.go", Name: "User", QualifiedName: "User", Kind: "struct", StartLine: 3, EndLine: 5},
+		{ProjectID: project.ID, FilePath: "main.go", Name: "Save", QualifiedName: "User.Save", Kind: "method", Parent: "User", StartLine: 7, EndLine: 9},
+		{ProjectID: project.ID, FilePath: "web/app.js", Name: "renderMarkdownInto", QualifiedName: "renderMarkdownInto", Kind: "function", StartLine: 1, EndLine: 8},
+		{ProjectID: project.ID, FilePath: "web/app.js", Name: "Widget", QualifiedName: "Widget", Kind: "class", StartLine: 10, EndLine: 20},
+	}
+	if err := st.SyncProjectSymbols(project.ID, files, symbols, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ListProjectSymbolFiles(project.ID)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("files = %+v, %v", got, err)
+	}
+	if got["main.go"].MTimeNS != 10 || got["web/app.js"].SizeBytes != 200 {
+		t.Fatalf("unexpected file metadata: %+v", got)
+	}
+
+	matches, err := st.SearchProjectSymbols(project.ID, "save", []string{"method"}, 50)
+	if err != nil || len(matches) != 1 || matches[0].QualifiedName != "User.Save" {
+		t.Fatalf("method matches = %+v, %v", matches, err)
+	}
+	matches, err = st.SearchProjectSymbols(project.ID, "widget", []string{"struct", "class"}, 50)
+	if err != nil || len(matches) != 1 || matches[0].Kind != "class" {
+		t.Fatalf("struct matches = %+v, %v", matches, err)
+	}
+	matches, err = st.SearchProjectSymbols(project.ID, "RENDER", nil, 50)
+	if err != nil || len(matches) != 1 || matches[0].Name != "renderMarkdownInto" {
+		t.Fatalf("case-insensitive matches = %+v, %v", matches, err)
+	}
+
+	// Replacing a file removes its old symbols; deleting removes the file row.
+	update := []ProjectSymbolFile{
+		{ProjectID: project.ID, FilePath: "main.go", Language: "go", MTimeNS: 11, SizeBytes: 120},
+	}
+	replacement := []ProjectSymbol{
+		{ProjectID: project.ID, FilePath: "main.go", Name: "User", QualifiedName: "User", Kind: "struct", StartLine: 4, EndLine: 6},
+	}
+	if err := st.SyncProjectSymbols(project.ID, update, replacement, nil); err != nil {
+		t.Fatal(err)
+	}
+	if matches, err = st.SearchProjectSymbols(project.ID, "Save", nil, 50); err != nil || len(matches) != 0 {
+		t.Fatalf("stale method survived sync: %+v, %v", matches, err)
+	}
+	if err := st.SyncProjectSymbols(project.ID, nil, nil, []string{"main.go"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.ListProjectSymbolFiles(project.ID)
+	if err != nil || len(got) != 1 || got["main.go"].FilePath != "" {
+		t.Fatalf("deleted file still present: %+v, %v", got, err)
+	}
+	if err := st.DeleteProjectSymbols(project.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = st.ListProjectSymbolFiles(project.ID); err != nil || len(got) != 0 {
+		t.Fatalf("files after delete = %+v, %v", got, err)
+	}
+}
+
 func TestOpenMovesIncompatibleLegacyDatabase(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "forge.db")

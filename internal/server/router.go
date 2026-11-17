@@ -493,12 +493,12 @@ func (s *Server) warmRepoOutline(project store.Project) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	started := time.Now()
-	outline, err := tools.EnsureRepoOutline(ctx, s.store, project.Path)
+	outline, err := tools.EnsureProjectIndex(ctx, s.store, project.ID, project.Path)
 	if err != nil {
-		logx.Warn("repo outline warmup failed", "project", project.ID, "error", err)
+		logx.Warn("project index warmup failed", "project", project.ID, "error", err)
 		return
 	}
-	logx.Debug("repo outline warmed", "project", project.ID,
+	logx.Debug("project index warmed", "project", project.ID,
 		"chars", len(outline), "duration", time.Since(started).Round(time.Millisecond).String())
 }
 

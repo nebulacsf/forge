@@ -448,6 +448,12 @@ func digestTarget(name string, args map[string]any) string {
 			target += " glob " + clipRunes(glob, 40)
 		}
 		return target
+	case "symbol_lookup":
+		target := clipRunes(argString(args, "query"), 80)
+		if kind := argString(args, "kind"); kind != "" {
+			target += " [" + kind + "]"
+		}
+		return target
 	case "list_directory":
 		if path == "" {
 			return "."

@@ -32,7 +32,7 @@ Configured host/port are used when the flags are omitted.
 | Path | Purpose |
 | --- | --- |
 | `${FORGE_HOME:-~/.forge}/config.json` | Configuration (created on first run) |
-| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists, repo outlines) |
+| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists, repo outline, symbol index) |
 | `${FORGE_HOME:-~/.forge}/forge.log` | Application log (rotated to `forge.log.1` at 10 MB) |
 
 Both the directory (0700) and the files are created automatically. `FORGE_HOME`
@@ -54,7 +54,7 @@ Sessions are stored per project; open tabs are restored after a reload.
 
 | Mode | Tools |
 | --- | --- |
-| **PLAN** (read-only) | `read_file`, `grep_search`, `list_directory`, `git_diff`, `update_checklist` |
+| **PLAN** (read-only) | `read_file`, `grep_search`, `symbol_lookup`, `list_directory`, `git_diff`, `update_checklist` |
 | **BUILD** | all of the above, plus `patch_file`, `write_file`, `bash` |
 
 At the start of a new task the agent records it in the checklist before reading
@@ -73,8 +73,10 @@ checkpoint/auto-continue behavior.
 
 ### Token-saving behavior
 
-- **Grep first.** The system prompt requires the agent to locate a target with
-  `grep_search` or the repository outline before calling `read_file`.
+- **Symbol first.** When the agent knows a declaration name, `symbol_lookup`
+  returns only the symbol kind, file, and line range (never the body), so it can
+  jump straight to the right window. Otherwise it uses `grep_search` or the
+  repository outline before calling `read_file`.
 - **Bounded reads.** `read_file` requires explicit `start_line` and `end_line`
   and returns at most **200 lines** per call. Larger requests are capped and
   report the requested vs. returned range.
@@ -83,8 +85,9 @@ checkpoint/auto-continue behavior.
 - **Local repo map.** Forge scans the project with Go's AST (and fast regex
   scanners for other languages), caches symbols and line numbers in SQLite, and
   injects a compact outline (~300–500 tokens) into the system prompt. No LLM
-  calls are used to build it. The cache refreshes when files change and when a
-  project is opened.
+  calls are used to build it. The same scan feeds a queryable `project_symbols`
+  table with exact start/end ranges for `symbol_lookup`. The cache refreshes
+  when files change and when a project is opened.
 
 In PLAN mode a completed turn ends with a **Plan ready — Switch to BUILD** card
 so it is always clear that files cannot change until you switch modes. The plan

@@ -131,18 +131,19 @@ six-call window and:
 
 | Tool | PLAN | BUILD |
 |------|:----:|:-----:|
-| read_file, grep_search, list_directory, git_diff, update_checklist | ✅ | ✅ |
+| read_file, grep_search, symbol_lookup, list_directory, git_diff, update_checklist | ✅ | ✅ |
 | patch_file, write_file, bash | ❌ | ✅ |
 
 **Bounded reads:** `read_file` requires `start_line` and `end_line`; at most 200
 lines are returned, each prefixed with its real line number (`142 | code`).
 Requests above the cap are truncated and report the requested vs. returned
-range. The agent is instructed to use the repo outline or `grep_search` before
-reading.
+range. The agent is instructed to use `symbol_lookup` for known declarations,
+the repo outline, or `grep_search` before reading.
 
 ### Repository Map (`tools/scanner.go`)
 Forge builds a zero-AI outline of the project and stores one row per file in
-`repo_outline`:
+`repo_outline`. The same scan also feeds `project_symbols`, a queryable table
+with one row per declaration and exact start/end lines for `symbol_lookup`:
 
 - `.go` files: `go/parser` + `go/ast` (`SkipObjectResolution`) for package,
   structs, interfaces, types, functions, and methods with declaration lines.
@@ -153,6 +154,9 @@ Forge builds a zero-AI outline of the project and stores one row per file in
 - The rendered outline is capped at ~2,000 runes (~450–500 tokens). It is
   refreshed on project creation and on each chat turn; `write_file`/`patch_file`
   refresh just the affected file.
+- `project_symbols` stores the complete symbol set (not capped at 32) with
+  `start_line`–`end_line`, kind, and parent. `symbol_lookup` checks mtime/size
+  before each query and reparses only changed files, so line ranges never drift.
 - The outline and checklist are **not** part of the system prompt. They are
   injected in a trailing ephemeral user message (see 3.2) so the system prompt
   stays byte-stable and cacheable.

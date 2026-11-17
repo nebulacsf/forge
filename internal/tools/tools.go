@@ -65,6 +65,7 @@ type Manager struct {
 	MaxRead     int
 	BashTimeout time.Duration
 	Store       *store.Store
+	ProjectID   int64
 	SessionID   int64
 	Mode        string
 }
@@ -97,6 +98,7 @@ var (
 	readOnlyTools = map[string]bool{
 		"read_file":        true,
 		"grep_search":      true,
+		"symbol_lookup":    true,
 		"list_directory":   true,
 		"git_diff":         true,
 		"update_checklist": true,
@@ -161,6 +163,19 @@ func Specs(mode string) []llm.Tool {
 					"case_sensitive": booleanProp("Match case-sensitively (default false)."),
 					"max_results":    integerProp("Maximum matches to return (default 100, max 500)."),
 				}, "pattern"),
+			},
+		},
+		{
+			Type: "function",
+			Function: llm.ToolFunctionSpec{
+				Name: "symbol_lookup",
+				Description: "Find function, method, struct/class, and variable declarations by partial name. " +
+					"Returns only the symbol name, kind, file path, and line range; never file contents. " +
+					"Prefer this over grep_search or read_file when you already know the symbol name.",
+				Parameters: objectSchema(map[string]any{
+					"query": stringProp("Symbol name or partial match, e.g. renderMarkdownInto."),
+					"kind":  enumProp("Optional declaration kind filter.", "function", "struct", "method", "variable"),
+				}, "query"),
 			},
 		},
 		{
@@ -283,6 +298,15 @@ func (m *Manager) Execute(ctx context.Context, name string, rawArgs json.RawMess
 			return fail("invalid arguments: " + err.Error())
 		}
 		return m.grepSearch(ctx, a.Pattern, a.Path, a.Glob, a.CaseSensitive, a.MaxResults)
+	case "symbol_lookup":
+		var a struct {
+			Query string `json:"query"`
+			Kind  string `json:"kind"`
+		}
+		if err := json.Unmarshal(rawArgs, &a); err != nil {
+			return fail("invalid arguments: " + err.Error())
+		}
+		return m.symbolLookup(ctx, a.Query, a.Kind)
 	case "list_directory":
 		var a struct {
 			Path          string `json:"path"`
@@ -967,6 +991,9 @@ func (m *Manager) refreshOutline(rel string) {
 	}
 	if err := RefreshOutlineFile(m.Store, m.Root, rel); err != nil {
 		logx.Debug("repo outline refresh failed", "file", rel, "error", err)
+	}
+	if err := RefreshSymbolFile(m.Store, m.ProjectID, m.Root, rel); err != nil {
+		logx.Debug("symbol index refresh failed", "file", rel, "error", err)
 	}
 }
 

@@ -73,6 +73,31 @@ type RepoOutlineFile struct {
 	UpdatedAt   string `json:"updated_at"`
 }
 
+// ProjectSymbolFile is the per-file freshness marker for the queryable symbol
+// index. It exists separately from ProjectSymbol so files with zero symbols are
+// still tracked and deletions can be detected.
+type ProjectSymbolFile struct {
+	ProjectID int64  `json:"project_id"`
+	FilePath  string `json:"file_path"`
+	Language  string `json:"language"`
+	MTimeNS   int64  `json:"mtime_ns"`
+	SizeBytes int64  `json:"size_bytes"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// ProjectSymbol is one declaration stored for symbol_lookup. It deliberately
+// carries no source text: only the metadata needed to navigate to the code.
+type ProjectSymbol struct {
+	ProjectID     int64  `json:"project_id"`
+	FilePath      string `json:"file_path"`
+	Name          string `json:"name"`
+	QualifiedName string `json:"qualified_name"`
+	Kind          string `json:"kind"`
+	Parent        string `json:"parent"`
+	StartLine     int    `json:"start_line"`
+	EndLine       int    `json:"end_line"`
+}
+
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
@@ -244,9 +269,33 @@ CREATE TABLE IF NOT EXISTS repo_outline (
 	PRIMARY KEY (project_path, file_path)
 );
 
+CREATE TABLE IF NOT EXISTS project_symbol_files (
+	project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	file_path  TEXT NOT NULL,
+	language   TEXT NOT NULL DEFAULT '',
+	mtime_ns   INTEGER NOT NULL DEFAULT 0,
+	size_bytes INTEGER NOT NULL DEFAULT 0,
+	updated_at TEXT NOT NULL,
+	PRIMARY KEY (project_id, file_path)
+);
+
+CREATE TABLE IF NOT EXISTS project_symbols (
+	project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	file_path      TEXT NOT NULL,
+	name           TEXT NOT NULL,
+	qualified_name TEXT NOT NULL DEFAULT '',
+	kind           TEXT NOT NULL,
+	parent         TEXT NOT NULL DEFAULT '',
+	start_line     INTEGER NOT NULL,
+	end_line       INTEGER NOT NULL,
+	PRIMARY KEY (project_id, file_path, start_line, name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, is_open, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_checklists_session ON checklists(session_id, position, id);
+CREATE INDEX IF NOT EXISTS idx_project_symbols_name ON project_symbols(project_id, name);
+CREATE INDEX IF NOT EXISTS idx_project_symbols_kind ON project_symbols(project_id, kind, name);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize schema: %w", err)
@@ -426,6 +475,7 @@ func (s *Store) UpdateProject(id int64, name, path, color *string) (Project, err
 	}
 	if movedFrom != "" {
 		_ = s.DeleteRepoOutline(movedFrom)
+		_ = s.DeleteProjectSymbols(id)
 	}
 	return s.GetProject(id)
 }
@@ -449,6 +499,7 @@ func (s *Store) DeleteProject(id int64) error {
 		return ErrNotFound
 	}
 	_ = s.DeleteRepoOutline(path)
+	_ = s.DeleteProjectSymbols(id)
 	return nil
 }
 
@@ -891,4 +942,177 @@ func (s *Store) SyncRepoOutline(projectPath string, upserts []RepoOutlineFile, d
 func (s *Store) DeleteRepoOutline(projectPath string) error {
 	_, err := s.db.Exec(`DELETE FROM repo_outline WHERE project_path = ?`, projectPath)
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Queryable symbol index
+
+// ListProjectSymbolFiles returns the freshness markers for a project keyed by
+// relative file path.
+func (s *Store) ListProjectSymbolFiles(projectID int64) (map[string]ProjectSymbolFile, error) {
+	rows, err := s.db.Query(`
+		SELECT project_id, file_path, language, mtime_ns, size_bytes, updated_at
+		FROM project_symbol_files WHERE project_id = ?`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]ProjectSymbolFile)
+	for rows.Next() {
+		var f ProjectSymbolFile
+		if err := rows.Scan(&f.ProjectID, &f.FilePath, &f.Language, &f.MTimeNS,
+			&f.SizeBytes, &f.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out[f.FilePath] = f
+	}
+	return out, rows.Err()
+}
+
+// SyncProjectSymbols applies file freshness updates and symbol replacements in
+// one transaction. Every file in files has its old symbols replaced by the rows
+// in symbols that belong to it; deleted files are removed entirely.
+func (s *Store) SyncProjectSymbols(projectID int64, files []ProjectSymbolFile, symbols []ProjectSymbol, deleted []string) error {
+	if len(files) == 0 && len(symbols) == 0 && len(deleted) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	changed := make(map[string]bool, len(files)+len(symbols)+len(deleted))
+	for _, f := range files {
+		changed[f.FilePath] = true
+	}
+	for _, sym := range symbols {
+		changed[sym.FilePath] = true
+	}
+	for _, file := range deleted {
+		changed[file] = true
+	}
+	for file := range changed {
+		if _, err := tx.Exec(`DELETE FROM project_symbols WHERE project_id = ? AND file_path = ?`,
+			projectID, file); err != nil {
+			return err
+		}
+	}
+
+	ts := now()
+	for _, file := range deleted {
+		if _, err := tx.Exec(`DELETE FROM project_symbol_files WHERE project_id = ? AND file_path = ?`,
+			projectID, file); err != nil {
+			return err
+		}
+	}
+	for _, f := range files {
+		updated := f.UpdatedAt
+		if updated == "" {
+			updated = ts
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO project_symbol_files
+				(project_id, file_path, language, mtime_ns, size_bytes, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(project_id, file_path) DO UPDATE SET
+				language = excluded.language,
+				mtime_ns = excluded.mtime_ns,
+				size_bytes = excluded.size_bytes,
+				updated_at = excluded.updated_at`,
+			projectID, f.FilePath, f.Language, f.MTimeNS, f.SizeBytes, updated); err != nil {
+			return err
+		}
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO project_symbols
+			(project_id, file_path, name, qualified_name, kind, parent, start_line, end_line)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, file_path, start_line, name) DO UPDATE SET
+			qualified_name = excluded.qualified_name,
+			kind = excluded.kind,
+			parent = excluded.parent,
+			end_line = excluded.end_line`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, sym := range symbols {
+		if _, err := stmt.Exec(projectID, sym.FilePath, sym.Name, sym.QualifiedName,
+			sym.Kind, sym.Parent, sym.StartLine, sym.EndLine); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SearchProjectSymbols returns declarations whose name or qualified name
+// contains query (case-insensitive), optionally restricted to a set of kinds.
+func (s *Store) SearchProjectSymbols(projectID int64, query string, kinds []string, limit int) ([]ProjectSymbol, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	sqlText := `
+		SELECT project_id, file_path, name, qualified_name, kind, parent, start_line, end_line
+		FROM project_symbols
+		WHERE project_id = ?
+		  AND (instr(lower(name), lower(?)) > 0 OR instr(lower(qualified_name), lower(?)) > 0)`
+	args := []any{projectID, query, query}
+	if len(kinds) > 0 {
+		sqlText += ` AND kind IN (` + placeholders(len(kinds)) + `)`
+		for _, kind := range kinds {
+			args = append(args, kind)
+		}
+	}
+	sqlText += `
+		ORDER BY CASE
+			WHEN lower(name) = lower(?) OR lower(qualified_name) = lower(?) THEN 0
+			WHEN instr(lower(name), lower(?)) = 1 OR instr(lower(qualified_name), lower(?)) = 1 THEN 1
+			ELSE 2
+		END, name ASC, file_path ASC, start_line ASC`
+	args = append(args, query, query, query, query)
+	if limit > 0 {
+		sqlText += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(sqlText, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ProjectSymbol{}
+	for rows.Next() {
+		var sym ProjectSymbol
+		if err := rows.Scan(&sym.ProjectID, &sym.FilePath, &sym.Name, &sym.QualifiedName,
+			&sym.Kind, &sym.Parent, &sym.StartLine, &sym.EndLine); err != nil {
+			return nil, err
+		}
+		out = append(out, sym)
+	}
+	return out, rows.Err()
+}
+
+// DeleteProjectSymbols removes every indexed file and symbol for a project.
+func (s *Store) DeleteProjectSymbols(projectID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM project_symbols WHERE project_id = ?`, projectID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM project_symbol_files WHERE project_id = ?`, projectID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }

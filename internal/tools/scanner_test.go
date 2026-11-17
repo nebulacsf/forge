@@ -93,6 +93,100 @@ def boot():
 	}
 }
 
+func TestScanFileSymbolRanges(t *testing.T) {
+	goSrc := `package demo
+
+type User struct {
+	Name string
+}
+
+func New() *User {
+	return &User{}
+}
+
+func (u *User) Save() error {
+	return nil
+}
+
+var Global = 1
+const Version = "1"
+`
+	goSyms := scanFileSymbols("go", "demo.go", []byte(goSrc))
+	wantGo := map[string][3]any{
+		"User":      {"struct", 3, 5},
+		"New":       {"function", 7, 9},
+		"User.Save": {"method", 11, 13},
+		"Global":    {"variable", 15, 15},
+		"Version":   {"constant", 16, 16},
+	}
+	for _, sym := range goSyms {
+		if want, ok := wantGo[sym.QualifiedName]; ok {
+			if sym.Kind != want[0] || sym.StartLine != want[1] || sym.EndLine != want[2] {
+				t.Errorf("%s = %+v, want %+v", sym.QualifiedName, sym, want)
+			}
+			delete(wantGo, sym.QualifiedName)
+		}
+	}
+	if len(wantGo) != 0 {
+		t.Errorf("missing Go symbols: %+v (got %+v)", wantGo, goSyms)
+	}
+
+	jsSrc := `function boot() {
+  return 1;
+}
+
+class Widget {
+  render(id) {
+    if (id) {
+      return id;
+    }
+  }
+}
+`
+	jsSyms := scanFileSymbols("js", "app.js", []byte(jsSrc))
+	wantJS := map[string][3]any{
+		"boot":          {"function", 1, 3},
+		"Widget":        {"class", 5, 11},
+		"Widget.render": {"method", 6, 10},
+	}
+	for _, sym := range jsSyms {
+		if want, ok := wantJS[sym.QualifiedName]; ok {
+			if sym.Kind != want[0] || sym.StartLine != want[1] || sym.EndLine != want[2] {
+				t.Errorf("%s = %+v, want %+v", sym.QualifiedName, sym, want)
+			}
+			delete(wantJS, sym.QualifiedName)
+		}
+	}
+	if len(wantJS) != 0 {
+		t.Errorf("missing JS symbols: %+v (got %+v)", wantJS, jsSyms)
+	}
+
+	pySrc := `class Widget:
+    def render(self):
+        pass
+
+def boot():
+    pass
+`
+	pySyms := scanFileSymbols("py", "app.py", []byte(pySrc))
+	wantPy := map[string][3]any{
+		"Widget":        {"class", 1, 3},
+		"Widget.render": {"method", 2, 3},
+		"boot":          {"function", 5, 6},
+	}
+	for _, sym := range pySyms {
+		if want, ok := wantPy[sym.QualifiedName]; ok {
+			if sym.Kind != want[0] || sym.StartLine != want[1] || sym.EndLine != want[2] {
+				t.Errorf("%s = %+v, want %+v", sym.QualifiedName, sym, want)
+			}
+			delete(wantPy, sym.QualifiedName)
+		}
+	}
+	if len(wantPy) != 0 {
+		t.Errorf("missing Python symbols: %+v (got %+v)", wantPy, pySyms)
+	}
+}
+
 func TestRenderRepoOutlineBudget(t *testing.T) {
 	rows := make([]store.RepoOutlineFile, 0, 300)
 	for i := 0; i < 300; i++ {

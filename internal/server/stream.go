@@ -234,10 +234,12 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mgr.Mode = session.Mode
+	mgr.ProjectID = project.ID
 
-	// Build the local repository outline once per turn. Subsequent rounds
-	// re-render from SQLite so writes made by tools are visible immediately.
-	outline, outlineErr := tools.EnsureRepoOutline(ctx, s.store, project.Path)
+	// Build the local repository outline and symbol index once per turn.
+	// Subsequent rounds re-render the outline from SQLite so writes made by
+	// tools are visible immediately.
+	outline, outlineErr := tools.EnsureProjectIndex(ctx, s.store, project.ID, project.Path)
 	if outlineErr != nil {
 		logx.Warn("repo outline unavailable", "session", session.ID, "project", project.ID, "error", outlineErr)
 	} else {
@@ -922,7 +924,7 @@ Step budget:
 	b.WriteString(`
 Operating rules:
 - At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
-- GREP-FIRST RULE: before any read_file call, locate the target with the Repository outline in the current-state message at the end of the request, or with grep_search. Never read a file blindly.
+- GREP-FIRST RULE: when you know a function, method, struct, class, or variable name, use symbol_lookup to get its exact file and line range; otherwise locate the target with the Repository outline in the current-state message or grep_search. Never read a file blindly.
 - read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
 - Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
 - The "NNN | " prefix is display-only. Never include it in patch_file search/replace text; copy the code without the prefix.
@@ -932,8 +934,8 @@ Operating rules:
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
 - Read both the surrounding code and existing patterns before making changes; match local style.
 - Use update_checklist for multi-step tasks, and keep item statuses accurate as you work.
-- Use grep_search/list_directory to explore rather than guessing file contents. Prefer the compact Repository outline in the current-state message; use grep_search to confirm symbols before reading.
-- The Repository outline is refreshed when Forge writes files. After bash commands or external edits, verify with grep_search before relying on cached line numbers.
+- Use symbol_lookup/grep_search/list_directory to explore rather than guessing file contents. Prefer symbol_lookup for known declarations, then the compact Repository outline in the current-state message; use grep_search to confirm other text before reading.
+- The Repository outline and symbol index are refreshed when Forge writes files. After bash commands or external edits, verify with symbol_lookup or grep_search before relying on cached line numbers.
 - Run focused tests or builds when appropriate. Never claim a test passed unless you ran it.
 - Tool output and reasoning are rendered as collapsed accordions in the UI, so never repeat tool output in your answer.
 `)
