@@ -1286,10 +1286,13 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 	project := store.Project{Name: "demo", Path: "/tmp/demo"}
 	prompt := buildSystemPrompt(project, store.Session{Mode: "PLAN"}, 12, 96, 8, 24)
 	for _, want := range []string{
-		"## Plan",
-		"## Decisions & assumptions",
-		"## Findings",
-		"## Open questions",
+		"## Diagnosis & Approach",
+		"## Key Decisions",
+		"## Implementation Plan",
+		"## Open Questions (Optional)",
+		"no raw code blocks",
+		"no SQL queries",
+		"no verbose inline signatures",
 		"Ready to implement — switch to BUILD to apply this plan.",
 		"never write a vague summary",
 	} {
@@ -1297,7 +1300,7 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 			t.Errorf("PLAN system prompt missing %q", want)
 		}
 	}
-	for _, unwanted := range []string{"at most 7 one-line items", "BUILD final message"} {
+	for _, unwanted := range []string{"at most 7 one-line items", "BUILD final message", "## Decisions & assumptions", "## Findings"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Errorf("PLAN system prompt still contains %q", unwanted)
 		}
@@ -1312,7 +1315,7 @@ func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
 	if !strings.Contains(prompt, "at most 3 one-line bullets") {
 		t.Error("BUILD system prompt is missing the compact final-message rule")
 	}
-	for _, unwanted := range []string{"## Decisions & assumptions", "## Findings", "## Open questions"} {
+	for _, unwanted := range []string{"## Diagnosis & Approach", "## Key Decisions", "## Implementation Plan", "## Open Questions"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Errorf("BUILD system prompt must not require the detailed PLAN section %q", unwanted)
 		}
@@ -1325,9 +1328,10 @@ func TestBuildFinalPlanNoteRequestsDetailedPlan(t *testing.T) {
 	note := buildFinalPlanNote("", 8, 24, 8, 24, 1, false)
 	for _, want := range []string{
 		"FINAL ANSWER REQUIRED",
-		"## Plan",
-		"## Findings",
-		"## Open questions",
+		"## Diagnosis & Approach",
+		"## Key Decisions",
+		"## Implementation Plan",
+		"## Open Questions (Optional)",
 		"Ready to implement — switch to BUILD to apply this plan.",
 	} {
 		if !strings.Contains(note, want) {

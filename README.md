@@ -87,7 +87,11 @@ checkpoint/auto-continue behavior.
   project is opened.
 
 In PLAN mode a completed turn ends with a **Plan ready — Switch to BUILD** card
-so it is always clear that files cannot change until you switch modes. If a
+so it is always clear that files cannot change until you switch modes. The plan
+itself is a review document, not an implementation: it uses fixed sections
+(**Diagnosis & Approach**, **Key Decisions**, **Implementation Plan** grouped by
+file path, optional **Open Questions**) and never contains raw code blocks, SQL,
+or verbose inline signatures. If a
 model returns only reasoning and no final answer, Forge expands the reasoning
 card and warns you instead of leaving an apparently empty turn.
 

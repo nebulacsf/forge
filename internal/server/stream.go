@@ -874,7 +874,7 @@ func buildSystemPrompt(project store.Project, session store.Session, segmentSize
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
 	if session.Mode == "PLAN" {
 		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
-		b.WriteString("When you have enough information, finish with a detailed plan: the exact changes needed, the evidence that justifies them, and the open questions. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
+		b.WriteString("When you have enough information, finish with a plan structured for human architectural review: the diagnosis, the key decisions, and the per-file implementation plan. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
 	} else {
 		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them.\n")
 	}
@@ -928,17 +928,19 @@ Response style (strict):
 - No preamble, no praise, no restating code, no long explanations.
 `)
 	if session.Mode == "PLAN" {
-		b.WriteString(`- PLAN final message: Markdown text only, no tool-call syntax. It is the deliverable, so it must be detailed enough to implement without re-reading the code. Use exactly these sections, in this order:
-  ## Plan
-  1. **path/to/file.go:120-148** — symbol/function: the exact change to make and why. One item per change, at most 8 items. Never collapse two files into one item.
-  ## Decisions & assumptions
-  - One line per decision or assumption that shaped the plan (why this file, why this approach, what was assumed).
-  ## Findings
-  - One line per relevant file or symbol, with the line range that justifies the plan (the evidence you gathered).
-  ## Open questions
-  - One short line per remaining doubt, or "None." when nothing is uncertain.
+		b.WriteString(`- PLAN final message: Markdown text only, no tool-call syntax. It is a document for human architectural review before execution, not an implementation, so it is structured and short rather than exhaustive. Write no raw code blocks, no SQL queries, and no verbose inline signatures: name the change in prose and cite line numbers only as anchors. Use exactly these sections, in this order:
+  ## Diagnosis & Approach
+  A concise 2-4 sentence summary explaining the root problem or current limitation in the codebase and the high-level architectural strategy to solve it.
+  ## Key Decisions
+  - Short, punchy bullet points explaining important trade-offs, edge cases handled, and why existing patterns are reused or avoided.
+  ## Implementation Plan
+  Group changes strictly by file path. Keep each item to 1-2 clear sentences describing what changes and why, referencing line numbers only as anchors:
+  - **path/to/file.go (lines X-Y)**: Brief description of the structural change or new functions to add.
+  - **path/to/new_file.go (new)**: Brief description of the module's responsibility.
+  ## Open Questions (Optional)
+  Include only if there is a genuine ambiguity or architectural choice requiring user confirmation before switching to BUILD.
   Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
-  Rules: never repeat raw tool output or file dumps; never write a vague summary ("update the UI", "improve the prompt") — always name the file, the line range, the symbol, and the concrete change.
+  Rules: never repeat raw tool output or file dumps; never write a vague summary ("update the UI", "improve the prompt") — always name the file, the line range, and the concrete change.
 `)
 	} else {
 		b.WriteString("- BUILD final message: the most compact possible output — at most 3 one-line bullets (about 12 words each): (1) what changed, with file paths; (2) what you verified; (3) blockers or next step. No headings, no sections, no explanations, no unrequested code.\n")
@@ -993,12 +995,13 @@ func buildFinalPlanNote(reason string, planRounds, planToolCalls, usedRounds, us
 	if attempt > 1 {
 		b.WriteString("Your previous final response was not a usable plan (empty, reasoning-only, or a tool call written as text). This time write the plan in Markdown only.\n")
 	}
-	b.WriteString(`Write the final answer now, in normal response content, with the full PLAN deliverable:
-- "## Plan": numbered items, each one "**path/to/file.go:120-148** — symbol: exact change and why" (at most 8 items).
-- "## Decisions & assumptions": one line per decision or assumption.
-- "## Findings": one line per relevant file or symbol with the justifying line range (evidence only, never raw tool output).
-- "## Open questions": one short line per remaining doubt, or "None.".
+	b.WriteString(`Write the final answer now, in normal response content, with the full PLAN deliverable, structured for human architectural review:
+- "## Diagnosis & Approach": 2-4 sentences on the root problem and the high-level strategy.
+- "## Key Decisions": short bullets on trade-offs, edge cases, and patterns reused or avoided.
+- "## Implementation Plan": items grouped strictly by file path, each 1-2 sentences on what changes and why, citing line numbers only as anchors, e.g. "- **path/to/file.go (lines X-Y)**: change." and "- **path/to/new_file.go (new)**: responsibility.".
+- "## Open Questions (Optional)": only genuine ambiguities needing user confirmation before BUILD.
 - Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
+No raw code blocks, no SQL queries, no verbose inline signatures, no raw tool output.
 Do not try to research further; if something is missing, state the assumption instead.`)
 	return b.String()
 }

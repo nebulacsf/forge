@@ -81,7 +81,7 @@ func (m *planFinalizeMock) writePseudoResearch(w http.ResponseWriter, flusher ht
 
 func (m *planFinalizeMock) writeFinal(w http.ResponseWriter, flusher http.Flusher, send func(any)) {
 	send(map[string]any{"id": "gen-final", "choices": []any{
-		map[string]any{"delta": map[string]any{"content": "## Plan: add copy buttons to code blocks, user bubbles, and assistant responses. Ready to implement — switch to BUILD to apply this plan."}},
+		map[string]any{"delta": map[string]any{"content": "## Diagnosis & Approach\nThe message renderer lacks an action row. Add one shared helper.\n\n## Key Decisions\n- Reuse the existing clipboard helper.\n\n## Implementation Plan\n- **web/js/app.js (lines 640-700)**: Add the action row to each message.\n\nReady to implement — switch to BUILD to apply this plan."}},
 	}})
 	send(map[string]any{"id": "gen-final", "choices": []any{
 		map[string]any{"delta": map[string]any{
@@ -198,7 +198,7 @@ func TestLooksLikePseudoToolCall(t *testing.T) {
 	}
 	for _, s := range []string{
 		"",
-		"## Plan: add copy buttons to the UI and verify the behavior.",
+		"## Diagnosis & Approach: add copy buttons to the UI and verify the behavior.",
 		`{"plan":"add buttons"}`,
 	} {
 		if looksLikePseudoToolCall(s) {
@@ -208,7 +208,7 @@ func TestLooksLikePseudoToolCall(t *testing.T) {
 	if usablePlanContent("Done.") {
 		t.Error("short content should not be a usable plan")
 	}
-	if !usablePlanContent("## Plan: add copy buttons to code blocks and messages, then verify the result.") {
+	if !usablePlanContent("## Diagnosis & Approach: add copy buttons to code blocks and messages, then verify the result.") {
 		t.Error("a normal plan should be usable")
 	}
 }
@@ -261,7 +261,7 @@ func TestChatStreamPlanForcesFinalAnswerAtBudget(t *testing.T) {
 		t.Fatalf("messages = %d, want 8 (user + 6 tool rounds + final)", len(msgs))
 	}
 	last := msgs[len(msgs)-1]
-	if last.Role != "assistant" || !strings.Contains(last.Content, "## Plan") {
+	if last.Role != "assistant" || !strings.Contains(last.Content, "## Diagnosis & Approach") {
 		t.Errorf("last message = %+v, want the final plan", last)
 	}
 }
@@ -360,7 +360,7 @@ func TestChatStreamPlanFinalRetriesEmptyAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	last := msgs[len(msgs)-1]
-	if last.Role != "assistant" || !strings.Contains(last.Content, "## Plan") {
+	if last.Role != "assistant" || !strings.Contains(last.Content, "## Diagnosis & Approach") {
 		t.Errorf("last message = %+v, want the final plan", last)
 	}
 }
@@ -401,7 +401,7 @@ func TestChatStreamPlanRejectsPseudoFinalContent(t *testing.T) {
 	if strings.Contains(last.Content, "<tool_call>") {
 		t.Errorf("pseudo tool call was persisted as the final answer: %q", last.Content)
 	}
-	if !strings.Contains(last.Content, "## Plan") {
+	if !strings.Contains(last.Content, "## Diagnosis & Approach") {
 		t.Errorf("last message = %+v, want the final plan", last)
 	}
 }
