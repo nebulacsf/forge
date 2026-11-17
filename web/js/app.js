@@ -81,6 +81,7 @@ async function init() {
     projectModal = new bootstrap.Modal($('projectModal'));
     settingsModal = new bootstrap.Modal($('settingsModal'));
     sessionsModal = new bootstrap.Modal($('sessionsModal'));
+    initTooltips($('settingsModal'));
   }
   try {
     await loadConfig();
@@ -2457,6 +2458,16 @@ function decorateCodeBlocks(el) {
 
 /* ── Settings / project modals ───────────────────────────────────── */
 
+// Bootstrap 5 does not auto-initialise tooltips from data attributes, so every
+// explainer icon is created once. `container: body` is required inside the
+// scrollable modal, whose overflow would otherwise clip the tooltip.
+function initTooltips(root) {
+  if (!window.bootstrap || !root) return;
+  root.querySelectorAll('[data-bs-toggle="tooltip"]').forEach((el) => {
+    bootstrap.Tooltip.getOrCreateInstance(el, { trigger: 'hover focus', delay: { show: 260, hide: 90 } });
+  });
+}
+
 function openSettings() {
   if (!state.config) return;
   const cfg = state.config;
@@ -2473,11 +2484,11 @@ function openSettings() {
   $('defaultMode').value = cfg.defaults.mode || 'PLAN';
   $('maxRead').value = cfg.defaults.max_file_read_chars || 25000;
   $('bashTimeout').value = cfg.defaults.bash_timeout_sec || 30;
-  $('maxToolRounds').value = cfg.defaults.max_tool_rounds || 24;
-  $('maxTurnRounds').value = cfg.defaults.max_turn_rounds || 96;
+  $('maxToolRounds').value = cfg.defaults.max_tool_rounds || 16;
+  $('maxTurnRounds').value = cfg.defaults.max_turn_rounds || 64;
   $('maxTurnCost').value = cfg.defaults.max_turn_cost_usd ?? 0;
   $('planRounds').value = cfg.defaults.plan_rounds ?? 16;
-  $('planToolCalls').value = cfg.defaults.plan_tool_calls ?? 64;
+  $('planToolCalls').value = cfg.defaults.plan_tool_calls ?? 32;
   $('historyPrunePercent').value = cfg.defaults.history_prune_percent ?? 70;
   $('historyPruneMaxTokens').value = cfg.defaults.history_prune_max_tokens ?? 120000;
   $('historyKeepRecent').value = cfg.defaults.history_keep_recent_rounds ?? 0;
@@ -2492,7 +2503,34 @@ function openSettings() {
   $('debugLLMToggle').checked = !!cfg.server.debug_llm || !!state.llmDebugActive;
   $('logPath').textContent = state.logPath || '~/.forge/forge.log';
   $('configPath').textContent = state.configPath || '~/.forge/config.json';
+  renderEffectiveBudget();
   if (settingsModal) settingsModal.show();
+}
+
+// renderEffectiveBudget explains the one derived value in the settings modal:
+// the token ceiling a request must fit in, min(context × prune %, token cap).
+function renderEffectiveBudget() {
+  const el = $('effectiveBudget');
+  if (!el) return;
+  const pct = Math.max(0, Number($('historyPrunePercent').value) || 0);
+  const cap = Math.max(0, Number($('historyPruneMaxTokens').value) || 0);
+  const ctx = contextLimit($('defaultModel').value.trim() || state.config?.defaults?.model);
+  if (pct === 0 && cap === 0) {
+    el.innerHTML = 'Token budget disabled — pruning falls back to the round-based window below.';
+    return;
+  }
+  let limit = cap;
+  const fromContext = ctx > 0 && pct > 0 ? Math.floor((ctx * pct) / 100) : 0;
+  if (fromContext > 0 && (limit === 0 || fromContext < limit)) limit = fromContext;
+  const parts = [];
+  parts.push(`<strong>${formatLimit(limit)} tokens</strong> per request`);
+  const pctLabel = fromContext > 0
+    ? `${pct}% of ${formatLimit(ctx)}`
+    : `${pct}% of the context window`;
+  parts.push(cap > 0 && fromContext > 0
+    ? `min(${pctLabel}, ${formatLimit(cap)} cap)`
+    : (cap > 0 ? `${formatLimit(cap)} cap` : pctLabel));
+  el.innerHTML = parts.join(' — ');
 }
 
 async function saveSettings(e) {
@@ -2579,6 +2617,7 @@ function resetDefaults() {
   $('debugToggle').checked = false;
   $('debugLLMToggle').checked = false;
   $('baseURL').value = 'https://openrouter.ai/api/v1';
+  renderEffectiveBudget();
   toast('Defaults restored — click Save settings to persist', 'success');
 }
 
@@ -3070,6 +3109,11 @@ function bindEvents() {
   $('projectForm').addEventListener('submit', saveProject);
   $('settingsForm').addEventListener('submit', saveSettings);
   $('resetDefaultsBtn').addEventListener('click', resetDefaults);
+  // Keep the derived token budget in sync while the two knobs are edited.
+  ['defaultModel', 'historyPrunePercent', 'historyPruneMaxTokens'].forEach((id) => {
+    const el = $(id);
+    if (el) el.addEventListener('input', renderEffectiveBudget);
+  });
   $('toggleKey').addEventListener('click', () => {
     const input = $('apiKey');
     input.type = input.type === 'password' ? 'text' : 'password';

@@ -156,7 +156,8 @@ A loop guard runs alongside the budget. It fingerprints each tool call together
 with its result and stops the turn when the same call produces the same result
 three times in a short window, or after six consecutive tool errors. Budget and
 loop stops are reported as a neutral checkpoint (`limit` event), not as failures.
-All limits are configurable in **Settings → Defaults**.
+All limits are configurable in **Settings → BUILD limits** and **Settings → PLAN
+research budget**, each knob documented by an inline tooltip.
 
 In PLAN mode, tools that write files or run commands are rejected **before
 execution** and rendered as a `🚫 … blocked` card, so you never see a tool start
@@ -236,7 +237,7 @@ provider latency, and stream summary.
 
 Enable it with any of:
 
-- Settings → **Logging → Debug logging** (applies immediately, saved to config)
+- Settings → **Logging & diagnostics → Debug logging** (applies immediately, saved to config)
 - `./forge --debug`
 - `FORGE_DEBUG=1 ./forge`
 - `"debug": true` in `config.json`
@@ -261,7 +262,7 @@ the model:
 
 Enable it with any of:
 
-- Settings → **Logging → LLM payload tracing** (applies immediately, implies debug)
+- Settings → **Logging & diagnostics → LLM payload tracing** (applies immediately, implies debug)
 - `./forge --debug-llm`
 - `FORGE_LLM_DEBUG=1 ./forge`
 - `"debug_llm": true` in `config.json`

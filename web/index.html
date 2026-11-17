@@ -312,10 +312,18 @@
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body settings-body">
-          <div class="settings-section">
-            <div class="settings-section-title">OpenRouter</div>
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-plug"></i>Provider &amp; credentials</div>
+            <div class="settings-section-desc">
+              How Forge authenticates with the model API. Used by every session and every model.
+            </div>
             <div class="mb-3">
-              <label for="apiKey" class="form-label">API key</label>
+              <div class="setting-label">
+                <label for="apiKey" class="form-label">OpenRouter API key</label>
+                <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the API key"
+                   data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                   title="Secret carried as the Bearer token on every model request. Stored in plain text in the local config file and sent only to the base URL below. Leave blank to keep the current key."></i>
+              </div>
               <div class="input-group">
                 <input id="apiKey" type="password" class="form-control" autocomplete="off"
                        placeholder="sk-or-v1-…">
@@ -326,140 +334,270 @@
               <div id="apiKeyHelp" class="form-text">Stored locally in <code>~/.forge/config.json</code>.</div>
             </div>
             <div>
-              <label for="baseURL" class="form-label">Base URL</label>
+              <div class="setting-label">
+                <label for="baseURL" class="form-label">Base URL</label>
+                <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the base URL"
+                   data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                   title="OpenAI-compatible endpoint that serves the model catalog and the chat completions. Point it at a proxy or a self-hosted gateway if you do not use OpenRouter directly. Must start with http:// or https://."></i>
+              </div>
               <input id="baseURL" class="form-control" spellcheck="false">
             </div>
-          </div>
+          </section>
 
-          <div class="settings-section">
-            <div class="settings-section-title">Defaults</div>
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-cpu"></i>Model &amp; mode</div>
+            <div class="settings-section-desc">
+              Starting point for new chats. Existing chats remember their own model and mode.
+            </div>
             <div class="row g-3">
               <div class="col-md-8">
-                <label for="defaultModel" class="form-label">Default model</label>
+                <div class="setting-label">
+                  <label for="defaultModel" class="form-label">Default model</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the default model"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Model preset applied to brand-new sessions. Its context window feeds the history budget below. You can still switch models per chat from the header."></i>
+                </div>
                 <input id="defaultModel" class="form-control" list="modelOptions" spellcheck="false">
               </div>
               <div class="col-md-4">
-                <label for="defaultMode" class="form-label">Default mode</label>
+                <div class="setting-label">
+                  <label for="defaultMode" class="form-label">Default mode</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the default mode"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Mode a new session starts in. PLAN only reads and reasons and ends with a plan; BUILD edits files, runs commands and verifies them."></i>
+                </div>
                 <select id="defaultMode" class="form-select">
                   <option value="PLAN">PLAN</option>
                   <option value="BUILD">BUILD</option>
                 </select>
               </div>
-              <div class="col-md-6">
-                <label for="maxRead" class="form-label">Max file read (chars)</label>
-                <input id="maxRead" type="number" min="1000" max="2000000" class="form-control">
-              </div>
-              <div class="col-md-6">
-                <label for="bashTimeout" class="form-label">Bash timeout (seconds)</label>
-                <input id="bashTimeout" type="number" min="1" max="600" class="form-control">
-              </div>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-hammer"></i>BUILD limits</div>
+            <div class="settings-section-desc">
+              One round is one model call, and a single round may run several tools.
+            </div>
+            <div class="row g-3">
               <div class="col-md-4">
-                <label for="maxToolRounds" class="form-label">BUILD rounds per checkpoint</label>
+                <div class="setting-label">
+                  <label for="maxToolRounds" class="form-label">Rounds per checkpoint</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About rounds per checkpoint"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Rounds a turn runs before Forge pauses, reports progress and asks to continue. Smaller values keep you in control on long refactors; default 16."></i>
+                </div>
                 <input id="maxToolRounds" type="number" min="1" max="200" class="form-control">
               </div>
               <div class="col-md-4">
-                <label for="maxTurnRounds" class="form-label">BUILD rounds per turn</label>
+                <div class="setting-label">
+                  <label for="maxTurnRounds" class="form-label">Rounds per turn</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About rounds per turn"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Hard ceiling of rounds in a single turn, checkpoint pauses included. Values below the checkpoint size are raised to match it; default 64."></i>
+                </div>
                 <input id="maxTurnRounds" type="number" min="1" max="1000" class="form-control">
               </div>
               <div class="col-md-4">
-                <label for="maxTurnCost" class="form-label">Turn cost cap (USD)</label>
+                <div class="setting-label">
+                  <label for="maxTurnCost" class="form-label">Turn cost cap (USD)</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the turn cost cap"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Estimated USD ceiling for one turn; Forge stops when the running estimate reaches it. It is an estimate from the model pricing, not a hard provider limit. Use 0 to disable the cap."></i>
+                </div>
                 <input id="maxTurnCost" type="number" min="0" step="0.01" class="form-control">
               </div>
-              <div class="col-md-4">
-                <label for="planRounds" class="form-label">PLAN research rounds</label>
-                <input id="planRounds" type="number" min="1" max="24" class="form-control">
-              </div>
-              <div class="col-md-4">
-                <label for="planToolCalls" class="form-label">PLAN tool-call cap</label>
-                <input id="planToolCalls" type="number" min="1" max="200" class="form-control">
-              </div>
-              <div class="col-md-4">
-                <label for="historyPrunePercent" class="form-label">Prune at % of context</label>
-                <input id="historyPrunePercent" type="number" min="0" max="100" class="form-control">
-              </div>
-              <div class="col-md-4">
-                <label for="historyPruneMaxTokens" class="form-label">Prune token cap</label>
-                <input id="historyPruneMaxTokens" type="number" min="0" max="2000000" step="1000" class="form-control">
-              </div>
-              <div class="col-md-4">
-                <label for="historyKeepRecent" class="form-label">Keep recent tool rounds</label>
-                <input id="historyKeepRecent" type="number" min="0" max="100" class="form-control">
-              </div>
-              <div class="col-md-4">
-                <label for="historyMaxResult" class="form-label">Max tool result (chars)</label>
-                <input id="historyMaxResult" type="number" min="0" max="25000" step="500" class="form-control">
-              </div>
-              <div class="col-md-4">
-                <label for="historyMaxArg" class="form-label">Max tool args (chars)</label>
-                <input id="historyMaxArg" type="number" min="0" max="25000" step="500" class="form-control">
-              </div>
-              <div class="col-md-4">
-                <label for="historyPruneChunk" class="form-label">Prune every N rounds</label>
-                <input id="historyPruneChunk" type="number" min="0" max="100" class="form-control">
-              </div>
               <div class="col-12">
-                <div class="form-check form-switch">
+                <div class="form-check form-switch setting-switch">
                   <input id="autoContinue" class="form-check-input" type="checkbox">
                   <label class="form-check-label" for="autoContinue">Continue automatically on long tasks</label>
-                </div>
-                <div class="form-text">
-                  One round is one model call and may run several tools. BUILD checkpoints every
-                  “rounds per checkpoint” and stops at “rounds per turn”. Use 0 in the cost cap to disable it.
-                  PLAN has its own research budget: when it is reached, tools are disabled and Forge requires
-                  the final plan in up to three attempts, rejecting empty answers and tool calls written as text.
-                  Auto-continue applies to BUILD only. Older tool output is stubbed in place;
-                  only the newest rounds that fit the token budget are sent in full. The budget is
-                  min(context window × prune %, token cap) — 70% and 120,000 tokens by default, so the
-                  stricter limit wins: small windows keep 70% of their size, huge windows stop at 120k.
-                  Set either budget value to 0 to fall back to the round-based window below.
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About auto-continue"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="When the checkpoint is reached, immediately start the next batch of rounds instead of waiting for you. Applies to BUILD only and still respects the rounds-per-turn ceiling."></i>
                 </div>
               </div>
             </div>
-          </div>
+          </section>
 
-          <div class="settings-section">
-            <div class="settings-section-title">Server</div>
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-search"></i>PLAN research budget</div>
+            <div class="settings-section-desc">
+              Caps the research phase so a tool-hungry model cannot loop before writing the plan.
+            </div>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <div class="setting-label">
+                  <label for="planRounds" class="form-label">Research rounds</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About PLAN research rounds"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Rounds PLAN may spend reading and reasoning. When the budget runs out, tools are disabled and Forge requires the final plan in up to three attempts, rejecting empty answers. Default 16, maximum 24."></i>
+                </div>
+                <input id="planRounds" type="number" min="1" max="24" class="form-control">
+              </div>
+              <div class="col-md-6">
+                <div class="setting-label">
+                  <label for="planToolCalls" class="form-label">Tool-call cap</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the PLAN tool-call cap"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Total tool calls allowed during PLAN research. Whichever limit is hit first, rounds or calls, ends the research phase. Default 32, maximum 200."></i>
+                </div>
+                <input id="planToolCalls" type="number" min="1" max="200" class="form-control">
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-tools"></i>Tool limits</div>
+            <div class="settings-section-desc">
+              Per-call ceilings for the two tools that move the most text: file reads and shell commands.
+            </div>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <div class="setting-label">
+                  <label for="maxRead" class="form-label">Max file read (chars)</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the read limit"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Characters read_file returns per call. Bigger files are truncated with a hint to narrow the line range, so prefer reading windows over raising this. Default 25000."></i>
+                </div>
+                <input id="maxRead" type="number" min="1000" max="2000000" class="form-control">
+              </div>
+              <div class="col-md-6">
+                <div class="setting-label">
+                  <label for="bashTimeout" class="form-label">Bash timeout (seconds)</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the bash timeout"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Seconds a shell command may run before it is killed. Applies to every bash call, so raise it for slow builds and test suites. Default 30, maximum 600."></i>
+                </div>
+                <input id="bashTimeout" type="number" min="1" max="600" class="form-control">
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-layers"></i>Context &amp; history</div>
+            <div class="settings-section-desc">
+              What gets pruned before each request. Older tool output is stubbed in place, so the
+              conversation keeps its shape and the prompt prefix stays cacheable.
+            </div>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <div class="setting-label">
+                  <label for="historyPrunePercent" class="form-label">Prune at % of context</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the context percentage"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Share of the model context window a request may fill. The stricter of this and the token cap wins, so small windows keep 70% of their size. Set to 0 to disable the token budget. Default 70."></i>
+                </div>
+                <input id="historyPrunePercent" type="number" min="0" max="100" class="form-control">
+              </div>
+              <div class="col-md-6">
+                <div class="setting-label">
+                  <label for="historyPruneMaxTokens" class="form-label">Prune token cap</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the prune token cap"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Absolute token ceiling per request, so huge-context models do not get enormous prompts. Set to 0 to disable the token budget. Default 120000."></i>
+                </div>
+                <input id="historyPruneMaxTokens" type="number" min="0" max="2000000" step="1000" class="form-control">
+              </div>
+              <div class="col-12">
+                <div id="effectiveBudget" class="settings-hint"></div>
+              </div>
+              <div class="col-md-4">
+                <div class="setting-label">
+                  <label for="historyKeepRecent" class="form-label">Keep recent tool rounds</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About recent rounds"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Legacy round-based window: how many of the newest tool rounds stay verbatim. Only used when the token budget is disabled by setting either budget value to 0. Default 0."></i>
+                </div>
+                <input id="historyKeepRecent" type="number" min="0" max="100" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <div class="setting-label">
+                  <label for="historyPruneChunk" class="form-label">Prune every N rounds</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About prune chunks"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Legacy round-based window: prune in chunks of N rounds instead of on every request. Only used when the token budget is disabled. Default 0."></i>
+                </div>
+                <input id="historyPruneChunk" type="number" min="0" max="100" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <div class="setting-label">
+                  <label for="historyMaxResult" class="form-label">Max tool result (chars)</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About tool result size"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Older tool results are stubbed down to this many characters. 0 keeps them intact and lets the token budget do all the work. Default 16000."></i>
+                </div>
+                <input id="historyMaxResult" type="number" min="0" max="25000" step="500" class="form-control">
+              </div>
+              <div class="col-md-4">
+                <div class="setting-label">
+                  <label for="historyMaxArg" class="form-label">Max tool args (chars)</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About tool argument size"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Older tool arguments are stubbed down to this many characters. 0 keeps them intact. Default 4000."></i>
+                </div>
+                <input id="historyMaxArg" type="number" min="0" max="25000" step="500" class="form-control">
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-hdd-network"></i>Local server</div>
+            <div class="settings-section-desc">
+              Where the web UI and the REST API listen. Changing host or port requires a restart.
+            </div>
             <div class="row g-3">
               <div class="col-md-7">
-                <label for="serverHost" class="form-label">Host</label>
+                <div class="setting-label">
+                  <label for="serverHost" class="form-label">Host</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the host"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Network interface the server binds to. Keep 127.0.0.1 for a local-only instance; use 0.0.0.0 to expose the UI on your network, which also exposes the API and any stored API key."></i>
+                </div>
                 <input id="serverHost" class="form-control" spellcheck="false">
               </div>
               <div class="col-md-5">
-                <label for="serverPort" class="form-label">Port</label>
+                <div class="setting-label">
+                  <label for="serverPort" class="form-label">Port</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the port"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="TCP port for the web UI and API. Pick another one when the default 7890 is already in use. Default 7890, range 1-65535."></i>
+                </div>
                 <input id="serverPort" type="number" min="1" max="65535" class="form-control">
               </div>
               <div class="col-12">
-                <div class="form-check form-switch">
+                <div class="form-check form-switch setting-switch">
                   <input id="autoBrowser" class="form-check-input" type="checkbox">
                   <label class="form-check-label" for="autoBrowser">Open browser on startup</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About opening the browser"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Opens the UI in your default browser when Forge starts. Turn it off when running Forge as a background service or under a supervisor."></i>
                 </div>
                 <div class="form-text">Host/port changes take effect after restarting Forge.</div>
               </div>
             </div>
-          </div>
+          </section>
 
-          <div class="settings-section">
-            <div class="settings-section-title">Logging</div>
-            <div class="form-check form-switch">
+          <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-bug"></i>Logging &amp; diagnostics</div>
+            <div class="settings-section-desc">
+              Both switches apply immediately and are saved to the config file.
+            </div>
+            <div class="form-check form-switch setting-switch">
               <input id="debugToggle" class="form-check-input" type="checkbox">
               <label class="form-check-label" for="debugToggle">Debug logging</label>
+              <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About debug logging"
+                 data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                 title="Records every request, model round and tool call with metadata such as durations, token counts and arguments. Prompt and response text stay hidden. Also available as --debug or FORGE_DEBUG=1."></i>
             </div>
-            <div class="form-text">
-              Records every request, model round, and tool call. Applies immediately.
-              Also available as <code>--debug</code> or <code>FORGE_DEBUG=1</code>.
-            </div>
-            <div class="form-check form-switch mt-2">
+            <div class="form-check form-switch setting-switch mt-2">
               <input id="debugLLMToggle" class="form-check-input" type="checkbox">
               <label class="form-check-label" for="debugLLMToggle">LLM payload tracing</label>
-            </div>
-            <div class="form-text">
-              Extra verbose: logs the full request sent to the model (messages, tool schemas),
-              every stream chunk, the response and its reasoning. Implies debug logging and
-              writes prompt content to the log. Applies immediately.
-              Also available as <code>--debug-llm</code> or <code>FORGE_LLM_DEBUG=1</code>.
+              <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About LLM payload tracing"
+                 data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                 title="Extra verbose: logs the full request sent to the model (messages, tool schemas), every stream chunk, the response and its reasoning. Implies debug logging and writes prompt content to the log. Also available as --debug-llm or FORGE_LLM_DEBUG=1."></i>
             </div>
             <div class="settings-path">Log file: <code id="logPath">~/.forge/forge.log</code></div>
-          </div>
+          </section>
 
           <div class="settings-path">
             Config file: <code id="configPath">~/.forge/config.json</code>

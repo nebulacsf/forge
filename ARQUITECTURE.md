@@ -277,7 +277,7 @@ transaction.
 - **Right (XL+):** Collapsible inspector with usage/cost, active files, checklist
 - **Themes:** `data-theme` / `data-bs-theme` drive custom tokens, Bootstrap, and highlight.js; preference stored in `localStorage`
 - **Timers:** Live session and per-response timers; persisted as `sessions.duration_ms` and `messages.duration_ms`
-- **Modals:** Add Project, Settings
+- **Modals:** Add Project, Settings — the Settings form is grouped into ordered sections (provider, model, BUILD limits, PLAN budget, tool limits, context/history, server, logging) and every field carries an inline tooltip explaining its unit, default and effect
 - **SSE:** `EventSource` parses typed events → incremental DOM updates
 
 ---
