@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -29,6 +30,26 @@ var symbolKindGroups = map[string][]string{
 	"variable": {"variable", "constant"},
 }
 
+// indexLocks serializes index refreshes per project root. Parallel agents can
+// share a directory (a BUILD run plus read-only PLAN runs), and two concurrent
+// walks would otherwise duplicate the scan and race on the same upserts.
+var indexLocks = struct {
+	sync.Mutex
+	byRoot map[string]*sync.Mutex
+}{byRoot: map[string]*sync.Mutex{}}
+
+func lockRoot(root string) func() {
+	indexLocks.Lock()
+	mu, ok := indexLocks.byRoot[root]
+	if !ok {
+		mu = &sync.Mutex{}
+		indexLocks.byRoot[root] = mu
+	}
+	indexLocks.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
 // EnsureProjectIndex walks a project once and refreshes both the compact
 // repository outline and the queryable symbol index. Files whose mtime and size
 // are unchanged are never read or parsed.
@@ -37,6 +58,8 @@ func EnsureProjectIndex(ctx context.Context, st *store.Store, projectID int64, r
 	if err != nil {
 		return "", err
 	}
+	unlock := lockRoot(absRoot)
+	defer unlock()
 	started := time.Now()
 
 	var cachedOutline []store.RepoOutlineFile

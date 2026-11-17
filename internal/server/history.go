@@ -288,6 +288,7 @@ func buildHistory(rows []store.Message, system string, opts historyOptions) ([]l
 	}
 	stats.Messages = len(out)
 	stats.Chars = sentChars
+	stats.Rounds = toolRounds
 	stats.PrunedChars = fullChars - sentChars
 	return out, stats
 }

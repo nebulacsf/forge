@@ -448,6 +448,41 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   max-width: 900px;
   padding: 22px 26px 12px;
 }
+/* Each chat owns its transcript element, so a background agent renders into
+   its own hidden view instead of the one on screen. */
+.messages-view {
+  display: contents;
+}
+
+/* Parallel agents: a live run is marked on its tab, and a run that finished
+   while the user was elsewhere leaves a dot until the chat is opened. */
+.session-tab.running { color: var(--accent-2); }
+.session-tab.unseen .tab-title { font-weight: 600; }
+.tab-pulse {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.6s infinite;
+}
+.tab-unseen-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--green, #22c55e);
+}
+.run-summary {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  white-space: nowrap;
+}
 
 .msg { animation: rise .16s ease both; }
 .msg-focus {

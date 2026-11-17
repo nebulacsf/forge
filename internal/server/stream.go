@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"forge/internal/config"
 	"forge/internal/llm"
 	"forge/internal/logx"
 	"forge/internal/store"
@@ -158,19 +159,59 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		session.Mode = "PLAN"
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	rc := http.NewResponseController(w)
-	if err := rc.Flush(); err != nil {
+	// Files pinned with the composer's "@" picker are inlined into the persisted
+	// user message so the model sees them and later turns keep the context.
+	userContent := body.Content
+	if block := buildAttachmentBlock(project.Path, body.Attachments); block != "" {
+		if userContent == "" {
+			userContent = "Attached context."
+		}
+		userContent += "\n\n" + block
+	}
+
+	// Persist the user message before the run starts so the transcript stays
+	// consistent even if the browser disappears right after sending.
+	if _, err := s.store.AddMessage(session.ID, "user", "", userContent, ""); err != nil {
+		apiError(w, http.StatusInternalServerError, "Could not save message: "+err.Error())
 		return
 	}
-	stream := &sseWriter{w: w, rc: rc}
-	ctx := r.Context()
+	_ = s.store.TouchProject(project.ID)
+
+	var announce *store.Session
+	if session.Title == "" || session.Title == "New Chat" {
+		titleSource := body.Content
+		if strings.TrimSpace(titleSource) == "" && len(body.Attachments) > 0 {
+			titleSource = "Attach " + strings.Join(body.Attachments, ", ")
+		}
+		title := deriveTitle(titleSource)
+		if updated, err := s.store.UpdateSession(session.ID, &title, nil, nil, nil); err == nil {
+			session = updated
+			announce = &session
+		}
+	}
+
+	// Admission: at most one BUILD agent per project, any number of PLAN agents.
+	rn, err := s.runs.start(session, project, s.maxConcurrentRuns())
+	if err != nil {
+		apiError(w, http.StatusConflict, err.Error())
+		return
+	}
+	go s.runTurn(rn, session, project, announce, cfg)
+	s.tailRun(w, r, rn, 0)
+}
+
+// runTurn is the agent loop. It runs on the run's own context, so the browser
+// can go away without stopping the turn, and it publishes every event into the
+// run log instead of writing to the HTTP socket.
+func (s *Server) runTurn(rn *run, session store.Session, project store.Project, announce *store.Session, cfg config.Config) {
+	stream := &runPublisher{rn: rn}
+	ctx := rn.ctx
 	turnStart := time.Now()
+	defer rn.finish("turn_end")
 	logx.Info("turn start", "session", session.ID, "project", project.ID, "model", session.Model, "mode", session.Mode)
+	if announce != nil {
+		stream.send(chatEvent{Type: "session", Session: announce})
+	}
 
 	// A turn may span several rounds and end from many branches. Record the
 	// wall-clock duration once, before the final session snapshot is sent, so
@@ -202,35 +243,6 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = stream.send(chatEvent{Type: "cancelled", Message: "Stopped"})
 		finish(false)
-	}
-
-	// Files pinned with the composer's "@" picker are inlined into the persisted
-	// user message so the model sees them and later turns keep the context.
-	userContent := body.Content
-	if block := buildAttachmentBlock(project.Path, body.Attachments); block != "" {
-		if userContent == "" {
-			userContent = "Attached context."
-		}
-		userContent += "\n\n" + block
-	}
-
-	// Persist the user message first.
-	if _, err := s.store.AddMessage(session.ID, "user", "", userContent, ""); err != nil {
-		stream.fail("Could not save message: " + err.Error())
-		return
-	}
-	_ = s.store.TouchProject(project.ID)
-
-	if session.Title == "" || session.Title == "New Chat" {
-		titleSource := body.Content
-		if strings.TrimSpace(titleSource) == "" && len(body.Attachments) > 0 {
-			titleSource = "Attach " + strings.Join(body.Attachments, ", ")
-		}
-		title := deriveTitle(titleSource)
-		if updated, err := s.store.UpdateSession(session.ID, &title, nil, nil, nil); err == nil {
-			session = updated
-			stream.send(chatEvent{Type: "session", Session: &session})
-		}
 	}
 
 	mgr, err := tools.NewManager(project.Path, cfg.Defaults.MaxFileReadChars,
@@ -848,7 +860,7 @@ func (s *Server) persistToolCalls(sessionID int64, reasoning, content string, ca
 	return msg.ID, nil
 }
 
-func (s *Server) sendDone(stream *sseWriter, sessionID int64, reasoningOnly bool) {
+func (s *Server) sendDone(stream *runPublisher, sessionID int64, reasoningOnly bool) {
 	var ptr *store.Session
 	if sess, err := s.store.GetSession(sessionID); err == nil {
 		ptr = &sess

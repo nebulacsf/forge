@@ -38,6 +38,9 @@ type Server struct {
 	cfg   *config.Manager
 	store *store.Store
 	web   fs.FS
+	// runs owns the agent turns. They are independent of any HTTP connection,
+	// so switching project or closing the browser no longer stops an agent.
+	runs *runRegistry
 
 	modelsMu     sync.Mutex
 	modelsList   []llm.ModelInfo
@@ -47,7 +50,7 @@ type Server struct {
 }
 
 func New(cfg *config.Manager, st *store.Store, web fs.FS) *Server {
-	return &Server{cfg: cfg, store: st, web: web}
+	return &Server{cfg: cfg, store: st, web: web, runs: newRunRegistry()}
 }
 
 // Handler builds the complete HTTP handler.
@@ -74,6 +77,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{id}/messages", s.handleListMessages)
 	mux.HandleFunc("GET /api/sessions/{id}/checklist", s.handleListChecklist)
 	mux.HandleFunc("DELETE /api/sessions/{id}/checklist", s.handleClearChecklist)
+
+	// Parallel agents: a run survives the browser. These endpoints let the UI
+	// re-attach to it, stop it explicitly, and know which chats are busy.
+	mux.HandleFunc("GET /api/sessions/{id}/stream", s.handleResumeSessionStream)
+	mux.HandleFunc("POST /api/sessions/{id}/stop", s.handleStopSession)
+	mux.HandleFunc("GET /api/sessions/{id}/run", s.handleSessionRun)
+	mux.HandleFunc("GET /api/runs", s.handleListRuns)
 
 	mux.HandleFunc("POST /api/checklist", s.handleCreateChecklist)
 	mux.HandleFunc("PATCH /api/checklist/{id}", s.handlePatchChecklist)
@@ -698,6 +708,21 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "model cannot be empty")
 		return
 	}
+	// A run captures its mode when it starts, because the mode decides which
+	// tools are exposed and whether they may write. Changing it mid-run would
+	// silently desynchronize the agent from the UI.
+	if body.Mode != nil || (body.IsOpen != nil && !*body.IsOpen) {
+		if rn := s.runs.liveRun(id); rn != nil {
+			if body.Mode != nil {
+				apiError(w, http.StatusConflict,
+					"this chat has a running agent; stop it before changing the mode")
+				return
+			}
+			apiError(w, http.StatusConflict,
+				"this chat has a running agent; stop it before closing the tab")
+			return
+		}
+	}
 	session, err := s.store.UpdateSession(id, body.Title, body.Model, body.Mode, body.IsOpen)
 	if errors.Is(err, store.ErrNotFound) {
 		apiError(w, http.StatusNotFound, "session not found")
@@ -716,6 +741,9 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Deleting a chat must not race with its own agent: stop the run and let it
+	// persist what it produced before the rows disappear.
+	s.runs.stopAndWait(id, 15*time.Second)
 	if err := s.store.DeleteSession(id); err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return

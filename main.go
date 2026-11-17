@@ -122,7 +122,8 @@ func main() {
 	if err != nil {
 		logx.Fatalf("embedded web assets: %v", err)
 	}
-	handler := server.New(cfgMgr, st, webRoot).Handler()
+	srvApp := server.New(cfgMgr, st, webRoot)
+	handler := srvApp.Handler()
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	ln, err := net.Listen("tcp", addr)
@@ -167,6 +168,10 @@ func main() {
 	select {
 	case sig := <-sigCh:
 		logx.Info("shutting down", "signal", sig.String())
+		// Agents run independently of the browser, so they may still be working
+		// when the server stops. Cancel them and give them a moment to persist
+		// their partial output before the process exits.
+		srvApp.ShutdownStop(5 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {

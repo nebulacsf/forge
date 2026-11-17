@@ -58,6 +58,11 @@ type DefaultsConfig struct {
 	PlanToolCalls  int     `json:"plan_tool_calls"`
 	AutoContinue   *bool   `json:"auto_continue"`
 	MaxTurnCostUSD float64 `json:"max_turn_cost_usd"`
+	// MaxConcurrentRuns is a global safety valve for parallel agents. It never
+	// shortens a turn: it only rejects a new run while that many are already
+	// executing. Within a project a BUILD run is always exclusive, while PLAN
+	// runs (read-only) may be added alongside anything. 0 means unlimited.
+	MaxConcurrentRuns int `json:"max_concurrent_runs"`
 
 	// History pruning keeps recent tool output verbatim and stubs older rounds
 	// in place before each provider request. Volatile state (checklist, outline)
@@ -100,6 +105,9 @@ func Default() Config {
 			PlanToolCalls:    32,
 			AutoContinue:     boolPtr(true),
 			MaxTurnCostUSD:   0,
+			// Parallel agents: several projects (and several PLAN chats) can
+			// run at once; this only bounds the machine, never a single turn.
+			MaxConcurrentRuns: 6,
 			// Budget-driven pruning is the default: the request may use up to
 			// 70% of the model's context window, capped at 120k tokens.
 			HistoryPrunePercent:   70,
@@ -307,6 +315,12 @@ func normalize(c Config) Config {
 	}
 	if c.Defaults.MaxTurnCostUSD < 0 {
 		c.Defaults.MaxTurnCostUSD = 0
+	}
+	if c.Defaults.MaxConcurrentRuns < 0 {
+		c.Defaults.MaxConcurrentRuns = 0
+	}
+	if c.Defaults.MaxConcurrentRuns > 64 {
+		c.Defaults.MaxConcurrentRuns = 64
 	}
 	// Token-budget pruning: 0 disables the budget and re-enables the legacy
 	// round-based knobs. Negative values fall back to the shipped default.

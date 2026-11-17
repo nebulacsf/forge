@@ -20,41 +20,204 @@ const state = {
   allSessions: [],
   activeSessionId: null,
   session: null,
-  checklist: [],
-  files: new Map(),
   // Files pinned with the composer's "@" picker for the next message.
   attachments: [],
   fileCache: null,
   filePicker: { open: false, mention: null, files: [], matches: [], index: 0 },
-  usage: {
-    sessionIn: 0,
-    sessionOut: 0,
-    sessionCost: 0,
-    projectCost: 0,
-    contextTokens: 0,
-    contextExact: false,
-    cached: 0,
-  },
-  streaming: false,
+  // Chat-scoped state (transcript, streaming flags, rounds, timers, usage) is
+  // kept in one view per session — see chatViews below — so several agents can
+  // run at the same time. The accessors installed after this literal project
+  // that state onto the active view, which keeps the rest of the UI unchanged.
+};
+
+const EMPTY_USAGE = {
+  sessionIn: 0, sessionOut: 0, sessionCost: 0, projectCost: 0,
+  contextTokens: 0, contextExact: false, cached: 0,
+  rounds: 0, prunedRounds: 0, prunedChars: 0,
+};
+
+/* ── Per-session chat views ──────────────────────────────────────── */
+
+// Every session owns a view: its own transcript element, streaming flags,
+// current round, tool cards, usage and timer. Switching project or tab only
+// changes which view is mounted, so a background agent keeps streaming and
+// rendering into its own element instead of being cancelled.
+const chatViews = new Map();
+// renderView is set while a view is being rendered or fed stream events, so the
+// state accessors below address that view even when it is not the active one.
+let renderView = null;
+// Run status polled from the server: lets the tab bar show agents that keep
+// working after the user navigated away or closed the browser tab.
+const runIndex = new Map();
+let runWatchTimer = null;
+
+function makeView(sessionId) {
+  const el = document.createElement('div');
+  el.className = 'messages-view';
+  el.dataset.session = String(sessionId || '');
+  return {
+    sessionId,
+    el,
+    streaming: false,
+    attached: false,
+    finishedUnseen: false,
+    seq: 0,
+    abort: null,
+    currentRound: null,
+    toolCards: new Map(),
+    sawCancelled: false,
+    turnHadContent: false,
+    turnHadError: false,
+    turnReasoningOnly: false,
+    turnRound: 0,
+    turnLimit: 0,
+    turnSegment: 1,
+    turnSegmentSize: 0,
+    messageIndex: -1,
+    sessionTimeBase: 0,
+    turnBaseTime: 0,
+    turnStartedAt: 0,
+    turnElapsedMs: 0,
+    turnClock: null,
+    turnTimerEl: null,
+    checklist: [],
+    files: new Map(),
+    usage: { ...EMPTY_USAGE },
+  };
+}
+
+function viewFor(sessionId, { create = false } = {}) {
+  if (!sessionId) return null;
+  let view = chatViews.get(sessionId);
+  if (!view && create) {
+    view = makeView(sessionId);
+    chatViews.set(sessionId, view);
+  }
+  return view || null;
+}
+
+function dropView(sessionId) {
+  const view = chatViews.get(sessionId);
+  if (!view) return;
+  if (view.turnClock) clearInterval(view.turnClock);
+  chatViews.delete(sessionId);
+}
+
+// currentView resolves the view that UI code should read or write right now.
+function currentView() {
+  return renderView || viewFor(state.activeSessionId);
+}
+
+// withView runs fn with all chat-scoped state pointing at `view`. Handlers are
+// synchronous, so no other stream can interleave and steal the context.
+function withView(view, fn) {
+  if (!view) return fn();
+  const prev = renderView;
+  renderView = view;
+  try {
+    return fn();
+  } finally {
+    renderView = prev;
+  }
+}
+
+// messagesEl is the transcript container of the view being rendered.
+function messagesEl() {
+  const view = currentView();
+  return view ? view.el : $('messages');
+}
+
+// viewIsActive reports whether a view is the one currently on screen.
+function viewIsActive(view) {
+  return !!view && view === viewFor(state.activeSessionId);
+}
+
+// mountView puts a session's transcript on screen by moving its element. A
+// background agent keeps streaming into its own element, untouched.
+function mountView(view) {
+  const host = $('messages');
+  for (const child of [...host.children]) {
+    if (child !== (view && view.el)) child.remove();
+  }
+  if (view && view.el.parentElement !== host) host.appendChild(view.el);
+  if (view && view.el.children.length) hideEmpty();
+  else showEmpty('chat');
+  maybeScroll(true);
+}
+
+// runIndex mirrors the server's live runs so the tab bar can show agents that
+// keep working while the user is looking at another project.
+function setRunStatus(status) {
+  if (!status || !status.session_id) return;
+  if (status.state === 'running') runIndex.set(status.session_id, status);
+  else runIndex.delete(status.session_id);
+  renderTabs();
+  updateControls();
+}
+
+async function refreshRunIndex() {
+  try {
+    const data = await api('/api/runs');
+    runIndex.clear();
+    for (const run of data.runs || []) {
+      if (run.state === 'running') runIndex.set(run.session_id, run);
+    }
+    renderTabs();
+  } catch { /* offline: the tab bar simply shows no spinners */ }
+}
+
+function startRunWatch() {
+  if (runWatchTimer) clearInterval(runWatchTimer);
+  runWatchTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshRunIndex();
+  }, 5000);
+}
+
+const VIEW_DEFAULTS = {
+  toolCards: () => new Map(),
+  files: () => new Map(),
+  checklist: () => [],
+  messageIndex: -1,
+  turnSegment: 1,
+  turnTimerEl: null,
   abort: null,
   currentRound: null,
-  toolCards: new Map(),
-  sawCancelled: false,
-  turnHadContent: false,
-  turnHadError: false,
-  turnReasoningOnly: false,
-  turnRound: 0,
-  turnLimit: 0,
-  turnSegment: 1,
-  turnSegmentSize: 0,
-  messageIndex: -1,
-  sessionTimeBase: 0,
-  turnBaseTime: 0,
-  turnStartedAt: 0,
-  turnElapsedMs: 0,
-  turnClock: null,
-  turnTimerEl: null,
 };
+
+for (const field of [
+  'streaming', 'attached', 'finishedUnseen', 'abort', 'currentRound', 'toolCards',
+  'sawCancelled', 'turnHadContent', 'turnHadError', 'turnReasoningOnly', 'turnRound',
+  'turnLimit', 'turnSegment', 'turnSegmentSize', 'messageIndex', 'sessionTimeBase',
+  'turnBaseTime', 'turnStartedAt', 'turnElapsedMs', 'turnClock', 'turnTimerEl',
+  'checklist', 'files',
+]) {
+  Object.defineProperty(state, field, {
+    configurable: true,
+    get() {
+      const view = currentView();
+      if (view) return view[field];
+      const fallback = VIEW_DEFAULTS[field];
+      return typeof fallback === 'function' ? fallback() : (fallback !== undefined ? fallback : false);
+    },
+    set(value) {
+      const view = currentView();
+      if (view) view[field] = value;
+    },
+  });
+}
+
+Object.defineProperty(state, 'usage', {
+  configurable: true,
+  get() {
+    const view = currentView();
+    return view ? view.usage : EMPTY_USAGE;
+  },
+  set(value) {
+    const view = currentView();
+    if (view) view.usage = value;
+  },
+});
 
 let projectModal = null;
 let settingsModal = null;
@@ -75,6 +238,7 @@ async function init() {
   }
   applyTheme(localStorage.getItem('forge.theme') || 'dark', { persist: false });
   initFilesCard();
+  initUsageCard();
   setPanelHidden(localStorage.getItem('forge.panelHidden') === '1', { persist: false });
   bindEvents();
   if (window.bootstrap) {
@@ -96,6 +260,10 @@ async function init() {
     const saved = Number(localStorage.getItem('forge.project') || 0);
     const project = state.projects.find((p) => p.id === saved) || state.projects[0];
     await selectProject(project.id, { autoCreate: true });
+    // Rebuild the tab indicators for agents that kept running while the page
+    // was closed, then keep the index warm.
+    await refreshRunIndex();
+    startRunWatch();
   } catch (err) {
     toast(err.message, 'error');
     showEmpty('error');
@@ -274,11 +442,31 @@ function initFilesCard() {
   });
 }
 
+function initUsageCard() {
+  const card = $('usageDetails');
+  if (!card) return;
+  try { card.open = localStorage.getItem('forge.usageOpen') === '1'; } catch { /* ignore */ }
+  card.addEventListener('toggle', () => {
+    try { localStorage.setItem('forge.usageOpen', card.open ? '1' : '0'); } catch { /* ignore */ }
+  });
+  const pill = $('prunePill');
+  if (pill) {
+    pill.addEventListener('click', () => { card.open = true; });
+    pill.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      card.open = true;
+      card.querySelector('summary')?.focus();
+    });
+  }
+}
+
 /* ── Sessions ────────────────────────────────────────────────────── */
 
 async function selectProject(id, { autoCreate = false } = {}) {
   if (!id) return;
-  if (state.streaming) stopStream();
+  // Switching project never stops a running agent: background views keep
+  // streaming and the server keeps working even if the browser goes away.
   const project = state.projects.find((p) => p.id === id);
   if (!project) return;
   state.activeProjectId = id;
@@ -313,7 +501,6 @@ async function createSession({ silent = false } = {}) {
     toast('Register or select a project first', 'error');
     return null;
   }
-  if (state.streaming) stopStream();
   try {
     const data = await api(`/api/projects/${state.activeProjectId}/sessions`, {
       method: 'POST',
@@ -342,38 +529,72 @@ async function loadSession(id) {
     const tabIndex = state.sessions.findIndex((s) => s.id === id);
     if (tabIndex >= 0) state.sessions[tabIndex] = { ...state.sessions[tabIndex], ...data.session };
     else state.sessions.push(data.session);
-    state.checklist = data.checklist || [];
-    state.files = new Map();
-    state.toolCards = new Map();
-    state.currentRound = null;
-    state.sawCancelled = false;
-    state.sessionTimeBase = Number(data.session.duration_ms || 0);
-    state.turnBaseTime = state.sessionTimeBase;
-    state.turnStartedAt = 0;
-    state.turnElapsedMs = 0;
-    state.turnTimerEl = null;
-    stopTurnClock(false);
-    state.usage = {
-      sessionIn: data.session.tokens_in || 0,
-      sessionOut: data.session.tokens_out || 0,
-      sessionCost: data.session.cost_usd || 0,
-      projectCost: data.project.total_cost_usd || 0,
-      contextTokens: estimateContext(data.messages || []),
-      contextExact: false,
-      cached: data.session.cached_tokens || 0,
-    };
+
+    // The session owns its view. Opening a tab only mounts that view; a run
+    // that is still working in the background keeps streaming into it.
+    const view = viewFor(id, { create: true });
+    view.finishedUnseen = false;
+    view.checklist = data.checklist || [];
+    view.sessionTimeBase = Number(data.session.duration_ms || 0);
+    if (!view.streaming) {
+      view.turnBaseTime = view.sessionTimeBase;
+      view.turnStartedAt = 0;
+      view.turnElapsedMs = 0;
+    }
+    const seededRounds = countToolRounds(data.messages || []);
+    const prune = loadPruneState(id);
+    // The cached snapshot only applies while the history it described still
+    // exists. Compaction can drop the session below it, so ignore it then.
+    const usePrune = !!prune && prune.rounds <= seededRounds + 1;
+    if (!view.streaming) {
+      view.usage = {
+        sessionIn: data.session.tokens_in || 0,
+        sessionOut: data.session.tokens_out || 0,
+        sessionCost: data.session.cost_usd || 0,
+        projectCost: data.project.total_cost_usd || 0,
+        contextTokens: estimateContext(data.messages || []),
+        contextExact: false,
+        cached: data.session.cached_tokens || 0,
+        rounds: Math.max(seededRounds, usePrune ? prune.rounds : 0),
+        prunedRounds: usePrune ? prune.prunedRounds : 0,
+        prunedChars: usePrune ? prune.prunedChars : 0,
+      };
+    }
     localStorage.setItem(`forge.session.${data.project.id}`, String(id));
     updateProjectTotals(data.project);
     renderTabs();
-    renderSession(data.messages || []);
-    maybeScroll(true);
+    if (view.streaming) {
+      // Re-attach: replay whatever the run produced while we were elsewhere.
+      resumeSessionRun(id, view);
+    } else {
+      withView(view, () => renderSession(data.messages || []));
+      if (view.el.children.length) hideEmpty();
+      else showEmpty('chat');
+    }
+    mountView(view);
+    const run = await activeRunFor(id);
+    if (run) {
+      setRunStatus(run);
+      if (!view.streaming) attachSessionRun(id, view, 0);
+    }
   } catch (err) {
     toast(err.message, 'error');
     if (err.status === 404) {
+      dropView(id);
       state.sessions = state.sessions.filter((s) => s.id !== id);
       renderTabs();
       clearSession();
     }
+  }
+}
+
+// activeRunFor asks the server whether a session still has a background agent.
+async function activeRunFor(sessionId) {
+  try {
+    const data = await api(`/api/sessions/${sessionId}/run`);
+    return data && data.state === 'running' ? data : null;
+  } catch {
+    return null;
   }
 }
 
@@ -387,6 +608,7 @@ function clearSession() {
   state.usage = {
     sessionIn: 0, sessionOut: 0, sessionCost: 0, projectCost: 0,
     contextTokens: 0, contextExact: false, cached: 0,
+    rounds: 0, prunedRounds: 0, prunedChars: 0,
   };
   stopTurnClock(false);
   state.sessionTimeBase = 0;
@@ -395,7 +617,7 @@ function clearSession() {
   state.turnElapsedMs = 0;
   state.turnTimerEl = null;
   if (state.activeProjectId) localStorage.removeItem(`forge.session.${state.activeProjectId}`);
-  $('messages').innerHTML = '';
+  messagesEl().innerHTML = '';
   $('modelInput').value = state.config?.defaults?.model || '';
   setModeUI(state.config?.defaults?.mode || 'PLAN');
   renderTabs();
@@ -465,12 +687,26 @@ function renderTabs() {
     tab.title = `${session.title || 'New Chat'} — drag to reorder, double-click to rename`;
     tab.draggable = true;
     tab.dataset.id = String(session.id);
+    // Background agents stay visible: a spinner while the run is live and a dot
+    // when it finished while the user was looking at another chat.
+    const running = runIndex.has(session.id) || !!viewFor(session.id)?.streaming;
+    const unseen = !!viewFor(session.id)?.finishedUnseen;
+    if (running) {
+      tab.classList.add('running');
+      const dot = document.createElement('span');
+      dot.className = 'tab-pulse';
+      dot.title = 'Agent working in this chat';
+      tab.appendChild(dot);
+    } else if (unseen) {
+      tab.classList.add('unseen');
+      const dot = document.createElement('span');
+      dot.className = 'tab-unseen-dot';
+      dot.title = 'Finished while you were away — open to see the result';
+      tab.appendChild(dot);
+    }
     // Click only opens the chat; it never moves the tab.
     tab.addEventListener('click', () => {
-      if (session.id !== state.activeSessionId) {
-        if (state.streaming) stopStream();
-        loadSession(session.id);
-      }
+      if (session.id !== state.activeSessionId) loadSession(session.id);
     });
 
     tab.addEventListener('dragstart', (e) => {
@@ -576,7 +812,8 @@ function startTabRename(label, session) {
 }
 
 async function closeSession(id) {
-  if (state.streaming && id === state.activeSessionId) stopStream();
+  // A background agent keeps the chat open server-side: closing the tab is a
+  // UI preference, so the run is left alone and the tab simply disappears.
   try {
     await api(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ is_open: false }) });
     state.sessions = state.sessions.filter((s) => s.id !== id);
@@ -622,7 +859,7 @@ async function patchSession(payload) {
 /* ── Session rendering ───────────────────────────────────────────── */
 
 function renderSession(messages) {
-  const container = $('messages');
+  const container = messagesEl();
   state.currentRound = null;
   state.toolCards = new Map();
   state.messageIndex = -1;
@@ -653,7 +890,7 @@ function renderSession(messages) {
 }
 
 function removePlanReadyCard() {
-  const existing = $('messages').querySelector('.plan-ready');
+  const existing = messagesEl().querySelector('.plan-ready');
   if (existing) existing.remove();
 }
 
@@ -685,7 +922,7 @@ function addPlanReadyCard() {
     $('promptInput').focus();
   });
   card.querySelector('.plan-ready-close').addEventListener('click', () => card.remove());
-  $('messages').appendChild(card);
+  messagesEl().appendChild(card);
 }
 
 function appendUserMessage(text, attachments = []) {
@@ -717,7 +954,7 @@ function appendUserMessage(text, attachments = []) {
   const btn = makeCopyButton('msg-copy', 'Copy message', (b) => copyToClipboard(copyText, b));
   wrap.appendChild(btn);
   wrap.appendChild(bubble);
-  $('messages').appendChild(wrap);
+  messagesEl().appendChild(wrap);
 }
 
 function renderAssistantHistory(msg) {
@@ -732,7 +969,7 @@ function renderAssistantHistory(msg) {
   if (!hasReasoning && !hasContent && !calls.length) return false;
 
   const round = makeRoundElement();
-  $('messages').appendChild(round.el);
+  messagesEl().appendChild(round.el);
   if (hasReasoning) {
     const card = addReasoningCard(round, msg.reasoning);
     card.title.textContent = 'Thought process';
@@ -810,38 +1047,41 @@ async function continueTurn() {
 }
 
 async function runTurn({ content = '', isContinue = false, userText = content, attachments = [] }) {
+  const sessionId = state.session?.id || state.activeSessionId;
+  const view = viewFor(sessionId, { create: true });
   removePlanReadyCard();
   updateSendState();
   appendUserMessage(userText, attachments);
   hideEmpty();
-  state.messageIndex = -1;
+  view.messageIndex = -1;
   maybeScroll(true);
 
-  state.streaming = true;
-  state.sawCancelled = false;
-  state.turnHadContent = false;
-  state.turnHadError = false;
-  state.turnReasoningOnly = false;
-  state.turnRound = 0;
-  state.turnLimit = 0;
-  state.turnSegment = 1;
-  state.turnSegmentSize = 0;
+  withView(view, () => {
+    state.streaming = true;
+    state.sawCancelled = false;
+    state.turnHadContent = false;
+    state.turnHadError = false;
+    state.turnReasoningOnly = false;
+    state.turnRound = 0;
+    state.turnLimit = 0;
+    state.turnSegment = 1;
+    state.turnSegmentSize = 0;
+    setStreamingUI(true);
+    startTurnClock();
+    beginRound(0);
+  });
   const modeAtSend = state.session?.mode === 'BUILD' ? 'BUILD' : 'PLAN';
-  setStreamingUI(true);
-  startTurnClock();
-  beginRound(0);
-  const controller = new AbortController();
-  state.abort = controller;
+  setRunStatus({ session_id: sessionId, state: 'running', mode: modeAtSend });
+  renderTabs();
 
   try {
     const payload = isContinue
-      ? { session_id: state.session.id, continue: true }
-      : { session_id: state.session.id, content, attachments };
+      ? { session_id: sessionId, continue: true }
+      : { session_id: sessionId, content, attachments };
     const res = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: controller.signal,
     });
     if (!res.ok) {
       let msg = `Request failed (${res.status})`;
@@ -854,44 +1094,103 @@ async function runTurn({ content = '', isContinue = false, userText = content, a
       throw err;
     }
     if (!res.body) throw new Error('Streaming is not supported by this browser.');
-    await readSSE(res.body);
+    view.attached = true;
+    await readSSE(res.body, view);
   } catch (err) {
     if (err.preflight) {
-      const users = $('messages').querySelectorAll('.msg-user');
-      if (users.length) users[users.length - 1].remove();
-      if (!$('messages').querySelector('.msg-user, .assistant-round')) showEmpty('chat');
+      withView(view, () => {
+        const users = messagesEl().querySelectorAll('.msg-user');
+        if (users.length) users[users.length - 1].remove();
+        if (!messagesEl().querySelector('.msg-user, .assistant-round')) showEmpty('chat');
+      });
       if (!isContinue && !$('promptInput').value.trim()) {
         $('promptInput').value = content;
         resizePrompt();
       }
       updateSendState();
       toast(err.message || 'Message was not sent', 'error');
-    } else if (err.name === 'AbortError' || controller.signal.aborted) {
-      if (!state.sawCancelled) addNotice('Stopped', 'stopped');
-    } else {
-      state.turnHadError = true;
-      addNotice(err.message || 'Request failed', 'error');
+      runIndex.delete(sessionId);
+    } else if (!view.sawCancelled) {
+      withView(view, () => {
+        view.turnHadError = true;
+        addNotice(err.message || 'Request failed', 'error');
+      });
       toast(err.message || 'Request failed', 'error');
     }
   } finally {
+    view.attached = false;
+    finishTurnView(view, modeAtSend);
+  }
+}
+
+// finishTurnView settles the UI of a finished turn. It runs identically for a
+// foreground turn and for a background agent that kept working after the user
+// navigated away, so both end in the same state.
+function finishTurnView(view, modeAtSend = '') {
+  withView(view, () => {
     stopTurnClock(true);
     finalizeRound();
     state.streaming = false;
-    state.abort = null;
     state.turnRound = 0;
     state.turnLimit = 0;
     state.turnSegment = 1;
     state.turnSegmentSize = 0;
-    updateStreamLabel();
-    setStreamingUI(false);
-    updateControls();
-    if (!state.sawCancelled && !state.turnHadError && !state.turnReasoningOnly &&
-        modeAtSend === 'PLAN' && state.turnHadContent) {
+    if (viewIsActive(view)) updateStreamLabel();
+    if (!view.sawCancelled && !view.turnHadError && !view.turnReasoningOnly &&
+        modeAtSend === 'PLAN' && view.turnHadContent) {
       addPlanReadyCard();
     }
+  });
+  if (viewIsActive(view)) {
+    setStreamingUI(false);
+    updateControls();
     maybeScroll(true);
-    updateSessionTabCosts();
+  } else if (view.turnHadError) {
+    const session = state.sessions.find((s) => s.id === view.sessionId);
+    toast(`${session?.title || 'Background agent'} failed — open the chat for details`, 'error');
+  } else if (!view.sawCancelled) {
+    view.finishedUnseen = true;
+    const session = state.sessions.find((s) => s.id === view.sessionId);
+    toast(`${session?.title || 'Background agent'} finished`, 'success');
   }
+  runIndex.delete(view.sessionId);
+  updateSessionTabCosts();
+  renderTabs();
+}
+
+// attachSessionRun re-attaches a session view to whatever the server is still
+// running. The turn never depended on the browser, so this only replays the
+// events produced while the view was detached.
+async function attachSessionRun(sessionId, view, after = 0) {
+  const v = view || viewFor(sessionId, { create: true });
+  if (!v || v.attached) return;
+  v.attached = true;
+  v.streaming = true;
+  v.finishedUnseen = false;
+  const modeAtSend = state.sessions.find((s) => s.id === sessionId)?.mode || 'PLAN';
+  withView(v, () => {
+    if (viewIsActive(v)) setStreamingUI(true);
+    startTurnClock();
+  });
+  try {
+    const res = await fetch(`/api/sessions/${sessionId}/stream?after=${Number(after || 0)}`, {
+      headers: { Accept: 'text/event-stream' },
+    });
+    if (res.status === 204) return;
+    if (!res.ok || !res.body) throw new Error(`Could not re-attach to the agent (${res.status})`);
+    await readSSE(res.body, v);
+  } catch (err) {
+    withView(v, () => addNotice(err.message || 'Lost the connection to the agent', 'error'));
+  } finally {
+    v.attached = false;
+    finishTurnView(v, modeAtSend);
+  }
+}
+
+// resumeSessionRun continues a view that was streaming before a navigation or a
+// reload, replaying only the events it has not seen yet.
+function resumeSessionRun(sessionId, view) {
+  return attachSessionRun(sessionId, view, view ? view.seq : 0);
 }
 
 async function compactConversation() {
@@ -940,7 +1239,7 @@ async function compactConversation() {
   }
 }
 
-async function readSSE(body) {
+async function readSSE(body, view = null) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -953,17 +1252,19 @@ async function readSSE(body) {
     while ((idx = buffer.indexOf('\n\n')) >= 0) {
       const block = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
-      handleSSEBlock(block);
+      handleSSEBlock(block, view);
     }
   }
   buffer += decoder.decode();
-  if (buffer.trim()) handleSSEBlock(buffer);
+  if (buffer.trim()) handleSSEBlock(buffer, view);
 }
 
-function handleSSEBlock(block) {
+function handleSSEBlock(block, view = null) {
   const dataLines = [];
+  let seq = 0;
   for (const line of block.split('\n')) {
     if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+    else if (line.startsWith('id:')) seq = Number(line.slice(3).trim()) || 0;
   }
   if (!dataLines.length) return;
   let ev;
@@ -972,9 +1273,13 @@ function handleSSEBlock(block) {
   } catch {
     return;
   }
-  handleEvent(ev);
+  // Remember the last sequence seen so a re-attach replays only what is new.
+  if (view && seq > view.seq) view.seq = seq;
+  withView(view, () => handleEvent(ev));
 }
 
+// handleEvent mutates the view selected by withView, so events from a
+// background agent never touch the transcript on screen.
 function handleEvent(ev) {
   switch (ev.type) {
     case 'round_start':
@@ -1047,7 +1352,11 @@ function handleEvent(ev) {
     case 'session':
       if (ev.session) {
         syncSession(ev.session);
-        if (ev.session.title) document.title = `${ev.session.title} · Forge`;
+        // Only the chat on screen owns the window title: a background agent
+        // must not rename the tab of the chat the user is reading.
+        if (ev.session.title && viewIsActive(currentView())) {
+          document.title = `${ev.session.title} · Forge`;
+        }
       }
       break;
     case 'done':
@@ -1098,7 +1407,7 @@ function beginRound(num) {
   finalizeRound();
   const round = makeRoundElement();
   round.num = num || 0;
-  $('messages').appendChild(round.el);
+  messagesEl().appendChild(round.el);
   round.thinking = addThinkingRow(round);
   state.currentRound = round;
   if (state.streaming) attachTurnTimer(round);
@@ -1439,7 +1748,7 @@ function addNotice(text, kind) {
   const div = document.createElement('div');
   div.className = 'notice ' + (kind || '');
   div.textContent = text;
-  $('messages').appendChild(div);
+  messagesEl().appendChild(div);
   maybeScroll(true);
 }
 
@@ -1461,7 +1770,7 @@ function addLimitNotice(ev) {
 // addContinueNotice renders a checkpoint with an explicit Continue action.
 function addContinueNotice(text) {
   const round = state.currentRound;
-  const host = round ? round.events : $('messages');
+  const host = round ? round.events : messagesEl();
   const div = document.createElement('div');
   div.className = 'notice checkpoint';
   const label = document.createElement('span');
@@ -1586,16 +1895,68 @@ function applyUsage(ev) {
     state.usage.contextTokens = ev.context_tokens;
     state.usage.contextExact = true;
   }
-  if (state.session) {
-    if (ev.session_tokens_in !== undefined) state.session.tokens_in = ev.session_tokens_in;
-    if (ev.session_tokens_out !== undefined) state.session.tokens_out = ev.session_tokens_out;
-    if (ev.session_cost_usd !== undefined) state.session.cost_usd = ev.session_cost_usd;
+  if (ev.history_rounds !== undefined) state.usage.rounds = ev.history_rounds;
+  if (ev.pruned_rounds !== undefined) state.usage.prunedRounds = ev.pruned_rounds;
+  if (ev.pruned_chars !== undefined) state.usage.prunedChars = ev.pruned_chars;
+  // Usage belongs to the session that produced it, on screen or in background.
+  const view = currentView();
+  const session = view ? state.sessions.find((s) => s.id === view.sessionId) : state.session;
+  if (session) {
+    if (ev.session_tokens_in !== undefined) session.tokens_in = ev.session_tokens_in;
+    if (ev.session_tokens_out !== undefined) session.tokens_out = ev.session_tokens_out;
+    if (ev.session_cost_usd !== undefined) session.cost_usd = ev.session_cost_usd;
   }
   if (state.activeProject && ev.project_cost_usd !== undefined) {
     state.activeProject.total_cost_usd = ev.project_cost_usd;
     updateProjectTotals(state.activeProject);
   }
+  savePruneState();
   updateUsageUI();
+}
+
+// Pruning stats describe the last request, so they are cached per session to
+// survive a reload instead of resetting to "nothing pruned".
+function pruneStorageKey(sessionID = state.activeSessionId) {
+  return sessionID ? `forge.prune.${sessionID}` : '';
+}
+
+function loadPruneState(sessionID) {
+  const key = pruneStorageKey(sessionID);
+  if (!key) return null;
+  try {
+    const raw = JSON.parse(localStorage.getItem(key) || 'null');
+    if (!raw || typeof raw.rounds !== 'number') return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+function savePruneState() {
+  const key = pruneStorageKey();
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({
+      rounds: state.usage.rounds || 0,
+      prunedRounds: state.usage.prunedRounds || 0,
+      prunedChars: state.usage.prunedChars || 0,
+    }));
+  } catch { /* ignore */ }
+}
+
+function countToolRounds(messages) {
+  let rounds = 0;
+  for (const m of messages || []) {
+    if (m.role !== 'assistant') continue;
+    let calls = [];
+    try {
+      calls = Array.isArray(m.tool_calls) ? m.tool_calls : JSON.parse(m.tool_calls || '[]');
+    } catch {
+      calls = [];
+    }
+    if (Array.isArray(calls) && calls.length) rounds++;
+  }
+  return rounds;
 }
 
 function contextLimit(model) {
@@ -1630,7 +1991,7 @@ function updateUsageUI() {
     `${state.usage.contextExact ? '' : 'est. '}${formatNum(used)} / ${formatLimit(limit)} tokens`;
   $('contextMeta').title =
     `${used} / ${limit} tokens in the current context (prompt + response). ` +
-    'The session input/output totals below add every model round.';
+    'Session totals in the accordion below add every model round.';
   $('tokensIn').textContent = formatNum(state.usage.sessionIn);
   $('tokensOut').textContent = formatNum(state.usage.sessionOut);
   $('cachedTokens').textContent = formatNum(state.usage.cached);
@@ -1642,9 +2003,67 @@ function updateUsageUI() {
     'Cache hits require an identical prompt prefix and the same upstream provider.';
   $('sessionCost').textContent = formatCost(state.usage.sessionCost);
   $('projectCost').textContent = formatCost(state.usage.projectCost);
+  updatePruneUI();
   updateSessionTimeUI();
   const status = $('sessionStatus');
   if (status) status.textContent = state.session ? formatLimit(limit) + ' ctx' : '';
+}
+
+// Each dot is one tool round in the persisted history, oldest first. Blue
+// means the round was sent verbatim; amber means it was stubbed before the
+// request. Pruning always targets the oldest rounds, so amber forms a prefix.
+function updatePruneUI() {
+  const rounds = Math.max(0, Math.floor(state.usage.rounds || 0));
+  const pruned = Math.min(rounds, Math.max(0, Math.floor(state.usage.prunedRounds || 0)));
+  const savedChars = Math.max(0, Math.floor(state.usage.prunedChars || 0));
+  const savedTokens = Math.ceil(savedChars / 4);
+
+  const pill = $('prunePill');
+  pill.classList.toggle('d-none', pruned <= 0);
+  if (pruned > 0) {
+    pill.textContent = `${formatNum(pruned)} pruned`;
+    pill.title =
+      `${pruned} of ${rounds} tool rounds stubbed before the last request` +
+      (savedChars > 0 ? ` (~${formatNum(savedTokens)} tokens saved).` : '.') +
+      ' Click to inspect.';
+  }
+
+  $('roundsCount').textContent = formatNum(rounds);
+
+  const meta = $('pruneMeta');
+  const dots = $('pruneDots');
+  const legend = document.querySelector('#usageDetails .prune-legend');
+  dots.innerHTML = '';
+
+  if (!rounds) {
+    meta.textContent = 'no rounds yet';
+    meta.title = 'Pruning stats appear after the first model response.';
+    dots.setAttribute('aria-label', 'No tool rounds in context');
+    if (legend) legend.classList.add('d-none');
+    const empty = document.createElement('span');
+    empty.className = 'prune-empty';
+    empty.textContent = 'Tool rounds appear here as the agent works.';
+    dots.appendChild(empty);
+    return;
+  }
+  if (legend) legend.classList.remove('d-none');
+
+  meta.textContent = `${pruned}/${rounds} pruned` +
+    (savedChars > 0 ? ` · ${formatNum(savedChars)} chars saved` : '');
+  meta.title = savedChars > 0
+    ? `About ${formatNum(savedTokens)} tokens saved in the last request, including per-result clipping.`
+    : 'The last request sent every tool round verbatim.';
+
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < rounds; i++) {
+    const dot = document.createElement('span');
+    const isPruned = i < pruned;
+    dot.className = 'prune-dot' + (isPruned ? ' pruned' : '');
+    dot.title = `Round ${i + 1} · ${isPruned ? 'pruned from the context' : 'sent in full'}`;
+    frag.appendChild(dot);
+  }
+  dots.appendChild(frag);
+  dots.setAttribute('aria-label', `${rounds} tool rounds, ${pruned} pruned, oldest first`);
 }
 
 function rememberFile(path, action) {
@@ -1850,25 +2269,52 @@ function setModeUI(mode) {
       : 'BUILD mode can edit files and run commands';
 }
 
+// busySessions counts the chats with a live agent, on screen or in background.
+function busySessions() {
+  let n = 0;
+  for (const view of chatViews.values()) if (view.streaming) n += 1;
+  return Math.max(n, runIndex.size);
+}
+
+function updateRunSummary() {
+  const el = $('runSummary');
+  if (!el) return;
+  const total = busySessions();
+  const others = Math.max(0, total - (state.streaming ? 1 : 0));
+  if (others > 0) {
+    el.classList.remove('d-none');
+    el.textContent = `${others} other agent${others === 1 ? '' : 's'} running`;
+    el.title = 'Agents keep working when you switch chat or project';
+  } else {
+    el.classList.add('d-none');
+    el.textContent = '';
+  }
+}
+
 function setStreamingUI(streaming) {
   $('streamIndicator').classList.toggle('d-none', !streaming);
+  // A background agent must never lock the composer of the chat on screen:
+  // only the active view's run disables input.
   $('stopBtn').classList.toggle('d-none', !streaming);
   $('stopBtn').disabled = false;
   $('modelInput').disabled = streaming || !state.session;
   for (const btn of $('modeToggle').querySelectorAll('button')) btn.disabled = streaming || !state.session;
   updateSendState();
+  updateRunSummary();
 }
 
 function updateControls() {
   const hasSession = !!state.session;
-  $('modelInput').disabled = state.streaming || !hasSession;
-  for (const btn of $('modeToggle').querySelectorAll('button')) btn.disabled = state.streaming || !hasSession;
+  const busy = state.streaming;
+  $('modelInput').disabled = busy || !hasSession;
+  for (const btn of $('modeToggle').querySelectorAll('button')) btn.disabled = busy || !hasSession;
   $('promptInput').disabled = !hasSession;
   $('newSessionBtn').disabled = !state.activeProjectId;
   $('manageProjectBtn').disabled = !state.activeProjectId;
   $('manageSessionsBtn').disabled = !state.activeProjectId;
   updateSendState();
   updateUsageUI();
+  updateRunSummary();
 }
 
 function updateSendState() {
@@ -1878,6 +2324,9 @@ function updateSendState() {
 }
 
 function maybeScroll(force = false) {
+  // Only the mounted view owns the scroll position: a background agent must not
+  // yank the chat the user is reading.
+  if (!viewIsActive(currentView())) return;
   const el = $('chatScroll');
   const near = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
   if (force || near) el.scrollTop = el.scrollHeight;
@@ -2940,7 +3389,6 @@ async function openSessionFromModal(session) {
         persistTabOrder();
       }
     }
-    if (state.streaming) stopStream();
     if (sessionsModal) sessionsModal.hide();
     await loadSession(session.id);
   } catch (err) {
@@ -2951,9 +3399,11 @@ async function openSessionFromModal(session) {
 async function deleteSession(session) {
   const ok = window.confirm(`Delete "${session.title || 'New Chat'}" permanently? This cannot be undone.`);
   if (!ok) return;
-  if (state.streaming && session.id === state.activeSessionId) stopStream();
   try {
+    // The server stops the agent and lets it persist before deleting.
     await api(`/api/sessions/${session.id}`, { method: 'DELETE' });
+    dropView(session.id);
+    runIndex.delete(session.id);
     state.sessions = state.sessions.filter((s) => s.id !== session.id);
     state.allSessions = state.allSessions.filter((s) => s.id !== session.id);
     if (session.id === state.activeSessionId) {
@@ -3199,7 +3649,7 @@ async function toggleMode() {
 
 function navigateUserMessage(dir) {
   // Cycle only the user's own messages; assistant/tool rounds are skipped.
-  const all = [...$('messages').querySelectorAll('.msg')];
+  const all = [...messagesEl().querySelectorAll('.msg')];
   const items = all.filter((el) => el.classList.contains('msg-user'));
   if (!items.length) return;
   all.forEach((el) => el.classList.remove('msg-focus'));
@@ -3217,10 +3667,17 @@ function navigateUserMessage(dir) {
   items[idx].scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
-function stopStream() {
-  if (state.abort) {
-    try {
-      state.abort.abort();
-    } catch { /* ignore */ }
+// stopStream asks the server to cancel the active chat's run. Detaching the
+// event stream would not stop the agent any more, because runs live on the
+// server; the explicit endpoint is what ends the turn.
+async function stopStream() {
+  const sessionId = state.session?.id || state.activeSessionId;
+  if (!sessionId) return;
+  const view = viewFor(sessionId);
+  if (view) view.stopRequested = true;
+  try {
+    await api(`/api/sessions/${sessionId}/stop`, { method: 'POST', body: JSON.stringify({}) });
+  } catch (err) {
+    toast(err.message || 'Could not stop the agent', 'error');
   }
 }

@@ -32,6 +32,11 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if s.runs.liveRun(id) != nil {
+		apiError(w, http.StatusConflict,
+			"this chat has a running agent; stop it or wait for it to finish before compacting")
+		return
+	}
 	session, err := s.store.GetSession(id)
 	if errors.Is(err, store.ErrNotFound) {
 		apiError(w, http.StatusNotFound, "session not found")
