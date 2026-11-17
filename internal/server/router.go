@@ -230,6 +230,7 @@ func (s *Server) publicConfig() map[string]any {
 		"api_key_set": set,
 		"log_path":    logPath,
 		"debug":       logx.DebugEnabled(),
+		"llm_debug":   logx.LLMEnabled(),
 	}
 }
 
@@ -304,7 +305,8 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := s.cfg.Get()
-	logx.ApplyDebug(next.Server.Debug)
+	logx.ApplyDebug(next.Server.Debug || next.Server.DebugLLM)
+	logx.ApplyLLM(next.Server.DebugLLM)
 	if current.Providers.OpenRouter.BaseURL != next.Providers.OpenRouter.BaseURL ||
 		current.Providers.OpenRouter.APIKey != next.Providers.OpenRouter.APIKey {
 		s.modelsMu.Lock()

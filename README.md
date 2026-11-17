@@ -24,7 +24,7 @@ Or directly:
 ./forge --port 7890 --no-browser
 ```
 
-Flags: `--host`, `--port`, `--no-browser`, `--debug`, `--log-file`, `--version`.
+Flags: `--host`, `--port`, `--no-browser`, `--debug`, `--debug-llm`, `--log-file`, `--version`.
 Configured host/port are used when the flags are omitted.
 
 ## Files
@@ -190,6 +190,7 @@ system shortcuts.
     "port": 7890,
     "auto_open_browser": true,
     "debug": false,
+    "debug_llm": false,
     "log_file": ""
   },
   "providers": {
@@ -233,8 +234,34 @@ Enable it with any of:
 
 `--debug` and `FORGE_DEBUG=1` win over the config file, so turning the switch
 off in the UI will not silence a forced debug session. The log rotates to
-`forge.log.1` at 10 MB. API keys are never written to the log; message content
-is not logged, only sizes and metadata.
+`forge.log.1` at 10 MB. API keys are never written to the log; at the debug
+level message content is not logged, only sizes and metadata.
+
+### LLM payload tracing (`--debug-llm`)
+
+`--debug-llm` adds a level *below* DEBUG that records everything exchanged with
+the model:
+
+- the full request body — model, `tool_choice`, the system prompt, every message
+  in the pruned history (including tool results) and the tool schemas;
+- every raw SSE chunk as it arrives (content deltas, reasoning deltas,
+  tool-call fragments and the final `[DONE]`);
+- the assembled response — reasoning, content, tool calls with their arguments
+  and token usage — plus the request id and upstream headers of the response;
+- the complete provider error body before it is truncated for the UI.
+
+Enable it with any of:
+
+- Settings → **Logging → LLM payload tracing** (applies immediately, implies debug)
+- `./forge --debug-llm`
+- `FORGE_LLM_DEBUG=1 ./forge`
+- `"debug_llm": true` in `config.json`
+
+Records are labelled `level=LLM` and dumps are written as indented JSON blocks
+so they stay readable. This mode **does** write prompt and tool output content to
+the log, so treat the log file as sensitive. API keys and the `Authorization`
+header are never written at any level, and `--debug-llm` / `FORGE_LLM_DEBUG=1`
+win over the config file like `--debug` does.
 
 ## Model context windows
 

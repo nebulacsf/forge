@@ -29,7 +29,10 @@ type ServerConfig struct {
 	Port            int    `json:"port"`
 	AutoOpenBrowser bool   `json:"auto_open_browser"`
 	Debug           bool   `json:"debug"`
-	LogFile         string `json:"log_file"`
+	// DebugLLM enables the extra-verbose LLM trace level (--debug-llm): every
+	// request and response payload sent to the model is written to the log.
+	DebugLLM bool   `json:"debug_llm"`
+	LogFile  string `json:"log_file"`
 }
 
 type ProvidersConfig struct {

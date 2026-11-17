@@ -437,6 +437,16 @@
               Records every request, model round, and tool call. Applies immediately.
               Also available as <code>--debug</code> or <code>FORGE_DEBUG=1</code>.
             </div>
+            <div class="form-check form-switch mt-2">
+              <input id="debugLLMToggle" class="form-check-input" type="checkbox">
+              <label class="form-check-label" for="debugLLMToggle">LLM payload tracing</label>
+            </div>
+            <div class="form-text">
+              Extra verbose: logs the full request sent to the model (messages, tool schemas),
+              every stream chunk, the response and its reasoning. Implies debug logging and
+              writes prompt content to the log. Applies immediately.
+              Also available as <code>--debug-llm</code> or <code>FORGE_LLM_DEBUG=1</code>.
+            </div>
             <div class="settings-path">Log file: <code id="logPath">~/.forge/forge.log</code></div>
           </div>
 

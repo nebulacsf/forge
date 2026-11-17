@@ -9,6 +9,7 @@ const state = {
   configPath: '',
   logPath: '',
   debugActive: false,
+  llmDebugActive: false,
   apiKeySet: false,
   models: new Map(),
   modelsSource: '',
@@ -126,6 +127,7 @@ async function loadConfig() {
   state.configPath = data.path;
   state.logPath = data.log_path || '';
   state.debugActive = !!data.debug;
+  state.llmDebugActive = !!data.llm_debug;
   state.apiKeySet = !!data.api_key_set;
 }
 
@@ -2485,6 +2487,7 @@ function openSettings() {
   $('serverPort').value = cfg.server.port || 7890;
   $('autoBrowser').checked = !!cfg.server.auto_open_browser;
   $('debugToggle').checked = !!cfg.server.debug || !!state.debugActive;
+  $('debugLLMToggle').checked = !!cfg.server.debug_llm || !!state.llmDebugActive;
   $('logPath').textContent = state.logPath || '~/.forge/forge.log';
   $('configPath').textContent = state.configPath || '~/.forge/config.json';
   if (settingsModal) settingsModal.show();
@@ -2521,6 +2524,8 @@ async function saveSettings(e) {
   cfg.server.port = Number($('serverPort').value) || 7890;
   cfg.server.auto_open_browser = $('autoBrowser').checked;
   cfg.server.debug = $('debugToggle').checked;
+  cfg.server.debug_llm = $('debugLLMToggle').checked;
+  if (cfg.server.debug_llm) cfg.server.debug = true;
 
   const before = state.config;
   try {
@@ -2529,11 +2534,15 @@ async function saveSettings(e) {
     state.configPath = data.path;
     state.logPath = data.log_path || state.logPath;
     state.debugActive = !!data.debug;
+    state.llmDebugActive = !!data.llm_debug;
     state.apiKeySet = !!data.api_key_set;
     if (settingsModal) settingsModal.hide();
     toast('Settings saved', 'success');
     if (before.server.debug !== state.config.server.debug) {
       toast(state.config.server.debug ? 'Debug logging enabled' : 'Debug logging disabled', 'success');
+    }
+    if (before.server.debug_llm !== state.config.server.debug_llm) {
+      toast(state.config.server.debug_llm ? 'LLM payload tracing enabled' : 'LLM payload tracing disabled', 'success');
     }
     if (before.server.port !== state.config.server.port || before.server.host !== state.config.server.host) {
       toast('Host/port will apply after restarting Forge', 'success');
@@ -2562,6 +2571,7 @@ function resetDefaults() {
   $('serverPort').value = 7890;
   $('autoBrowser').checked = true;
   $('debugToggle').checked = false;
+  $('debugLLMToggle').checked = false;
   $('baseURL').value = 'https://openrouter.ai/api/v1';
   toast('Defaults restored — click Save settings to persist', 'success');
 }

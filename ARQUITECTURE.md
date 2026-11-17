@@ -300,6 +300,11 @@ transaction.
 - HTTP middleware: method, path, status, duration, bytes
 - Provider logs: model, tokens, cost, latency per round
 - Debug: `--debug`, `FORGE_DEBUG=1`, `config.server.debug` (hot-reload)
+- LLM trace: `--debug-llm`, `FORGE_LLM_DEBUG=1`, `config.server.debug_llm`
+  (hot-reload). An extra level below DEBUG that dumps the full provider
+  request body, every raw SSE chunk, the assembled response and provider error
+  bodies. Implies DEBUG; API keys and the `Authorization` header are never
+  logged.
 
 ---
 

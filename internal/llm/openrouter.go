@@ -164,7 +164,11 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(body))
+	endpoint := c.BaseURL + "/chat/completions"
+	callID := nextCallID()
+	traceRequest(callID, endpoint, body)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -174,7 +178,7 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 	httpReq.Header.Set("HTTP-Referer", "https://github.com/forge-harness/forge")
 	httpReq.Header.Set("X-Title", "Forge")
 
-	logx.Debug("provider request", "url", c.BaseURL+"/chat/completions", "model", req.Model,
+	logx.Debug("provider request", "call", callID, "url", endpoint, "model", req.Model,
 		"messages", len(req.Messages), "tools", len(req.Tools))
 
 	started := time.Now()
@@ -186,9 +190,11 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		traceErrorBody(callID, resp.StatusCode, data)
 		return nil, providerError(resp.StatusCode, data)
 	}
-	logx.Debug("provider response", "status", resp.StatusCode, "latency", time.Since(started).Round(time.Millisecond).String())
+	traceResponse(callID, resp.StatusCode, resp.Header)
+	logx.Debug("provider response", "call", callID, "status", resp.StatusCode, "latency", time.Since(started).Round(time.Millisecond).String())
 
 	result := &StreamResult{}
 	chunks := 0
@@ -209,8 +215,10 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 				continue
 			}
 			if line == "[DONE]" {
+				logx.LLMTrace("llm stream done", "call", callID)
 				return io.EOF
 			}
+			traceChunk(callID, line)
 			var chunk streamChunk
 			if err := json.Unmarshal([]byte(line), &chunk); err != nil {
 				// Keep streaming through malformed keep-alive or provider
@@ -333,7 +341,8 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 		}
 		result.ToolCalls = append(result.ToolCalls, call)
 	}
-	logx.Debug("provider stream complete", "model", result.Model, "chunks", chunks,
+	traceResult(callID, result)
+	logx.Debug("provider stream complete", "call", callID, "model", result.Model, "chunks", chunks,
 		"content_chars", len(result.Content), "reasoning_chars", len(result.Reasoning),
 		"tool_calls", len(result.ToolCalls), "prompt_tokens", result.Usage.PromptTokens,
 		"completion_tokens", result.Usage.CompletionTokens, "cost", result.Usage.Cost,

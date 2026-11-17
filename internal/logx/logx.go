@@ -1,5 +1,10 @@
 // Package logx provides leveled logging to stderr and a rotating local log
 // file. Debug logging is opt-in and never records API keys or full prompts.
+//
+// A second, lower tier (LLM) is available through --debug-llm. It dumps the
+// complete provider payloads verbatim: every message sent to the model, the
+// raw stream chunks, the assembled response and provider error bodies. API keys
+// and the Authorization header are never written at any level.
 package logx
 
 import (
@@ -8,9 +13,16 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// LevelLLM is the trace level used by --debug-llm. It sits below DEBUG so
+// enabling it also enables every DEBUG record.
+const LevelLLM = slog.LevelDebug - 4
 
 // Options configures the process logger.
 type Options struct {
@@ -18,6 +30,11 @@ type Options struct {
 	// configuration later turns it off (used for --debug / FORGE_DEBUG).
 	Debug      bool
 	ForceDebug bool
+	// LLMDebug enables the LLM trace level below DEBUG. ForceLLM keeps it on
+	// even if the configuration later turns it off (--debug-llm /
+	// FORGE_LLM_DEBUG).
+	LLMDebug bool
+	ForceLLM bool
 	// FilePath is the log file to append to. Empty disables file logging.
 	FilePath string
 	// RotateBytes rotates the log file once it grows past this size.
@@ -29,15 +46,33 @@ const defaultRotateBytes = 10 << 20 // 10 MiB
 var (
 	level       = new(slog.LevelVar)
 	logger      atomic.Pointer[slog.Logger]
+	debugWanted atomic.Bool
 	forcedDebug atomic.Bool
-	fileSink    = &rotatingSink{}
+	llmWanted   atomic.Bool
+	forcedLLM   atomic.Bool
+	fileSink              = &rotatingSink{}
+	sink        io.Writer = io.MultiWriter(os.Stderr, fileSink)
+	dumpMu      sync.Mutex
 )
 
 func init() {
-	logger.Store(slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, fileSink), &slog.HandlerOptions{
-		Level: level,
+	logger.Store(slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{
+		Level:       level,
+		ReplaceAttr: replaceAttr,
 	})))
 	level.Set(slog.LevelInfo)
+}
+
+// replaceAttr renames the custom trace level so records read "level=LLM"
+// instead of the raw numeric value.
+func replaceAttr(_ []string, a slog.Attr) slog.Attr {
+	if a.Key != slog.LevelKey {
+		return a
+	}
+	if l, ok := a.Value.Any().(slog.Level); ok && l <= LevelLLM {
+		a.Value = slog.StringValue("LLM")
+	}
+	return a
 }
 
 // Init configures the global logger. It is safe to call more than once.
@@ -45,7 +80,11 @@ func Init(o Options) error {
 	if o.ForceDebug {
 		forcedDebug.Store(true)
 	}
+	if o.ForceLLM {
+		forcedLLM.Store(true)
+	}
 	applyDebug(o.Debug)
+	applyLLM(o.LLMDebug)
 	if o.FilePath == "" {
 		return nil
 	}
@@ -58,9 +97,21 @@ func ApplyDebug(enabled bool) {
 	applyDebug(enabled)
 }
 
-// DebugEnabled reports whether DEBUG output is currently active.
+// ApplyLLM updates the LLM trace switch at runtime, respecting an explicitly
+// forced trace mode from the command line or environment.
+func ApplyLLM(enabled bool) {
+	applyLLM(enabled)
+}
+
+// DebugEnabled reports whether DEBUG output is currently active. The LLM trace
+// level implies DEBUG.
 func DebugEnabled() bool {
 	return level.Level() <= slog.LevelDebug
+}
+
+// LLMEnabled reports whether full LLM payload tracing is active.
+func LLMEnabled() bool {
+	return level.Level() <= LevelLLM
 }
 
 // Close flushes and closes the log file.
@@ -78,6 +129,36 @@ func Info(msg string, args ...any)  { write(slog.LevelInfo, msg, args...) }
 func Warn(msg string, args ...any)  { write(slog.LevelWarn, msg, args...) }
 func Error(msg string, args ...any) { write(slog.LevelError, msg, args...) }
 
+// LLMTrace writes one trace record at the LLM level. Short values (ids, sizes,
+// single stream chunks) belong here; whole payloads should use LLMDump.
+func LLMTrace(msg string, args ...any) { write(LevelLLM, msg, args...) }
+
+// LLMDump writes a raw, multi-line block at the LLM level. It bypasses the slog
+// text handler on purpose: the handler would escape newlines and quotes, which
+// makes JSON payloads unreadable.
+func LLMDump(label, text string) {
+	if !LLMEnabled() {
+		return
+	}
+	text = strings.TrimRight(text, "\n")
+	var b strings.Builder
+	b.WriteString(time.Now().UTC().Format(time.RFC3339Nano))
+	b.WriteString(" level=LLM msg=")
+	b.WriteString(strconv.Quote(label))
+	b.WriteString("\n")
+	if text == "" {
+		text = "(empty)"
+	}
+	for _, line := range strings.Split(text, "\n") {
+		b.WriteString("    ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	dumpMu.Lock()
+	defer dumpMu.Unlock()
+	_, _ = io.WriteString(sink, b.String())
+}
+
 // Fatalf logs at ERROR level and exits with status 1.
 func Fatalf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
@@ -94,11 +175,24 @@ func write(l slog.Level, msg string, args ...any) {
 }
 
 func applyDebug(enabled bool) {
-	if enabled || forcedDebug.Load() {
+	debugWanted.Store(enabled)
+	applyLevels()
+}
+
+func applyLLM(enabled bool) {
+	llmWanted.Store(enabled)
+	applyLevels()
+}
+
+func applyLevels() {
+	switch {
+	case forcedLLM.Load() || llmWanted.Load():
+		level.Set(LevelLLM)
+	case forcedDebug.Load() || debugWanted.Load():
 		level.Set(slog.LevelDebug)
-		return
+	default:
+		level.Set(slog.LevelInfo)
 	}
-	level.Set(slog.LevelInfo)
 }
 
 // rotatingSink is an io.Writer that appends to the current log file.

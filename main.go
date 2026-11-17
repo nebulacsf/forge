@@ -36,6 +36,7 @@ func main() {
 		port      int
 		noBrowser bool
 		debug     bool
+		debugLLM  bool
 		logFile   string
 		showVer   bool
 	)
@@ -43,6 +44,7 @@ func main() {
 	flag.IntVar(&port, "port", 0, "override the configured HTTP port")
 	flag.BoolVar(&noBrowser, "no-browser", false, "do not open the browser on startup")
 	flag.BoolVar(&debug, "debug", false, "enable verbose DEBUG logging")
+	flag.BoolVar(&debugLLM, "debug-llm", false, "log every LLM request and response payload in full (implies --debug)")
 	flag.StringVar(&logFile, "log-file", "", "write logs to this file (default: <forge home>/forge.log)")
 	flag.BoolVar(&showVer, "version", false, "print the version and exit")
 	flag.Parse()
@@ -60,8 +62,13 @@ func main() {
 	cfg := cfgMgr.Get()
 
 	envDebug := envBool("FORGE_DEBUG")
-	debug = debug || envDebug || cfg.Server.Debug
-	debugForced := debug && (flagDebugSet() || envDebug)
+	envLLM := envBool("FORGE_LLM_DEBUG") || envBool("FORGE_DEBUG_LLM")
+	debugLLM = debugLLM || envLLM || cfg.Server.DebugLLM
+	// The trace level sits below DEBUG, so a trace session always keeps the
+	// round/session metadata that makes the dumps readable.
+	debug = debug || envDebug || cfg.Server.Debug || debugLLM
+	debugForced := debug && (flagWasSet("debug") || envDebug)
+	llmForced := debugLLM && (flagWasSet("debug-llm") || envLLM)
 
 	path := logFile
 	if path == "" {
@@ -74,13 +81,19 @@ func main() {
 	if err := logx.Init(logx.Options{
 		Debug:      debug,
 		ForceDebug: debugForced,
+		LLMDebug:   debugLLM,
+		ForceLLM:   llmForced,
 		FilePath:   path,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "forge: %v (continuing with stderr only)\n", err)
 	}
 	defer logx.Close()
 
-	logx.Info("starting forge", "version", version, "debug", logx.DebugEnabled(), "log", path)
+	logx.Info("starting forge", "version", version, "debug", logx.DebugEnabled(),
+		"llm_trace", logx.LLMEnabled(), "log", path)
+	if logx.LLMEnabled() {
+		logx.Warn("LLM payload tracing is on: prompts, tool output and responses are written to the log")
+	}
 
 	if host == "" {
 		host = cfg.Server.Host
@@ -180,11 +193,11 @@ func envBool(name string) bool {
 	}
 }
 
-// flagDebugSet reports whether --debug was passed explicitly.
-func flagDebugSet() bool {
+// flagWasSet reports whether the named flag was passed explicitly.
+func flagWasSet(name string) bool {
 	set := false
 	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "debug" {
+		if f.Name == name {
 			set = true
 		}
 	})
