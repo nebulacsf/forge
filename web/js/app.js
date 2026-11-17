@@ -1565,7 +1565,7 @@ function scheduleContentRender(round) {
 function ensureContentEl(round) {
   if (!round.contentEl) {
     round.contentEl = document.createElement('div');
-    round.contentEl.className = 'md';
+    round.contentEl.className = 'md mt-4';
     if (round.footer) round.main.insertBefore(round.contentEl, round.footer);
     else round.main.appendChild(round.contentEl);
     addRoundCopyButton(round);
@@ -2267,6 +2267,7 @@ function setModeUI(mode) {
     current === 'PLAN'
       ? 'PLAN mode is read-only — inspect files, search, and diff'
       : 'BUILD mode can edit files and run commands';
+  if (current === 'BUILD') removePlanReadyCard();
 }
 
 // busySessions counts the chats with a live agent, on screen or in background.
