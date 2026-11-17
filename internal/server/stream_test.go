@@ -1348,8 +1348,17 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
 	project := store.Project{Name: "demo", Path: "/tmp/demo"}
 	prompt := buildSystemPrompt(project, store.Session{Mode: "BUILD"}, 12, 96, 8, 24)
-	if !strings.Contains(prompt, "at most 3 one-line bullets") {
-		t.Error("BUILD system prompt is missing the compact final-message rule")
+	if !strings.Contains(prompt, "concise but informative output") {
+		t.Error("BUILD system prompt is missing the expanded final-message rule")
+	}
+	if !strings.Contains(prompt, "what changed with file paths") {
+		t.Error("BUILD system prompt missing 'what changed' guidance")
+	}
+	if !strings.Contains(prompt, "what you verified") {
+		t.Error("BUILD system prompt missing 'what you verified' guidance")
+	}
+	if !strings.Contains(prompt, "next steps for the user") {
+		t.Error("BUILD system prompt missing 'next steps' guidance")
 	}
 	for _, unwanted := range []string{"## Diagnosis & Approach", "## Key Decisions", "## Implementation Plan", "## Open Questions"} {
 		if strings.Contains(prompt, unwanted) {

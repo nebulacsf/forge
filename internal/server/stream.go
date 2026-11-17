@@ -913,9 +913,11 @@ func buildSystemPrompt(project store.Project, session store.Session, segmentSize
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
 	if session.Mode == "PLAN" {
 		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
+		b.WriteString("Respond in the language the user is speaking (preferably). All code, planning, and technical content must be in English.\n")
 		b.WriteString("When you have enough information, finish with a plan structured for human architectural review: the diagnosis, the key decisions, and the per-file implementation plan. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
 	} else {
 		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them.\n")
+		b.WriteString("Respond in the language the user is speaking. Implement changes in English by default unless the user specifies otherwise.\n")
 	}
 	allowed := make([]string, 0, 8)
 	for _, spec := range tools.Specs(session.Mode) {
@@ -982,7 +984,7 @@ Response style (strict):
   Rules: never repeat raw tool output or file dumps; never write a vague summary ("update the UI", "improve the prompt") — always name the file, the line range, and the concrete change.
 `)
 	} else {
-		b.WriteString("- BUILD final message: the most compact possible output — at most 3 one-line bullets (about 12 words each): (1) what changed, with file paths; (2) what you verified; (3) blockers or next step. No headings, no sections, no explanations, no unrequested code.\n")
+		b.WriteString("- BUILD final message: concise but informative output — include: (1) what changed with file paths; (2) what you verified (tests, builds, etc.); (3) any blockers or next steps for the user. No headings, no long explanations, no unrequested code. Keep it to about 5-7 lines maximum.\n")
 	}
 	return strings.TrimSpace(b.String())
 }
