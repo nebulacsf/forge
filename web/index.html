@@ -330,6 +330,29 @@
   </div>
 </div>
 
+<!-- ── Rename tab modal ──────────────────────────────────────────────── -->
+<div class="modal fade" id="renameTabModal" tabindex="-1" aria-hidden="true">
+  <form id="renameTabForm" class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <input type="hidden" id="renameTabSessionId" value="">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-pencil me-2"></i>Rename chat</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label for="renameTabInput" class="form-label">Chat name</label>
+          <input id="renameTabInput" class="form-control" placeholder="Enter new name" autocomplete="off" required>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-accent">Save</button>
+      </div>
+    </div>
+  </form>
+</div>
+
 <!-- ── Settings modal ──────────────────────────────────────────────── -->
 <div class="modal fade" id="settingsModal" tabindex="-1" aria-hidden="true">
   <form id="settingsForm" class="modal-dialog modal-lg modal-dialog-scrollable">

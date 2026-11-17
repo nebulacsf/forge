@@ -222,6 +222,7 @@ Object.defineProperty(state, 'usage', {
 let projectModal = null;
 let settingsModal = null;
 let sessionsModal = null;
+let renameTabModal = null;
 let dragTabId = null;
 let contentTimer = null;
 let checklistDoneOpen = false;
@@ -245,6 +246,7 @@ async function init() {
     projectModal = new bootstrap.Modal($('projectModal'));
     settingsModal = new bootstrap.Modal($('settingsModal'));
     sessionsModal = new bootstrap.Modal($('sessionsModal'));
+    renameTabModal = new bootstrap.Modal($('renameTabModal'));
     initTooltips($('settingsModal'));
   }
   try {
@@ -742,7 +744,7 @@ function renderTabs() {
     title.textContent = session.title || 'New Chat';
     title.addEventListener('dblclick', (e) => {
       e.stopPropagation();
-      startTabRename(title, session);
+      openRenameTabModal(session);
     });
     tab.appendChild(title);
 
@@ -760,55 +762,19 @@ function renderTabs() {
   }
 }
 
-// Inline rename: the tab stays in place, the title is persisted via PATCH.
-function startTabRename(label, session) {
-  const input = document.createElement('input');
-  input.className = 'tab-rename';
-  input.type = 'text';
+// Open the rename tab modal for the given session.
+function openRenameTabModal(session) {
+  const input = $('renameTabInput');
+  const sessionIdInput = $('renameTabSessionId');
+  if (!input || !sessionIdInput) return;
+  sessionIdInput.value = String(session.id);
   input.value = session.title || '';
-  input.spellcheck = false;
-  // A draggable ancestor blocks text selection, so pause dragging while editing.
-  const tab = label.closest('.session-tab');
-  if (tab) tab.draggable = false;
-  label.replaceWith(input);
-  input.focus();
-  input.select();
-  let done = false;
-  const finish = async (commit) => {
-    if (done) return;
-    done = true;
-    const next = input.value.trim();
-    label.textContent = session.title || 'New Chat';
-    input.replaceWith(label);
-    if (tab) tab.draggable = true;
-    if (!commit || !next || next === session.title) return;
-    try {
-      const data = await api(`/api/sessions/${session.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ title: next }),
-      });
-      syncSession(data.session);
-      if (session.id === state.activeSessionId && data.session.title) {
-        document.title = `${data.session.title} · Forge`;
-      }
-      if ($('sessionsModal')?.classList.contains('show')) renderSessionsList();
-    } catch (err) {
-      toast(err.message, 'error');
-    }
-  };
-  input.addEventListener('keydown', (e) => {
-    e.stopPropagation();
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      finish(true);
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      finish(false);
-    }
-  });
-  input.addEventListener('blur', () => finish(true));
-  input.addEventListener('click', (e) => e.stopPropagation());
-  input.addEventListener('dblclick', (e) => e.stopPropagation());
+  if (renameTabModal) {
+    renameTabModal.show();
+    // Focus input after modal is shown
+    const modalEl = $('renameTabModal');
+    modalEl.addEventListener('shown.bs.modal', () => input.focus(), { once: true });
+  }
 }
 
 async function closeSession(id) {
@@ -3044,6 +3010,28 @@ async function saveSettings(e) {
   }
 }
 
+async function saveRenameTab(e) {
+  e.preventDefault();
+  const sessionId = Number($('renameTabSessionId').value || 0);
+  const newTitle = $('renameTabInput').value.trim();
+  if (!sessionId || !newTitle) return;
+  try {
+    const data = await api(`/api/sessions/${sessionId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title: newTitle }),
+    });
+    syncSession(data.session);
+    if (sessionId === state.activeSessionId && data.session.title) {
+      document.title = `${data.session.title} · Forge`;
+    }
+    if ($('sessionsModal')?.classList.contains('show')) renderSessionsList();
+    if (renameTabModal) renameTabModal.hide();
+    toast('Chat renamed', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
 function resetDefaults() {
   $('defaultModel').value = 'qwen/qwen-2.5-coder-32b-instruct';
   $('defaultMode').value = 'PLAN';
@@ -3559,6 +3547,7 @@ function bindEvents() {
 
   $('projectForm').addEventListener('submit', saveProject);
   $('settingsForm').addEventListener('submit', saveSettings);
+  $('renameTabForm').addEventListener('submit', saveRenameTab);
   $('resetDefaultsBtn').addEventListener('click', resetDefaults);
   // Keep the derived token budget in sync while the two knobs are edited.
   ['defaultModel', 'historyPrunePercent', 'historyPruneMaxTokens'].forEach((id) => {
