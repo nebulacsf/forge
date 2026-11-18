@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,10 +45,12 @@ type runEvent struct {
 type run struct {
 	reg *runRegistry
 
-	SessionID int64
-	ProjectID int64
-	Mode      string
-	StartedAt time.Time
+	SessionID   int64
+	ProjectID   int64
+	ProjectName string
+	SessionName string
+	Mode        string
+	StartedAt   time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -58,6 +61,7 @@ type run struct {
 	base     uint64
 	seq      uint64
 	round    int
+	activity string
 	notify   chan struct{}
 	finished bool
 	reason   string
@@ -66,18 +70,53 @@ type run struct {
 
 func newRun(reg *runRegistry, session store.Session, project store.Project) *run {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &run{
-		reg:       reg,
-		SessionID: session.ID,
-		ProjectID: project.ID,
-		Mode:      session.Mode,
-		StartedAt: time.Now(),
-		ctx:       ctx,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		base:      1,
-		notify:    make(chan struct{}),
+	title := session.Title
+	if strings.TrimSpace(title) == "" {
+		title = "New chat"
 	}
+	return &run{
+		reg:         reg,
+		SessionID:   session.ID,
+		ProjectID:   project.ID,
+		ProjectName: project.Name,
+		SessionName: title,
+		Mode:        session.Mode,
+		StartedAt:   time.Now(),
+		ctx:         ctx,
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		base:        1,
+		notify:      make(chan struct{}),
+		activity:    "starting up",
+	}
+}
+
+// runActivity maps an event type to the short label the run list shows, so the
+// UI can say what an agent is doing without opening its chat.
+func runActivity(evType string) string {
+	switch evType {
+	case "round_start":
+		return "starting a round"
+	case "reasoning":
+		return "thinking"
+	case "content":
+		return "writing"
+	case "tool_start":
+		return "running a tool"
+	case "tool_blocked":
+		return "tool blocked"
+	case "tool_end":
+		return "tool finished"
+	case "usage":
+		return "reporting usage"
+	case "checklist":
+		return "updating checklist"
+	case "checkpoint":
+		return "checkpoint reached"
+	case "limit":
+		return "hit a limit"
+	}
+	return ""
 }
 
 // publish appends an event to the run log and wakes every subscriber.
@@ -91,6 +130,12 @@ func (r *run) publish(ev chatEvent) {
 	r.seq++
 	if ev.Type == "round_start" && ev.Round > 0 {
 		r.round = ev.Round
+	}
+	if label := runActivity(ev.Type); label != "" {
+		r.activity = label
+	}
+	if ev.Session != nil && strings.TrimSpace(ev.Session.Title) != "" {
+		r.SessionName = ev.Session.Title
 	}
 	r.events = append(r.events, runEvent{Seq: r.seq, Ev: ev})
 	if len(r.events) > runEventBuffer {
@@ -203,15 +248,20 @@ func (r *run) follow(ctx context.Context, after uint64, emit func(runEvent) erro
 	}
 }
 
-// csvStatus is the wire representation of a run for status polling.
+// runStatus is the wire representation of a run for status polling. It carries
+// enough context for the "running agents" list to be readable on its own,
+// without the client having loaded the project or the chat it belongs to.
 type runStatus struct {
-	SessionID int64  `json:"session_id"`
-	ProjectID int64  `json:"project_id"`
-	Mode      string `json:"mode"`
-	State     string `json:"state"`
-	Round     int    `json:"round"`
-	StartedAt string `json:"started_at"`
-	Seq       uint64 `json:"seq"`
+	SessionID    int64  `json:"session_id"`
+	SessionTitle string `json:"session_title"`
+	ProjectID    int64  `json:"project_id"`
+	ProjectName  string `json:"project_name"`
+	Mode         string `json:"mode"`
+	State        string `json:"state"`
+	Activity     string `json:"activity"`
+	Round        int    `json:"round"`
+	StartedAt    string `json:"started_at"`
+	Seq          uint64 `json:"seq"`
 }
 
 func (r *run) status() runStatus {
@@ -222,13 +272,16 @@ func (r *run) status() runStatus {
 		state = "done"
 	}
 	return runStatus{
-		SessionID: r.SessionID,
-		ProjectID: r.ProjectID,
-		Mode:      r.Mode,
-		State:     state,
-		Round:     r.round,
-		StartedAt: r.StartedAt.UTC().Format(time.RFC3339),
-		Seq:       r.seq,
+		SessionID:    r.SessionID,
+		SessionTitle: r.SessionName,
+		ProjectID:    r.ProjectID,
+		ProjectName:  r.ProjectName,
+		Mode:         r.Mode,
+		State:        state,
+		Activity:     r.activity,
+		Round:        r.round,
+		StartedAt:    r.StartedAt.UTC().Format(time.RFC3339),
+		Seq:          r.seq,
 	}
 }
 

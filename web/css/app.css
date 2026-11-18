@@ -310,6 +310,36 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .tabs-add:hover,
 .panel-reopen:hover { border-color: var(--accent); color: var(--accent-2); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 
+/* Running agents: the button carries a live counter of background agents and
+   the run summary in the composer opens the same list. */
+.agents-btn { position: relative; }
+.agents-btn.has-agents {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  color: var(--accent-2);
+}
+.agents-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #07090c;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+.run-summary[role="button"] { cursor: pointer; }
+.run-summary[role="button"]:hover {
+  border-color: var(--accent);
+  color: var(--accent-2);
+}
+
 .project-path-label {
   max-width: 220px;
   margin-left: 6px;
@@ -1493,6 +1523,23 @@ kbd {
   overflow-y: auto;
   padding-right: 2px;
 }
+/* ── Running agents modal ──────────────────────────────────────────── */
+.agents-list { max-height: 56vh; }
+.agents-project {
+  margin-top: 4px;
+  padding: 0 2px;
+  color: var(--muted-2);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.agents-project:first-child { margin-top: 0; }
+.agents-row .manage-row-name { cursor: pointer; }
+.agents-row .manage-row-name:hover { color: var(--accent-2); }
+.agents-pulse { margin-top: 1px; }
+.agents-meta { font-variant-numeric: tabular-nums; }
+
 .manage-row {
   display: flex;
   align-items: center;

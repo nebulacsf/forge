@@ -51,14 +51,16 @@ let renderView = null;
 const runIndex = new Map();
 let runWatchTimer = null;
 
-function makeView(sessionId) {
+function makeView(sessionId, projectId = 0) {
   const el = document.createElement('div');
   el.className = 'messages-view';
   el.dataset.session = String(sessionId || '');
   return {
     sessionId,
+    projectId,
     el,
     streaming: false,
+    stopRequested: false,
     attached: false,
     finishedUnseen: false,
     seq: 0,
@@ -90,10 +92,22 @@ function viewFor(sessionId, { create = false } = {}) {
   if (!sessionId) return null;
   let view = chatViews.get(sessionId);
   if (!view && create) {
-    view = makeView(sessionId);
+    const session = sessionById(sessionId);
+    view = makeView(sessionId, session?.project_id || state.activeProjectId || 0);
     chatViews.set(sessionId, view);
   }
   return view || null;
+}
+
+// sessionById reads a chat from the tab list or the active session, so code
+// working on a background agent never has to fall back to state.session.
+function sessionById(id) {
+  if (!id) return null;
+  const tab = state.sessions.find((s) => s.id === id);
+  if (tab) return tab;
+  const all = state.allSessions.find((s) => s.id === id);
+  if (all) return all;
+  return state.session && state.session.id === id ? state.session : null;
 }
 
 function dropView(sessionId) {
@@ -132,6 +146,13 @@ function viewIsActive(view) {
   return !!view && view === viewFor(state.activeSessionId);
 }
 
+// activeView is the view the user is looking at. Unlike currentView it ignores
+// the view currently being rendered, which is what the shared chrome and the
+// Inspector must read to stay immune to background agents.
+function activeView() {
+  return viewFor(state.activeSessionId);
+}
+
 // mountView puts a session's transcript on screen by moving its element. A
 // background agent keeps streaming into its own element, untouched.
 function mountView(view) {
@@ -143,16 +164,29 @@ function mountView(view) {
   if (view && view.el.children.length) hideEmpty();
   else showEmpty('chat');
   maybeScroll(true);
+  // The Inspector and the composer chrome belong to the chat on screen: repaint
+  // both from that view, so what a background agent wrote into its own state
+  // becomes visible only now. This is what hides Stop when opening a quiet chat.
+  renderInspector();
+  renderChrome();
 }
 
-// runIndex mirrors the server's live runs so the tab bar can show agents that
-// keep working while the user is looking at another project.
+// runIndex mirrors the server's live runs so the tab bar and the "running
+// agents" list can show agents that keep working while the user is elsewhere.
 function setRunStatus(status) {
   if (!status || !status.session_id) return;
   if (status.state === 'running') runIndex.set(status.session_id, status);
   else runIndex.delete(status.session_id);
+  afterRunIndexChange();
+}
+
+// afterRunIndexChange refreshes everything that reads runIndex. Keeping it in
+// one place means a new consumer of the index only has to be added here.
+function afterRunIndexChange() {
   renderTabs();
   updateControls();
+  updateAgentsBadge();
+  if (agentsModal && $('agentsModal')?.classList.contains('show')) renderAgentsList();
 }
 
 async function refreshRunIndex() {
@@ -162,7 +196,7 @@ async function refreshRunIndex() {
     for (const run of data.runs || []) {
       if (run.state === 'running') runIndex.set(run.session_id, run);
     }
-    renderTabs();
+    afterRunIndexChange();
   } catch { /* offline: the tab bar simply shows no spinners */ }
 }
 
@@ -186,11 +220,11 @@ const VIEW_DEFAULTS = {
 };
 
 for (const field of [
-  'streaming', 'attached', 'finishedUnseen', 'abort', 'currentRound', 'toolCards',
-  'sawCancelled', 'turnHadContent', 'turnHadError', 'turnReasoningOnly', 'turnRound',
-  'turnLimit', 'turnSegment', 'turnSegmentSize', 'messageIndex', 'sessionTimeBase',
-  'turnBaseTime', 'turnStartedAt', 'turnElapsedMs', 'turnClock', 'turnTimerEl',
-  'checklist', 'files',
+  'streaming', 'stopRequested', 'attached', 'finishedUnseen', 'abort', 'currentRound',
+  'toolCards', 'sawCancelled', 'turnHadContent', 'turnHadError', 'turnReasoningOnly',
+  'turnRound', 'turnLimit', 'turnSegment', 'turnSegmentSize', 'messageIndex',
+  'sessionTimeBase', 'turnBaseTime', 'turnStartedAt', 'turnElapsedMs', 'turnClock',
+  'turnTimerEl', 'checklist', 'files',
 ]) {
   Object.defineProperty(state, field, {
     configurable: true,
@@ -203,6 +237,11 @@ for (const field of [
     set(value) {
       const view = currentView();
       if (view) view[field] = value;
+      // Both shared surfaces are projections of the view that changed: the
+      // Inspector and the composer chrome. Scheduling is a no-op for agents
+      // that are not on screen, so a new chat-scoped field is armored by default.
+      scheduleInspector(view);
+      scheduleChrome();
     },
   });
 }
@@ -216,6 +255,8 @@ Object.defineProperty(state, 'usage', {
   set(value) {
     const view = currentView();
     if (view) view.usage = value;
+    scheduleInspector(view);
+    scheduleChrome();
   },
 });
 
@@ -223,6 +264,8 @@ let projectModal = null;
 let settingsModal = null;
 let sessionsModal = null;
 let renameTabModal = null;
+let agentsModal = null;
+let agentsTimer = null;
 let dragTabId = null;
 let contentTimer = null;
 let checklistDoneOpen = false;
@@ -247,6 +290,10 @@ async function init() {
     settingsModal = new bootstrap.Modal($('settingsModal'));
     sessionsModal = new bootstrap.Modal($('sessionsModal'));
     renameTabModal = new bootstrap.Modal($('renameTabModal'));
+    agentsModal = new bootstrap.Modal($('agentsModal'));
+    // The agents list is only polled while it is on screen.
+    $('agentsModal').addEventListener('show.bs.modal', startAgentsWatch);
+    $('agentsModal').addEventListener('hidden.bs.modal', stopAgentsWatch);
     initTooltips($('settingsModal'));
   }
   try {
@@ -467,13 +514,30 @@ function initUsageCard() {
 
 async function selectProject(id, { autoCreate = false } = {}) {
   if (!id) return;
-  // Switching project never stops a running agent: background views keep
-  // streaming and the server keeps working even if the browser goes away.
-  const project = state.projects.find((p) => p.id === id);
+  const project = await openProject(id);
   if (!project) return;
+
+  const savedSession = Number(localStorage.getItem(`forge.session.${id}`) || 0);
+  let target = state.sessions.find((s) => s.id === savedSession) || state.sessions[0];
+  if (target) {
+    await loadSession(target.id);
+  } else if (autoCreate) {
+    await createSession({ silent: true });
+  } else {
+    clearSession();
+  }
+}
+
+// openProject makes a project active and loads its open chats without choosing
+// a session. Switching project never stops a running agent: background views
+// keep streaming and the server keeps working even if the browser goes away.
+async function openProject(id) {
+  if (!id) return null;
+  const project = state.projects.find((p) => p.id === id);
+  if (!project) return null;
   state.activeProjectId = id;
   state.activeProject = project;
-  localStorage.setItem('forge.project', String(id));
+  try { localStorage.setItem('forge.project', String(id)); } catch { /* ignore */ }
   renderProjects();
   setProjectPathLabel(project);
 
@@ -486,16 +550,8 @@ async function selectProject(id, { autoCreate = false } = {}) {
   }
   sortSessionsByOrder();
   renderTabs();
-
-  const savedSession = Number(localStorage.getItem(`forge.session.${id}`) || 0);
-  let target = state.sessions.find((s) => s.id === savedSession) || state.sessions[0];
-  if (target) {
-    await loadSession(target.id);
-  } else if (autoCreate) {
-    await createSession({ silent: true });
-  } else {
-    clearSession();
-  }
+  updateControls();
+  return project;
 }
 
 async function createSession({ silent = false } = {}) {
@@ -601,32 +657,22 @@ async function activeRunFor(sessionId) {
 }
 
 function clearSession() {
-  finalizeRound();
+  const view = currentView();
+  withView(view, () => {
+    finalizeRound();
+    stopTurnClock(false);
+  });
+  // A cleared screen has no active chat, so every panel falls back to its empty
+  // state instead of keeping the numbers of the chat that was open.
   state.activeSessionId = null;
   state.session = null;
-  state.checklist = [];
-  state.files = new Map();
-  state.toolCards = new Map();
-  state.usage = {
-    sessionIn: 0, sessionOut: 0, sessionCost: 0, projectCost: 0,
-    contextTokens: 0, contextExact: false, cached: 0,
-    rounds: 0, prunedRounds: 0, prunedChars: 0,
-  };
-  stopTurnClock(false);
-  state.sessionTimeBase = 0;
-  state.turnBaseTime = 0;
-  state.turnStartedAt = 0;
-  state.turnElapsedMs = 0;
-  state.turnTimerEl = null;
   if (state.activeProjectId) localStorage.removeItem(`forge.session.${state.activeProjectId}`);
   messagesEl().innerHTML = '';
   $('modelInput').value = state.config?.defaults?.model || '';
   setModeUI(state.config?.defaults?.mode || 'PLAN');
   renderTabs();
-  renderFiles();
-  renderChecklist();
-  updateUsageUI();
-  updateControls();
+  renderInspector();
+  renderChrome();
   showEmpty('session');
   document.title = 'Forge';
 }
@@ -797,12 +843,24 @@ async function closeSession(id) {
   }
 }
 
+// syncSession merges a session update into the right place. Only the chat on
+// screen owns state.session: a background agent updating its own row (tokens,
+// title, cost) must not overwrite the chat the user is reading, nor push a chat
+// from another project into this project's tab bar.
 function syncSession(session) {
   if (!session) return;
-  state.session = { ...(state.session || {}), ...session };
+  const sameChat = !state.session || state.session.id === session.id;
+  if (sameChat && (session.is_open || session.id === state.activeSessionId || !session.id)) {
+    state.session = { ...(state.session || {}), ...session };
+  }
   const idx = state.sessions.findIndex((s) => s.id === session.id);
-  if (idx >= 0) state.sessions[idx] = { ...state.sessions[idx], ...session };
-  else if (session.is_open) state.sessions.push(session);
+  if (idx >= 0) {
+    state.sessions[idx] = { ...state.sessions[idx], ...session };
+  } else if (session.is_open && session.project_id === state.activeProjectId) {
+    state.sessions.push(session);
+  }
+  const allIdx = state.allSessions.findIndex((s) => s.id === session.id);
+  if (allIdx >= 0) state.allSessions[allIdx] = { ...state.allSessions[allIdx], ...session };
   renderTabs();
 }
 
@@ -1024,6 +1082,7 @@ async function runTurn({ content = '', isContinue = false, userText = content, a
 
   withView(view, () => {
     state.streaming = true;
+    state.stopRequested = false;
     state.sawCancelled = false;
     state.turnHadContent = false;
     state.turnHadError = false;
@@ -1032,7 +1091,7 @@ async function runTurn({ content = '', isContinue = false, userText = content, a
     state.turnLimit = 0;
     state.turnSegment = 1;
     state.turnSegmentSize = 0;
-    setStreamingUI(true);
+    setStreamingUI();
     startTurnClock();
     beginRound(0);
   });
@@ -1097,18 +1156,20 @@ function finishTurnView(view, modeAtSend = '') {
     stopTurnClock(true);
     finalizeRound();
     state.streaming = false;
+    state.stopRequested = false;
     state.turnRound = 0;
     state.turnLimit = 0;
     state.turnSegment = 1;
     state.turnSegmentSize = 0;
-    if (viewIsActive(view)) updateStreamLabel();
     if (!view.sawCancelled && !view.turnHadError && !view.turnReasoningOnly &&
         modeAtSend === 'PLAN' && view.turnHadContent) {
       addPlanReadyCard();
     }
   });
+  // The chrome is repainted for every finished run, foreground or background:
+  // when a background agent ends, the Stop button of the chat on screen is
+  // re-derived from the run index instead of keeping its previous state.
   if (viewIsActive(view)) {
-    setStreamingUI(false);
     updateControls();
     maybeScroll(true);
   } else if (view.turnHadError) {
@@ -1122,6 +1183,9 @@ function finishTurnView(view, modeAtSend = '') {
   runIndex.delete(view.sessionId);
   updateSessionTabCosts();
   renderTabs();
+  // Always repaint the chrome, even for a background run: the chat on screen
+  // derives Stop and the spinner from the run index, not from this view.
+  scheduleChrome();
 }
 
 // attachSessionRun re-attaches a session view to whatever the server is still
@@ -1132,10 +1196,11 @@ async function attachSessionRun(sessionId, view, after = 0) {
   if (!v || v.attached) return;
   v.attached = true;
   v.streaming = true;
+  v.stopRequested = false;
   v.finishedUnseen = false;
   const modeAtSend = state.sessions.find((s) => s.id === sessionId)?.mode || 'PLAN';
   withView(v, () => {
-    if (viewIsActive(v)) setStreamingUI(true);
+    if (viewIsActive(v)) setStreamingUI();
     startTurnClock();
   });
   try {
@@ -1168,7 +1233,7 @@ async function compactConversation() {
 
   state.streaming = true;
   state.abort = new AbortController();
-  setStreamingUI(true);
+  setStreamingUI();
   try {
     const res = await fetch(`/api/sessions/${state.session.id}/compact`, {
       method: 'POST',
@@ -1200,7 +1265,7 @@ async function compactConversation() {
   } finally {
     state.streaming = false;
     state.abort = null;
-    setStreamingUI(false);
+    setStreamingUI();
     updateControls();
   }
 }
@@ -1453,55 +1518,73 @@ function addHistoricalTurnTime(round, ms) {
   round.footer.appendChild(el);
 }
 
+// The turn clock is owned by the view that started it. The interval closes over
+// that view instead of reading the proxied state, so a background agent's timer
+// can never tick (or paint) the elapsed time of the chat on screen.
 function startTurnClock() {
   stopTurnClock(false);
-  const persisted = Math.max(Number(state.session?.duration_ms || 0), Number(state.sessionTimeBase || 0));
-  state.turnBaseTime = persisted;
-  state.sessionTimeBase = persisted;
-  state.turnStartedAt = Date.now();
-  state.turnElapsedMs = 0;
-  state.turnClock = setInterval(tickTurnClock, 500);
-  updateSessionTimeUI();
+  const view = currentView();
+  if (!view) return;
+  const persisted = Math.max(
+    Number(sessionById(view.sessionId)?.duration_ms || 0),
+    Number(view.sessionTimeBase || 0)
+  );
+  view.turnBaseTime = persisted;
+  view.sessionTimeBase = persisted;
+  view.turnStartedAt = Date.now();
+  view.turnElapsedMs = 0;
+  if (view.turnClock) clearInterval(view.turnClock);
+  view.turnClock = setInterval(() => tickTurnClock(view), 500);
+  scheduleInspector(view);
 }
 
-function tickTurnClock() {
-  if (!state.turnStartedAt) return;
-  state.turnElapsedMs = Date.now() - state.turnStartedAt;
-  if (state.turnTimerEl) state.turnTimerEl.textContent = formatElapsed(state.turnElapsedMs);
-  updateSessionTimeUI();
+function tickTurnClock(view) {
+  if (!view || !view.turnStartedAt) return;
+  view.turnElapsedMs = Date.now() - view.turnStartedAt;
+  if (view.turnTimerEl) view.turnTimerEl.textContent = formatElapsed(view.turnElapsedMs);
+  scheduleInspector(view);
 }
 
 function stopTurnClock(finalize = true) {
-  if (state.turnClock) {
-    clearInterval(state.turnClock);
-    state.turnClock = null;
+  const view = currentView();
+  if (!view) return;
+  if (view.turnClock) {
+    clearInterval(view.turnClock);
+    view.turnClock = null;
   }
-  if (state.turnStartedAt) {
-    state.turnElapsedMs = Date.now() - state.turnStartedAt;
-    state.turnStartedAt = 0;
+  if (view.turnStartedAt) {
+    view.turnElapsedMs = Date.now() - view.turnStartedAt;
+    view.turnStartedAt = 0;
   }
-  if (finalize && state.turnTimerEl) {
-    state.turnTimerEl.textContent = formatElapsed(state.turnElapsedMs);
-    state.turnTimerEl = null;
+  if (finalize && view.turnTimerEl) {
+    view.turnTimerEl.textContent = formatElapsed(view.turnElapsedMs);
+    view.turnTimerEl = null;
   }
-  if (finalize && state.currentRound) {
-    state.currentRound.el.classList.remove('is-working');
+  if (finalize && view.currentRound) {
+    view.currentRound.el.classList.remove('is-working');
   }
   if (finalize) {
-    const persisted = Number(state.session?.duration_ms || 0);
-    state.sessionTimeBase = Math.max(state.turnBaseTime + state.turnElapsedMs, persisted);
+    const persisted = Number(sessionById(view.sessionId)?.duration_ms || 0);
+    view.sessionTimeBase = Math.max(view.turnBaseTime + view.turnElapsedMs, persisted);
   }
-  updateSessionTimeUI();
+  scheduleInspector(view);
 }
 
-function updateSessionTimeUI() {
-  const el = $('sessionTime');
-  if (!el) return;
-  let total = Math.max(Number(state.sessionTimeBase || 0), Number(state.session?.duration_ms || 0));
-  if (state.streaming && state.turnStartedAt) {
-    total = state.turnBaseTime + (Date.now() - state.turnStartedAt);
+// sessionElapsedMS is the working time of one session, live while it streams.
+function sessionElapsedMS(view) {
+  if (!view) return 0;
+  const stored = Number(sessionById(view.sessionId)?.duration_ms || 0);
+  let total = Math.max(Number(view.sessionTimeBase || 0), stored);
+  if (view.streaming && view.turnStartedAt) {
+    total = view.turnBaseTime + (Date.now() - view.turnStartedAt);
   }
-  el.textContent = total > 0 ? formatElapsed(total) : '0s';
+  return Math.max(0, total);
+}
+
+// updateSessionTimeUI only schedules a repaint: the shared panel is painted from
+// the active view alone, so a background agent's clock cannot overwrite it.
+function updateSessionTimeUI() {
+  scheduleInspector(currentView());
 }
 
 function addThinkingRow(round) {
@@ -1760,15 +1843,20 @@ function addContinueNotice(text) {
 }
 
 function updateStreamLabel() {
+  // The round counter is shared chrome, so it always describes the chat on
+  // screen: it reads the active view directly instead of the render context.
   const label = $('streamLabel');
   if (!label) return;
-  if (state.turnRound > 0 && state.turnLimit > 0) {
-    let text = `round ${state.turnRound}/${state.turnLimit}`;
-    const segments = state.turnSegmentSize > 0
-      ? Math.ceil(state.turnLimit / state.turnSegmentSize)
-      : 1;
-    if (segments > 1 && state.turnSegment > 1) {
-      text += ` · segment ${state.turnSegment}/${segments}`;
+  const view = activeView();
+  const round = view ? view.turnRound : 0;
+  const limit = view ? view.turnLimit : 0;
+  const segment = view ? view.turnSegment : 1;
+  const segmentSize = view ? view.turnSegmentSize : 0;
+  if (round > 0 && limit > 0) {
+    let text = `round ${round}/${limit}`;
+    const segments = segmentSize > 0 ? Math.ceil(limit / segmentSize) : 1;
+    if (segments > 1 && segment > 1) {
+      text += ` · segment ${segment}/${segments}`;
     }
     label.textContent = text;
   } else {
@@ -1847,6 +1935,104 @@ function formatToolInput(name, args, raw) {
 
 /* ── Usage / files / checklist ───────────────────────────────────── */
 
+// The Inspector (usage, cost, files, checklist, session time) is shared chrome,
+// so it belongs to the chat on screen. Handlers never paint it: they mutate the
+// state of the view that produced the event and ask for a repaint. renderInspector
+// is the only writer and it always reads the active view, so a background agent
+// cannot leak its numbers into what the user is reading — and any element added
+// here later inherits that isolation for free instead of needing a guard.
+let inspectorFrame = 0;
+
+// scheduleInspector coalesces repaints and silently drops those of agents that
+// are not on screen.
+function scheduleInspector(view) {
+  if (view && !viewIsActive(view)) return;
+  if (!view && renderView) return;
+  if (inspectorFrame) return;
+  inspectorFrame = requestAnimationFrame(() => {
+    inspectorFrame = 0;
+    renderInspector();
+  });
+}
+
+function renderInspector() {
+  const view = activeView();
+  paintUsage(view);
+  paintSessionTime(view);
+  paintFiles(view);
+  paintChecklist(view);
+}
+
+function paintUsage(view) {
+  const usage = view ? view.usage : EMPTY_USAGE;
+  const session = view ? sessionById(view.sessionId) : null;
+  const limit = contextLimit(session?.model || state.config?.defaults?.model);
+  const used = Math.max(0, usage.contextTokens || 0);
+  const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+  $('ctxBar').style.width = pct.toFixed(1) + '%';
+  $('contextPct').textContent = (pct < 1 && pct > 0 ? '<1' : Math.round(pct)) + '%';
+  $('contextMeta').textContent =
+    `${usage.contextExact ? '' : 'est. '}${formatNum(used)} / ${formatLimit(limit)} tokens`;
+  $('contextMeta').title =
+    `${used} / ${limit} tokens in the current context (prompt + response). ` +
+    'Session totals in the accordion below add every model round.';
+  $('tokensIn').textContent = formatNum(usage.sessionIn);
+  $('tokensOut').textContent = formatNum(usage.sessionOut);
+  $('cachedTokens').textContent = formatNum(usage.cached);
+  const cachePct = usage.sessionIn > 0
+    ? Math.min(100, (usage.cached / usage.sessionIn) * 100)
+    : 0;
+  $('cachedTokens').parentElement.title =
+    `Cumulative prompt tokens served from the provider cache (${cachePct.toFixed(0)}% of session input). ` +
+    'Cache hits require an identical prompt prefix and the same upstream provider.';
+  $('sessionCost').textContent = formatCost(usage.sessionCost);
+  $('projectCost').textContent = formatCost(usage.projectCost);
+  paintPrune(usage);
+  const status = $('sessionStatus');
+  if (status) status.textContent = session ? formatLimit(limit) + ' ctx' : '';
+}
+
+// paintSessionTime shows the working time of the chat on screen. Its live clock
+// keeps running on the view, so switching back picks the total up again.
+function paintSessionTime(view) {
+  const el = $('sessionTime');
+  if (!el) return;
+  const total = sessionElapsedMS(view);
+  el.textContent = total > 0 ? formatElapsed(total) : '0s';
+}
+
+function paintFiles(view) {
+  const list = $('fileList');
+  if (!list) return;
+  const files = view ? view.files : new Map();
+  list.innerHTML = '';
+  $('fileCount').textContent = String(files.size);
+  if (!files.size) {
+    const empty = document.createElement('div');
+    empty.className = 'file-empty';
+    empty.textContent = 'Files read or modified in this session appear here.';
+    list.appendChild(empty);
+    return;
+  }
+  for (const [path, action] of files) {
+    const row = document.createElement('div');
+    row.className = 'file-item';
+    row.title = path;
+    const icon = document.createElement('i');
+    icon.className = 'bi ' + (isCodeFile(path) ? 'bi-file-earmark-code' : 'bi-file-earmark-text');
+    const name = document.createElement('span');
+    name.className = 'file-name';
+    name.textContent = path;
+    const badge = document.createElement('span');
+    badge.className = 'file-badge ' + action;
+    badge.textContent = action === 'modified' ? 'W' : 'R';
+    row.appendChild(icon);
+    row.appendChild(name);
+    row.appendChild(badge);
+    list.appendChild(row);
+  }
+}
+
 function applyUsage(ev) {
   if (ev.session_tokens_in !== undefined) state.usage.sessionIn = ev.session_tokens_in;
   if (ev.session_tokens_out !== undefined) state.usage.sessionOut = ev.session_tokens_out;
@@ -1864,19 +2050,29 @@ function applyUsage(ev) {
   if (ev.history_rounds !== undefined) state.usage.rounds = ev.history_rounds;
   if (ev.pruned_rounds !== undefined) state.usage.prunedRounds = ev.pruned_rounds;
   if (ev.pruned_chars !== undefined) state.usage.prunedChars = ev.pruned_chars;
-  // Usage belongs to the session that produced it, on screen or in background.
+  // Usage belongs to the session that produced it, on screen or in background,
+  // so both the totals and the project cost are attributed to the emitting view
+  // and never to whatever chat happens to be open.
   const view = currentView();
-  const session = view ? state.sessions.find((s) => s.id === view.sessionId) : state.session;
+  const session = view ? sessionById(view.sessionId) : state.session;
   if (session) {
     if (ev.session_tokens_in !== undefined) session.tokens_in = ev.session_tokens_in;
     if (ev.session_tokens_out !== undefined) session.tokens_out = ev.session_tokens_out;
     if (ev.session_cost_usd !== undefined) session.cost_usd = ev.session_cost_usd;
   }
-  if (state.activeProject && ev.project_cost_usd !== undefined) {
-    state.activeProject.total_cost_usd = ev.project_cost_usd;
-    updateProjectTotals(state.activeProject);
+  const projectId = view?.projectId || state.activeProjectId;
+  if (projectId && ev.project_cost_usd !== undefined) {
+    const project = state.projects.find((p) => p.id === projectId)
+      || (state.activeProject && state.activeProject.id === projectId ? state.activeProject : null);
+    if (project) {
+      project.total_cost_usd = ev.project_cost_usd;
+      if (state.activeProject && state.activeProject.id === projectId) {
+        state.activeProject.total_cost_usd = ev.project_cost_usd;
+      }
+      renderProjects();
+    }
   }
-  savePruneState();
+  savePruneState(view?.sessionId);
   updateUsageUI();
 }
 
@@ -1898,14 +2094,17 @@ function loadPruneState(sessionID) {
   }
 }
 
-function savePruneState() {
-  const key = pruneStorageKey();
+// savePruneState caches the stats of the emitting view, so a background agent
+// never overwrites the entry of the chat on screen.
+function savePruneState(sessionID = currentView()?.sessionId) {
+  const key = pruneStorageKey(sessionID);
   if (!key) return;
+  const usage = currentView()?.usage || EMPTY_USAGE;
   try {
     localStorage.setItem(key, JSON.stringify({
-      rounds: state.usage.rounds || 0,
-      prunedRounds: state.usage.prunedRounds || 0,
-      prunedChars: state.usage.prunedChars || 0,
+      rounds: usage.rounds || 0,
+      prunedRounds: usage.prunedRounds || 0,
+      prunedChars: usage.prunedChars || 0,
     }));
   } catch { /* ignore */ }
 }
@@ -1947,41 +2146,19 @@ function contextLimit(model) {
   return 128000;
 }
 
+// updateUsageUI asks for a repaint instead of painting. Callers keep working on
+// state; the panel is redrawn from the active view only.
 function updateUsageUI() {
-  const limit = contextLimit(state.session?.model || state.config?.defaults?.model);
-  const used = Math.max(0, state.usage.contextTokens || 0);
-  const pct = Math.min(100, (used / limit) * 100);
-  $('ctxBar').style.width = pct.toFixed(1) + '%';
-  $('contextPct').textContent = (pct < 1 && pct > 0 ? '<1' : Math.round(pct)) + '%';
-  $('contextMeta').textContent =
-    `${state.usage.contextExact ? '' : 'est. '}${formatNum(used)} / ${formatLimit(limit)} tokens`;
-  $('contextMeta').title =
-    `${used} / ${limit} tokens in the current context (prompt + response). ` +
-    'Session totals in the accordion below add every model round.';
-  $('tokensIn').textContent = formatNum(state.usage.sessionIn);
-  $('tokensOut').textContent = formatNum(state.usage.sessionOut);
-  $('cachedTokens').textContent = formatNum(state.usage.cached);
-  const cachePct = state.usage.sessionIn > 0
-    ? Math.min(100, (state.usage.cached / state.usage.sessionIn) * 100)
-    : 0;
-  $('cachedTokens').parentElement.title =
-    `Cumulative prompt tokens served from the provider cache (${cachePct.toFixed(0)}% of session input). ` +
-    'Cache hits require an identical prompt prefix and the same upstream provider.';
-  $('sessionCost').textContent = formatCost(state.usage.sessionCost);
-  $('projectCost').textContent = formatCost(state.usage.projectCost);
-  updatePruneUI();
-  updateSessionTimeUI();
-  const status = $('sessionStatus');
-  if (status) status.textContent = state.session ? formatLimit(limit) + ' ctx' : '';
+  scheduleInspector(currentView());
 }
 
 // Each dot is one tool round in the persisted history, oldest first. Blue
 // means the round was sent verbatim; amber means it was stubbed before the
 // request. Pruning always targets the oldest rounds, so amber forms a prefix.
-function updatePruneUI() {
-  const rounds = Math.max(0, Math.floor(state.usage.rounds || 0));
-  const pruned = Math.min(rounds, Math.max(0, Math.floor(state.usage.prunedRounds || 0)));
-  const savedChars = Math.max(0, Math.floor(state.usage.prunedChars || 0));
+function paintPrune(usage) {
+  const rounds = Math.max(0, Math.floor(usage.rounds || 0));
+  const pruned = Math.min(rounds, Math.max(0, Math.floor(usage.prunedRounds || 0)));
+  const savedChars = Math.max(0, Math.floor(usage.prunedChars || 0));
   const savedTokens = Math.ceil(savedChars / 4);
 
   const pill = $('prunePill');
@@ -2039,34 +2216,10 @@ function rememberFile(path, action) {
   else state.files.set(path, 'read');
 }
 
+// renderFiles asks for a repaint of the panel; the file list itself is painted
+// from the active view by paintFiles.
 function renderFiles() {
-  const list = $('fileList');
-  list.innerHTML = '';
-  $('fileCount').textContent = String(state.files.size);
-  if (!state.files.size) {
-    const empty = document.createElement('div');
-    empty.className = 'file-empty';
-    empty.textContent = 'Files read or modified in this session appear here.';
-    list.appendChild(empty);
-    return;
-  }
-  for (const [path, action] of state.files) {
-    const row = document.createElement('div');
-    row.className = 'file-item';
-    row.title = path;
-    const icon = document.createElement('i');
-    icon.className = 'bi ' + (isCodeFile(path) ? 'bi-file-earmark-code' : 'bi-file-earmark-text');
-    const name = document.createElement('span');
-    name.className = 'file-name';
-    name.textContent = path;
-    const badge = document.createElement('span');
-    badge.className = 'file-badge ' + action;
-    badge.textContent = action === 'modified' ? 'W' : 'R';
-    row.appendChild(icon);
-    row.appendChild(name);
-    row.appendChild(badge);
-    list.appendChild(row);
-  }
+  scheduleInspector(currentView());
 }
 
 function isCodeFile(path) {
@@ -2095,11 +2248,18 @@ function estimateContext(messages) {
   return Math.ceil(chars / 4);
 }
 
+// renderChecklist asks for a repaint; paintChecklist reads the active view.
 function renderChecklist() {
+  scheduleInspector(currentView());
+}
+
+function paintChecklist(view) {
   const list = $('checklistItems');
+  if (!list) return;
+  const checklist = view && Array.isArray(view.checklist) ? view.checklist : [];
   list.innerHTML = '';
-  const total = state.checklist.length;
-  const done = state.checklist.filter((i) => i.is_done).length;
+  const total = checklist.length;
+  const done = checklist.filter((i) => i.is_done).length;
   $('checklistCount').textContent = `${done}/${total}`;
   $('checklistBar').style.width = total ? `${(done / total) * 100}%` : '0%';
 
@@ -2111,8 +2271,8 @@ function renderChecklist() {
     return;
   }
 
-  const pending = state.checklist.filter((i) => !i.is_done);
-  const completed = state.checklist.filter((i) => i.is_done);
+  const pending = checklist.filter((i) => !i.is_done);
+  const completed = checklist.filter((i) => i.is_done);
 
   const makeRow = (item) => {
     const row = document.createElement('div');
@@ -2247,7 +2407,7 @@ function updateRunSummary() {
   const el = $('runSummary');
   if (!el) return;
   const total = busySessions();
-  const others = Math.max(0, total - (state.streaming ? 1 : 0));
+  const others = Math.max(0, total - (activeStreaming() ? 1 : 0));
   if (others > 0) {
     el.classList.remove('d-none');
     el.textContent = `${others} other agent${others === 1 ? '' : 's'} running`;
@@ -2258,36 +2418,79 @@ function updateRunSummary() {
   }
 }
 
-function setStreamingUI(streaming) {
-  $('streamIndicator').classList.toggle('d-none', !streaming);
-  // A background agent must never lock the composer of the chat on screen:
-  // only the active view's run disables input.
-  $('stopBtn').classList.toggle('d-none', !streaming);
-  $('stopBtn').disabled = false;
-  $('modelInput').disabled = streaming || !state.session;
-  for (const btn of $('modeToggle').querySelectorAll('button')) btn.disabled = streaming || !state.session;
-  updateSendState();
-  updateRunSummary();
+// activeStreaming reports whether the chat on screen has a live agent. The run
+// index counts too: a run lives on the server, so a chat can be busy before its
+// event stream re-attaches (reload, tab switch) and the Stop button must reflect
+// that. A background agent's run never makes another chat look busy.
+function activeStreaming() {
+  const view = activeView();
+  if (!view) return false;
+  return !!view.streaming || runIndex.has(view.sessionId);
 }
 
-function updateControls() {
+let chromeFrame = 0;
+
+// scheduleChrome coalesces repaints of the shared chrome. It is safe to call
+// from any view: the paint itself always reads the active one.
+function scheduleChrome() {
+  if (chromeFrame) return;
+  chromeFrame = requestAnimationFrame(() => {
+    chromeFrame = 0;
+    renderChrome();
+  });
+}
+
+// renderChrome is the only writer of the controls that live outside a
+// transcript: spinner, round label, Stop, composer, model/mode lock and the
+// agents summary. It derives all of them from the chat on screen plus the server
+// run index, so switching chats (not only receiving events) corrects them, and a
+// control added here later inherits that isolation instead of needing a guard.
+function renderChrome() {
+  const view = activeView();
+  const running = activeStreaming();
+  const stopping = !!view && !!view.stopRequested;
   const hasSession = !!state.session;
-  const busy = state.streaming;
-  $('modelInput').disabled = busy || !hasSession;
-  for (const btn of $('modeToggle').querySelectorAll('button')) btn.disabled = busy || !hasSession;
+
+  $('streamIndicator').classList.toggle('d-none', !running);
+  $('stopBtn').classList.toggle('d-none', !running);
+  $('stopBtn').disabled = stopping;
+  $('stopBtn').title = stopping ? 'Stopping the agent…' : 'Stop generation';
+
+  $('modelInput').disabled = running || !hasSession;
+  for (const btn of $('modeToggle').querySelectorAll('button')) {
+    btn.disabled = running || !hasSession;
+  }
   $('promptInput').disabled = !hasSession;
   $('newSessionBtn').disabled = !state.activeProjectId;
   $('manageProjectBtn').disabled = !state.activeProjectId;
   $('manageSessionsBtn').disabled = !state.activeProjectId;
+  $('agentsBtn').disabled = false;
+
+  if (stopping) {
+    const label = $('streamLabel');
+    if (label) label.textContent = 'stopping…';
+  } else {
+    updateStreamLabel();
+  }
   updateSendState();
-  updateUsageUI();
   updateRunSummary();
+}
+
+// setStreamingUI is the run-lifecycle entry point. The chrome is a projection,
+// so starting or finishing a run only has to ask for a repaint.
+function setStreamingUI() {
+  scheduleChrome();
+}
+
+function updateControls() {
+  renderChrome();
+  updateUsageUI();
 }
 
 function updateSendState() {
   const prompt = $('promptInput');
   const hasBody = !!prompt.value.trim() || state.attachments.length > 0;
-  $('sendBtn').disabled = state.streaming || !state.session || !hasBody;
+  $('sendBtn').disabled = activeStreaming() || !state.session || !hasBody;
 }
 
 function maybeScroll(force = false) {
@@ -3411,6 +3614,215 @@ async function deleteSession(session) {
   }
 }
 
+async function deleteSessionPermanent(session) {
+  const ok = window.confirm(`Delete "${session.title || 'New Chat'}" permanently? This cannot be undone.`);
+  if (!ok) return false;
+  try {
+    await api(`/api/sessions/${session.id}`, { method: 'DELETE' });
+    dropView(session.id);
+    state.sessions = state.sessions.filter((s) => s.id !== session.id);
+    state.allSessions = state.allSessions.filter((s) => s.id !== session.id);
+    return true;
+  } catch (err) {
+    toast(err.message, 'error');
+    return false;
+  }
+}
+
+/* ── Running agents ──────────────────────────────────────────────── */
+
+// The agents modal lists every live run of every project. It reads the server
+// index (runIndex) instead of the local views, so it also shows agents whose
+// project was never opened in this browser session.
+async function openAgentsModal() {
+  if (agentsModal) agentsModal.show();
+  await refreshRunIndex();
+  renderAgentsList();
+}
+
+// startAgentsWatch keeps the list fresh while the modal is open; the global
+// watcher stays at a slower cadence for the tab bar.
+function startAgentsWatch() {
+  stopAgentsWatch();
+  refreshRunIndex();
+  agentsTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshRunIndex();
+  }, 2000);
+  renderAgentsList();
+}
+
+function stopAgentsWatch() {
+  if (agentsTimer) clearInterval(agentsTimer);
+  agentsTimer = null;
+}
+
+// updateAgentsBadge shows how many agents are working right now.
+function updateAgentsBadge() {
+  const badge = $('agentsBadge');
+  if (!badge) return;
+  const n = runIndex.size;
+  badge.textContent = n > 9 ? '9+' : String(n);
+  badge.classList.toggle('d-none', n === 0);
+  $('agentsBtn').classList.toggle('has-agents', n > 0);
+  $('agentsBtn').title = n
+    ? `${n} agent${n === 1 ? '' : 's'} running — click to see them (Ctrl+Shift+A)`
+    : 'Running agents (Ctrl+Shift+A)';
+}
+
+// liveRuns returns the runs of the index, most recently started last.
+function liveRuns() {
+  return [...runIndex.values()].sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
+}
+
+function renderAgentsList() {
+  const list = $('agentsList');
+  if (!list) return;
+  const runs = liveRuns();
+  $('agentsCount').textContent = runs.length
+    ? `${runs.length} agent${runs.length === 1 ? '' : 's'} running`
+    : '';
+  list.innerHTML = '';
+  if (!runs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'manage-empty';
+    empty.textContent = 'No agent is running right now.';
+    list.appendChild(empty);
+    return;
+  }
+
+  let lastProject = null;
+  for (const run of runs) {
+    if (run.project_id !== lastProject) {
+      lastProject = run.project_id;
+      const head = document.createElement('div');
+      head.className = 'agents-project';
+      head.textContent = run.project_name || `Project #${run.project_id}`;
+      list.appendChild(head);
+    }
+    list.appendChild(agentsRow(run));
+  }
+}
+
+function agentsRow(run) {
+  const mine = run.session_id === state.activeSessionId;
+  const row = document.createElement('div');
+  row.className = 'manage-row agents-row' + (mine ? ' active' : '');
+
+  const dot = document.createElement('span');
+  dot.className = 'tab-pulse agents-pulse';
+  row.appendChild(dot);
+
+  const main = document.createElement('div');
+  main.className = 'manage-row-main';
+
+  const titleRow = document.createElement('div');
+  titleRow.className = 'manage-row-title';
+  const title = document.createElement('span');
+  title.className = 'manage-row-name';
+  title.textContent = run.session_title || `Chat #${run.session_id}`;
+  title.addEventListener('click', () => openChatFromRun(run));
+  titleRow.appendChild(title);
+  const mode = document.createElement('span');
+  mode.className = 'manage-badge' + (run.mode === 'BUILD' ? ' accent' : '');
+  mode.textContent = run.mode || 'PLAN';
+  titleRow.appendChild(mode);
+  if (mine) {
+    const badge = document.createElement('span');
+    badge.className = 'manage-badge';
+    badge.textContent = 'on screen';
+    titleRow.appendChild(badge);
+  }
+  main.appendChild(titleRow);
+
+  const meta = document.createElement('div');
+  meta.className = 'manage-row-meta agents-meta';
+  const parts = [
+    run.activity ? String(run.activity) : 'working',
+    run.round > 0 ? `round ${run.round}` : '',
+    elapsedSince(run.started_at),
+  ].filter(Boolean);
+  meta.textContent = parts.join(' · ');
+  main.appendChild(meta);
+  row.appendChild(main);
+
+  const actions = document.createElement('div');
+  actions.className = 'manage-row-actions';
+
+  const openBtn = document.createElement('button');
+  openBtn.type = 'button';
+  openBtn.className = 'manage-icon-btn';
+  openBtn.title = 'Open this chat';
+  openBtn.innerHTML = '<i class="bi bi-box-arrow-in-right"></i>';
+  openBtn.addEventListener('click', () => openChatFromRun(run));
+  actions.appendChild(openBtn);
+
+  const stopBtn = document.createElement('button');
+  stopBtn.type = 'button';
+  stopBtn.className = 'manage-icon-btn danger';
+  stopBtn.title = 'Stop this agent (keeps what it already produced)';
+  stopBtn.innerHTML = '<i class="bi bi-stop-circle"></i>';
+  stopBtn.addEventListener('click', () => stopRunFromModal(run, stopBtn));
+  actions.appendChild(stopBtn);
+
+  row.appendChild(actions);
+  return row;
+}
+
+function elapsedSince(iso) {
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return '';
+  return formatElapsed(Math.max(0, Date.now() - ts));
+}
+
+// openChatFromRun jumps to the chat of a running agent, switching project and
+// reopening the tab when needed. The run itself is untouched: the view either
+// replays what it missed or renders the persisted transcript.
+async function openChatFromRun(run) {
+  try {
+    if (run.project_id !== state.activeProjectId) {
+      const project = await openProject(run.project_id);
+      if (!project) {
+        toast('That project is not registered any more', 'error');
+        return;
+      }
+    }
+    if (!state.sessions.some((s) => s.id === run.session_id)) {
+      // A background chat may be closed as a tab: reopen it so it stays visible.
+      const data = await api(`/api/sessions/${run.session_id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_open: true }),
+      });
+      state.sessions.push(data.session);
+      persistTabOrder();
+      renderTabs();
+    }
+    if (agentsModal) agentsModal.hide();
+    await loadSession(run.session_id);
+  } catch (err) {
+    toast(err.message || 'Could not open that chat', 'error');
+  }
+}
+
+async function stopRunFromModal(run, btn) {
+  const label = run.session_title || `Chat #${run.session_id}`;
+  if (!window.confirm(`Stop the agent in "${label}"? It keeps what it already produced.`)) return;
+  if (btn) btn.disabled = true;
+  const view = viewFor(run.session_id);
+  if (view) view.stopRequested = true;
+  try {
+    await api(`/api/sessions/${run.session_id}/stop`, { method: 'POST', body: JSON.stringify({}) });
+    runIndex.delete(run.session_id);
+    afterRunIndexChange();
+    toast(`Stopping "${label}"…`, 'success');
+  } catch (err) {
+    toast(err.message || 'Could not stop the agent', 'error');
+    if (btn) btn.disabled = false;
+    if (view) view.stopRequested = false;
+  }
+  scheduleChrome();
+}
+
 function formatWhen(iso) {
   const ts = Date.parse(iso);
   if (!Number.isFinite(ts)) return '';
@@ -3466,6 +3878,15 @@ function bindEvents() {
   });
   $('newSessionBtn').addEventListener('click', () => createSession());
   $('manageSessionsBtn').addEventListener('click', openSessionsModal);
+  $('agentsBtn').addEventListener('click', openAgentsModal);
+  // The run summary is a shortcut to the same list of live agents.
+  const runSummary = $('runSummary');
+  runSummary.addEventListener('click', openAgentsModal);
+  runSummary.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    openAgentsModal();
+  });
   $('deleteProjectBtn').addEventListener('click', deleteProject);
   $('sessionSearch').addEventListener('input', renderSessionsList);
   $('sessionsShowAll').addEventListener('change', () => {
@@ -3473,10 +3894,9 @@ function bindEvents() {
     renderSessionsList();
   });
   $('sendBtn').addEventListener('click', sendMessage);
-  $('stopBtn').addEventListener('click', () => {
-    $('stopBtn').disabled = true;
-    stopStream();
-  });
+  // Stop disables itself through the chrome projection (stopRequested), so a
+  // second click is impossible without leaving the button stuck for the next run.
+  $('stopBtn').addEventListener('click', () => stopStream());
 
   $('promptInput').addEventListener('input', () => {
     resizePrompt();
@@ -3600,6 +4020,11 @@ function handleShortcut(e) {
     focusChat();
     return;
   }
+  if (code === 'KeyA' || key === 'a') {
+    e.preventDefault();
+    openAgentsModal();
+    return;
+  }
   if (key === 'arrowup') {
     if (modalOpen) return;
     e.preventDefault();
@@ -3659,15 +4084,23 @@ function navigateUserMessage(dir) {
 
 // stopStream asks the server to cancel the active chat's run. Detaching the
 // event stream would not stop the agent any more, because runs live on the
-// server; the explicit endpoint is what ends the turn.
+// server; the explicit endpoint is what ends the turn. The chat is resolved from
+// the screen, so the button can never stop a different chat than the one shown.
 async function stopStream() {
-  const sessionId = state.session?.id || state.activeSessionId;
+  const sessionId = state.activeSessionId || state.session?.id;
   if (!sessionId) return;
   const view = viewFor(sessionId);
   if (view) view.stopRequested = true;
+  scheduleChrome();
   try {
     await api(`/api/sessions/${sessionId}/stop`, { method: 'POST', body: JSON.stringify({}) });
   } catch (err) {
     toast(err.message || 'Could not stop the agent', 'error');
+    if (view) view.stopRequested = false;
+  } finally {
+    // Ask the server what is still running: the chrome and the tab bar follow
+    // the answer, not the click.
+    await refreshRunIndex();
+    scheduleChrome();
   }
 }

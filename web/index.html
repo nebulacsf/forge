@@ -60,6 +60,11 @@
       <button id="manageSessionsBtn" class="tabs-add flex-shrink-0" type="button" title="Manage all chats">
         <i class="bi bi-list-ul"></i>
       </button>
+      <button id="agentsBtn" class="tabs-add agents-btn flex-shrink-0" type="button"
+              title="Running agents (Ctrl+Shift+A)" aria-label="Running agents">
+        <i class="bi bi-activity"></i>
+        <span id="agentsBadge" class="agents-badge d-none">0</span>
+      </button>
       <div id="projectPathLabel" class="project-path-label flex-shrink-0" title=""></div>
       <button id="showPanelBtn" class="panel-reopen d-none flex-shrink-0" type="button" title="Show inspector panel">
         <i class="bi bi-layout-sidebar-inset"></i>
@@ -94,7 +99,8 @@
           </div>
 
           <div class="ms-auto d-flex align-items-center gap-2">
-            <span id="runSummary" class="run-summary d-none" role="status"></span>
+            <span id="runSummary" class="run-summary d-none" role="button" tabindex="0"
+                  title="Agents keep working when you switch chat or project — click to see them"></span>
             <span id="streamIndicator" class="stream-indicator d-none">
               <span class="pulse-dot"></span> <span id="streamLabel">working</span>
             </span>
@@ -324,6 +330,25 @@
       </div>
       <div class="modal-footer">
         <span id="sessionsCount" class="manage-count me-auto"></span>
+        <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Running agents modal ──────────────────────────────────────────── -->
+<div class="modal fade" id="agentsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-activity me-2"></i>Running agents</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="agentsList" class="manage-list agents-list"></div>
+      </div>
+      <div class="modal-footer">
+        <span id="agentsCount" class="manage-count me-auto"></span>
         <button type="button" class="btn btn-ghost" data-bs-dismiss="modal">Close</button>
       </div>
     </div>
