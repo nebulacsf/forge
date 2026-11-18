@@ -80,7 +80,7 @@ class Widget {
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.Content)
 	}
-	want := "renderMarkdownInto [function] -> web/js/app.js:3-9"
+	want := `renderMarkdownInto [function] -> web/js/app.js:3-9 (read_file path="web/js/app.js" start_line=3 end_line=9)`
 	if res.Content != want {
 		t.Fatalf("output = %q, want %q", res.Content, want)
 	}

@@ -154,8 +154,22 @@ func Specs(mode string) []llm.Tool {
 		{
 			Type: "function",
 			Function: llm.ToolFunctionSpec{
+				Name: "symbol_lookup",
+				Description: "PRIMARY way to locate a declaration: find function, method, struct/class, and variable declarations by partial name. " +
+					"Returns one row per match with the qualified name, kind, file path, exact line range, and the read_file call that reads it. " +
+					"Never returns file contents. Use this FIRST whenever you know or can guess a declaration name (Manager.symbolLookup, renderMarkdown, handleCompactSession); " +
+					"use grep_search only for free text, error strings, config keys, or regular expressions.",
+				Parameters: objectSchema(map[string]any{
+					"query": stringProp("Symbol name or partial match, e.g. renderMarkdownInto or symbolLookup."),
+					"kind":  enumProp("Optional declaration kind filter.", "function", "struct", "method", "variable"),
+				}, "query"),
+			},
+		},
+		{
+			Type: "function",
+			Function: llm.ToolFunctionSpec{
 				Name:        "grep_search",
-				Description: "Search file contents with a Go regular expression. Skips binary files and common vendor/build directories. Returns path:line matches.",
+				Description: "Search file contents with a Go regular expression. Skips binary files and common vendor/build directories. Returns path:line matches. Use for free text, error strings, or patterns; prefer symbol_lookup when you already know the declaration name.",
 				Parameters: objectSchema(map[string]any{
 					"pattern":        stringProp("Regular expression to search for."),
 					"path":           stringProp("Optional file or directory relative to the project root (default: root)."),
@@ -163,19 +177,6 @@ func Specs(mode string) []llm.Tool {
 					"case_sensitive": booleanProp("Match case-sensitively (default false)."),
 					"max_results":    integerProp("Maximum matches to return (default 100, max 500)."),
 				}, "pattern"),
-			},
-		},
-		{
-			Type: "function",
-			Function: llm.ToolFunctionSpec{
-				Name: "symbol_lookup",
-				Description: "Find function, method, struct/class, and variable declarations by partial name. " +
-					"Returns only the symbol name, kind, file path, and line range; never file contents. " +
-					"Prefer this over grep_search or read_file when you already know the symbol name.",
-				Parameters: objectSchema(map[string]any{
-					"query": stringProp("Symbol name or partial match, e.g. renderMarkdownInto."),
-					"kind":  enumProp("Optional declaration kind filter.", "function", "struct", "method", "variable"),
-				}, "query"),
 			},
 		},
 		{

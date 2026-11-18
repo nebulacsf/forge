@@ -227,7 +227,7 @@ func RenderRepoOutline(files []store.RepoOutlineFile) string {
 		used += cost
 	}
 	if truncated {
-		b.WriteString("[outline truncated; use grep_search or list_directory for the rest]\n")
+		b.WriteString("[outline truncated; use symbol_lookup for a known declaration name, or list_directory and grep_search for the rest]\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

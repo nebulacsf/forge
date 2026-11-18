@@ -52,7 +52,7 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		!strings.Contains(req.Messages[0].Content, "switch to BUILD") ||
 		!strings.Contains(req.Messages[0].Content, "FIRST action must be update_checklist") ||
 		!strings.Contains(req.Messages[0].Content, "Repository outline") ||
-		!strings.Contains(req.Messages[0].Content, "GREP-FIRST RULE") ||
+		!strings.Contains(req.Messages[0].Content, "SYMBOL-FIRST RULE") ||
 		!strings.Contains(req.Messages[0].Content, "Response style (strict)") ||
 		!strings.Contains(req.Messages[0].Content, "SHELL PATHS") {
 		http.Error(w, "PLAN system prompt missing required guidance", http.StatusBadRequest)

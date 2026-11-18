@@ -1881,6 +1881,7 @@ function toolIcon(name) {
     patch_file: '🩹',
     bash: '⚡',
     grep_search: '🔎',
+    symbol_lookup: '🧩',
     list_directory: '📁',
     git_diff: '🔀',
     update_checklist: '✅',
@@ -1899,6 +1900,8 @@ function toolTitle(name, args) {
       return `Running: ${truncate(String(args.command || '').split('\n')[0], 68)}`;
     case 'grep_search':
       return `Searching /${truncate(String(args.pattern || ''), 42)}/`;
+    case 'symbol_lookup':
+      return `Looking up symbol ${truncate(String(args.query || ''), 42)}${args.kind ? ' · ' + args.kind : ''}`;
     case 'list_directory':
       return `Listing ${args.path || '.'}`;
     case 'git_diff':
@@ -1918,6 +1921,9 @@ function formatToolInput(name, args, raw) {
   }
   if (name === 'patch_file' && args.search !== undefined) {
     return `path: ${args.path || ''}\n\nsearch:\n${args.search}\n\nreplace:\n${args.replace || ''}`;
+  }
+  if (name === 'symbol_lookup' && args.query) {
+    return `query: ${args.query}${args.kind ? `\nkind: ${args.kind}` : ''}`;
   }
   if (raw && typeof raw === 'string') {
     try {

@@ -171,23 +171,6 @@ func (l *researchLedger) render(planRounds, planToolCalls int) string {
 		fmt.Fprintf(&b, "\n- read %s %s", path, strings.Join(parts, ", "))
 	}
 
-	searches := make([]string, 0, len(l.greps))
-	for key := range l.greps {
-		searches = append(searches, key)
-	}
-	sort.Strings(searches)
-	for i, key := range searches {
-		if i >= 6 {
-			fmt.Fprintf(&b, "\n- …and %d more search(es) already run", len(searches)-i)
-			break
-		}
-		if n := l.greps[key]; n > 1 {
-			fmt.Fprintf(&b, "\n- grep %s (x%d)", key, n)
-		} else {
-			fmt.Fprintf(&b, "\n- grep %s", key)
-		}
-	}
-
 	symbols := make([]string, 0, len(l.symbols))
 	for key := range l.symbols {
 		symbols = append(symbols, key)
@@ -202,6 +185,23 @@ func (l *researchLedger) render(planRounds, planToolCalls int) string {
 			fmt.Fprintf(&b, "\n- symbol %s (x%d)", key, n)
 		} else {
 			fmt.Fprintf(&b, "\n- symbol %s", key)
+		}
+	}
+
+	searches := make([]string, 0, len(l.greps))
+	for key := range l.greps {
+		searches = append(searches, key)
+	}
+	sort.Strings(searches)
+	for i, key := range searches {
+		if i >= 6 {
+			fmt.Fprintf(&b, "\n- …and %d more search(es) already run", len(searches)-i)
+			break
+		}
+		if n := l.greps[key]; n > 1 {
+			fmt.Fprintf(&b, "\n- grep %s (x%d)", key, n)
+		} else {
+			fmt.Fprintf(&b, "\n- grep %s", key)
 		}
 	}
 	return clipRunes(strings.TrimSpace(b.String()), 900)

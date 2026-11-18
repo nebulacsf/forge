@@ -357,7 +357,9 @@ func (m *Manager) symbolLookup(ctx context.Context, query, kind string) Result {
 		return fail("symbol_lookup: " + err.Error())
 	}
 	if len(matches) == 0 {
-		return Result{Content: fmt.Sprintf("No symbols matching %q.", query)}
+		return Result{Content: fmt.Sprintf("No symbols matching %q in the index. "+
+			"The name may be spelled differently or live in free text (string literal, config key, interface field). "+
+			"Fall back to grep_search once with a shorter pattern, then continue.", query)}
 	}
 	rankSymbols(matches, query)
 	truncated := false
@@ -401,13 +403,27 @@ func rankSymbols(symbols []store.ProjectSymbol, query string) {
 func renderSymbolResults(symbols []store.ProjectSymbol, truncated bool) string {
 	var b strings.Builder
 	for _, sym := range symbols {
-		fmt.Fprintf(&b, "%s [%s] -> %s:%d-%d\n",
-			symbolDisplayName(sym), sym.Kind, sym.FilePath, sym.StartLine, sym.EndLine)
+		fmt.Fprintf(&b, "%s [%s] -> %s:%d-%d (read_file path=%q start_line=%d end_line=%d)\n",
+			symbolDisplayName(sym), sym.Kind, sym.FilePath, sym.StartLine, sym.EndLine,
+			sym.FilePath, sym.StartLine, symbolReadEnd(sym))
 	}
 	if truncated {
-		b.WriteString("[results truncated]\n")
+		b.WriteString("[results truncated; narrow the query or add kind]\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// symbolReadEnd caps the suggested read window at maxReadLines so the hint never
+// asks for more than read_file can return in one call.
+func symbolReadEnd(sym store.ProjectSymbol) int {
+	end := sym.EndLine
+	if end < sym.StartLine {
+		end = sym.StartLine
+	}
+	if end-sym.StartLine+1 > maxReadLines {
+		end = sym.StartLine + maxReadLines - 1
+	}
+	return end
 }
 
 func symbolDisplayName(sym store.ProjectSymbol) string {

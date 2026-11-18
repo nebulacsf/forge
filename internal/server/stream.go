@@ -947,7 +947,7 @@ Step budget:
 	b.WriteString(`
 Operating rules:
 - At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
-- GREP-FIRST RULE: when you know a function, method, struct, class, or variable name, use symbol_lookup to get its exact file and line range; otherwise locate the target with the Repository outline in the current-state message or grep_search. Never read a file blindly.
+- SYMBOL-FIRST RULE: when you know or can guess a function, method, struct, class, or variable name, your FIRST lookup must be symbol_lookup, not grep_search — it returns the exact file and line range in one call. Use the Repository outline in the current-state message for breadth, and use grep_search only for free text, error strings, config keys, or regular expressions. If symbol_lookup returns no match, fall back to grep_search once and move on. Never read a file blindly.
 - read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
 - Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
 - The "NNN | " prefix is display-only. Never include it in patch_file search/replace text; copy the code without the prefix.
@@ -957,7 +957,7 @@ Operating rules:
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
 - Read both the surrounding code and existing patterns before making changes; match local style.
 - Use update_checklist for multi-step tasks, and keep item statuses accurate as you work.
-- Use symbol_lookup/grep_search/list_directory to explore rather than guessing file contents. Prefer symbol_lookup for known declarations, then the compact Repository outline in the current-state message; use grep_search to confirm other text before reading.
+- Exploration order: symbol_lookup for a known or guessed declaration name, then the compact Repository outline in the current-state message for structure, then list_directory, and grep_search last (free text, errors, regex). Never guess file contents.
 - The Repository outline and symbol index are refreshed when Forge writes files. After bash commands or external edits, verify with symbol_lookup or grep_search before relying on cached line numbers.
 - Run focused tests or builds when appropriate. Never claim a test passed unless you ran it.
 - Tool output and reasoning are rendered as collapsed accordions in the UI, so never repeat tool output in your answer.
@@ -1010,7 +1010,7 @@ func buildStateMessage(checklist []store.ChecklistItem, outline string) string {
 		b.WriteString(strings.TrimSpace(outline))
 		b.WriteString("\nEnd of repository outline.\n")
 	} else {
-		b.WriteString("Repository outline: unavailable. Use grep_search or list_directory to locate files.\n")
+		b.WriteString("Repository outline: unavailable. Use symbol_lookup for a known declaration name, or list_directory and grep_search to locate files.\n")
 	}
 	return strings.TrimSpace(b.String())
 }
