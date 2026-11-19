@@ -914,10 +914,11 @@ func buildSystemPrompt(project store.Project, session store.Session, segmentSize
 	if session.Mode == "PLAN" {
 		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
 		b.WriteString("Respond in the language the user is speaking (IMPORTANT). All code and technical content must be in English.\n")
-		b.WriteString("When you have enough information, finish with a plan structured for human architectural review: the diagnosis, the key decisions, and the per-file implementation plan. Always put that plan in your normal response content, never only in reasoning. End the response with a line exactly like: \"Ready to implement — switch to BUILD to apply this plan.\" Never claim that files were changed or that commands were run in PLAN mode.\n")
+		b.WriteString("Adapt your response to the conversation: discuss trade-offs and findings naturally during exploration, and output a structured implementation plan only when ready for execution. Always put your response in normal content, never only in reasoning. Never claim that files were changed or commands were run in PLAN mode.\n")
 	} else {
-		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them.\n")
-		b.WriteString("Respond in the language the user is speaking. Implement changes in English by default unless the user specifies otherwise.\n")
+		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them. Action-first rule in BUILD: When a plan already exists in the conversation, do NOT re-explore the codebase. Read only the exact line ranges cited in the plan, apply patch_file/write_file within your first 1–2 rounds, and verify immediately.\n")
+		b.WriteString("Anti-loop rule: Never perform more than 2 consecutive read/search rounds without making an edit or running a verification command.\n")
+		b.WriteString("Respond in the language the user is speaking (IMPORTANT). Implement changes in English by default unless the user specifies otherwise.\n")
 	}
 	allowed := make([]string, 0, 8)
 	for _, spec := range tools.Specs(session.Mode) {
@@ -933,7 +934,7 @@ PLAN research budget:
 - This turn allows %d tool rounds and %d tool calls. The harness stops after the round that reaches either limit and requires the final plan.
 - Every response counts as one round even when it contains several tool calls. Batch independent reads and searches in the same response.
 - Stop as soon as you can name the files, the symbols, and the exact changes. Do not try to inspect every line of the project.
-- The research ledger in the current-state message lists what you already read and searched this turn. Never repeat those calls or re-read those ranges; this turn's tool results are preserved in the conversation.
+- The research ledger in the current-state message lists what you already read and searched this turn.
 - If the budget is reached, answer with the best plan you can and state any remaining uncertainty in one short line.
 `, planRounds, planToolCalls)
 	} else {
@@ -946,8 +947,8 @@ Step budget:
 	}
 	b.WriteString(`
 Operating rules:
-- At the start of a new task, your FIRST action must be update_checklist: add the task with action=add (or action=set for a multi-step plan) BEFORE reading files, searching, or running any other tool. Keep the list current as you work.
-- SYMBOL-FIRST RULE: when you know or can guess a function, method, struct, class, or variable name, your FIRST lookup must be symbol_lookup, not grep_search — it returns the exact file and line range in one call. Use the Repository outline in the current-state message for breadth, and use grep_search only for free text, error strings, config keys, or regular expressions. If symbol_lookup returns no match, fall back to grep_search once and move on. Never read a file blindly.
+- For multi-step implementation tasks in BUILD mode, initialize or update the checklist with update_checklist in your first batch alongside your initial file reads: add the task with action=add (or action=set for a multi-step plan). Keep the list current as you work.
+- SYMBOL-FIRST & EXPLORATION ORDER (strict): Always follow this hierarchy and never read or guess file contents blindly: (1) symbol_lookup first whenever you know or can guess a function, method, struct, class, or variable name — it returns the exact file and line range in one call; (2) the compact Repository outline in the current-state message for project structure and breadth; (3) list_directory; (4) grep_search last, strictly for free text, error strings, config keys, or regular expressions. If symbol_lookup returns no match, fall back to grep_search once and move on.
 - read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
 - Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
 - The "NNN | " prefix is display-only. Never include it in patch_file search/replace text; copy the code without the prefix.
@@ -956,8 +957,6 @@ Operating rules:
 - SHELL PATHS: every bash call starts in the project root in a fresh shell, so "cd" never persists between calls. Do not probe relative paths. If a command must run in another directory, put a single "cd" in the same invocation using an absolute, quoted literal path, for example: cd "/abs/path" && go test ./... — otherwise stay in the project root and pass paths as quoted literals.
 - Read relevant files before editing. Prefer patch_file for small, surgical changes and write_file for new or fully rewritten files.
 - Read both the surrounding code and existing patterns before making changes; match local style.
-- Use update_checklist for multi-step tasks, and keep item statuses accurate as you work.
-- Exploration order: symbol_lookup for a known or guessed declaration name, then the compact Repository outline in the current-state message for structure, then list_directory, and grep_search last (free text, errors, regex). Never guess file contents.
 - The Repository outline and symbol index are refreshed when Forge writes files. After bash commands or external edits, verify with symbol_lookup or grep_search before relying on cached line numbers.
 - Run focused tests or builds when appropriate. Never claim a test passed unless you ran it.
 - Tool output and reasoning are rendered as collapsed accordions in the UI, so never repeat tool output in your answer.
@@ -969,22 +968,31 @@ Response style (strict):
 - No preamble, no praise, no restating code, no long explanations.
 `)
 	if session.Mode == "PLAN" {
-		b.WriteString(`- PLAN final message: Markdown text only, no tool-call syntax. It is a document for human architectural review before execution, not an implementation, so it is structured and short rather than exhaustive. Write no raw code blocks, no SQL queries, and no verbose inline signatures: name the change in prose and cite line numbers only as anchors. Use exactly these sections, in this order:
-  ## Diagnosis & Approach
-  A concise 2-4 sentence summary explaining the root problem or current limitation in the codebase and the high-level architectural strategy to solve it.
-  ## Key Decisions
-  - Short, punchy bullet points explaining important trade-offs, edge cases handled, and why existing patterns are reused or avoided.
-  ## Implementation Plan
-  Group changes strictly by file path. Keep each item to 1-2 clear sentences describing what changes and why, referencing line numbers only as anchors:
-  - **path/to/file.go (lines X-Y)**: Brief description of the structural change or new functions to add.
-  - **path/to/new_file.go (new)**: Brief description of the module's responsibility.
-  ## Open Questions (Optional)
-  Include only if there is a genuine ambiguity or architectural choice requiring user confirmation before switching to BUILD.
-  Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
-  Rules: never repeat raw tool output or file dumps; never write a vague summary ("update the UI", "improve the prompt") — always name the file, the line range, and the concrete change.
+		b.WriteString(`- PLAN mode response behavior (adaptive): Markdown text only, no tool-call syntax. Adapt your response to the conversation stage:
+1. **Exploratory / Architectural Discussion** (when the user is asking questions, debating trade-offs, investigating a bug without requesting a fix yet, or when critical design choices remain unresolved): respond naturally as a senior architect. Present your findings, trade-offs, and concrete options clearly using concise prose or bullets, and ask the user to confirm the preferred direction. Do NOT force an implementation plan or the "Ready to implement" trigger yet.
+2. **Actionable Implementation Plan** (when the user requests a concrete change/plan or confirms the design direction): output a structured plan for human architectural review before execution. Write NO raw code blocks, NO SQL queries, and NO verbose inline signatures: describe changes in prose and cite line numbers only as anchors. Use these exact sections in order:
+
+## Diagnosis & Approach
+A concise 2-4 sentence summary explaining the root problem or current limitation and the high-level architectural strategy to solve it.
+
+## Key Decisions
+- Short, punchy bullet points explaining trade-offs, edge cases handled, and why existing patterns are reused or avoided.
+
+## Implementation Plan
+Group changes strictly by file path (1-2 clear sentences per item describing what changes and why):
+- **path/to/file.go (lines X-Y)**: Description of the structural change or new functions.
+- **path/to/new_file.go (new)**: Description of the module's responsibility.
+
+## Open Questions (Optional)
+Include only minor clarifications if needed.
+
+End the Actionable Implementation Plan with this exact line:
+Ready to implement — switch to BUILD to apply this plan.
+
+Rules for both modes: never repeat raw tool output or file dumps; never write vague summaries ("update the UI") — always cite exact files, symbols, and line ranges discovered.
 `)
 	} else {
-		b.WriteString("- BUILD final message: concise but informative output — include: (1) what changed with file paths; (2) what you verified (tests, builds, etc.); (3) any blockers or next steps for the user. No headings, no long explanations, no unrequested code. Keep it to about 5-7 lines maximum.\n")
+		b.WriteString("- BUILD final message: concise, factual summary (5-7 lines max) covering: (1) exact files created/modified and what changed; (2) verification run and its real outcome (never claim success if a test/build failed or was skipped); (3) any blockers, partial progress, or next steps. No headings, no unrequested code, no filler.\n")
 	}
 	return strings.TrimSpace(b.String())
 }
