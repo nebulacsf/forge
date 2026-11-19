@@ -70,6 +70,7 @@ type chatEvent struct {
 	PrunedChars   int `json:"pruned_chars,omitempty"`
 
 	Checklist     *[]store.ChecklistItem `json:"checklist,omitempty"`
+	QuestionBatch *store.QuestionBatch   `json:"question_batch,omitempty"`
 	Files         []tools.FileAction     `json:"files,omitempty"`
 	Session       *store.Session         `json:"session,omitempty"`
 	ReasoningOnly bool                   `json:"reasoning_only,omitempty"`
@@ -649,6 +650,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			}
 
 			calls := result.ToolCalls
+			var askedBatches []*store.QuestionBatch
 			for i := range calls {
 				call := &calls[i]
 				if call.ID == "" {
@@ -698,7 +700,17 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 					return
 				}
 				started := time.Now()
-				toolResult := mgr.Execute(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments))
+				var toolResult tools.Result
+				if call.Function.Name == "ask_user" && len(askedBatches) > 0 {
+					// One batch per round: the UI starts the next turn as soon as
+					// the user answers, so a second pending batch would be stranded.
+					toolResult = tools.Result{
+						Content: "ask_user: only one question batch per round is allowed; merge these questions into a single call.",
+						IsError: true,
+					}
+				} else {
+					toolResult = mgr.ExecuteCall(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments), call.ID)
+				}
 				elapsed := time.Since(started).Milliseconds()
 				ledger.observe(*call, toolResult)
 				if toolResult.IsError {
@@ -739,6 +751,9 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 						stream.send(chatEvent{Type: "checklist", Checklist: &items})
 					}
 				}
+				if toolResult.QuestionBatch != nil {
+					askedBatches = append(askedBatches, toolResult.QuestionBatch)
+				}
 			}
 			if len(calls) > 0 {
 				toolRounds++
@@ -753,6 +768,20 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			}
 			if ctx.Err() != nil {
 				cancelTurn("", "")
+				return
+			}
+
+			// ask_user is terminal: the batch is already persisted, so the
+			// browser can render it (or reload it later) and the user answers
+			// in the chat. Asking the model for another round would only make
+			// it talk to itself while the user is away.
+			if len(askedBatches) > 0 {
+				for _, batch := range askedBatches {
+					_ = stream.send(chatEvent{Type: "questions", QuestionBatch: batch})
+				}
+				logx.Info("turn paused for user answers", "session", session.ID,
+					"round", totalRounds, "batches", len(askedBatches))
+				finish(false)
 				return
 			}
 
@@ -912,15 +941,18 @@ func buildSystemPrompt(project store.Project, session store.Session, segmentSize
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
 	if session.Mode == "PLAN" {
-		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, and update the checklist. You cannot write files or run shell commands.\n")
+		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, update the checklist, and ask the user clarifying questions. You cannot write files or run shell commands.\n")
 		b.WriteString("Respond in the language the user is speaking (IMPORTANT). All code and technical content must be in English.\n")
 		b.WriteString("Adapt your response to the conversation: discuss trade-offs and findings naturally during exploration, and output a structured implementation plan only when ready for execution. Always put your response in normal content, never only in reasoning. Never claim that files were changed or commands were run in PLAN mode.\n")
+		b.WriteString("When a design decision, scope, naming, or requirement is genuinely ambiguous and only the user can resolve it, call ask_user instead of guessing. Use it as the final action of that research step: the turn ends and the user answers in a card with options plus a custom answer. Never use ask_user for choices you can make yourself or for cosmetic preferences.\n")
+		b.WriteString("If the latest user message begins with \"Answers to your questions:\", the user has resolved your questions: continue from those answers without repeating the questions or redoing completed research.\n")
 	} else {
 		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them. Action-first rule in BUILD: When a plan already exists in the conversation, do NOT re-explore the codebase. Read only the exact line ranges cited in the plan, apply patch_file/write_file within your first 1–2 rounds, and verify immediately.\n")
 		b.WriteString("Anti-loop rule: Never perform more than 2 consecutive read/search rounds without making an edit or running a verification command.\n")
+		b.WriteString("Use ask_user only when you are genuinely blocked by a decision only the user can make; do not ask for cosmetic preferences.\n")
 		b.WriteString("Respond in the language the user is speaking (IMPORTANT). Implement changes in English by default unless the user specifies otherwise.\n")
 	}
-	allowed := make([]string, 0, 8)
+	allowed := make([]string, 0, 10)
 	for _, spec := range tools.Specs(session.Mode) {
 		allowed = append(allowed, spec.Function.Name)
 	}
@@ -969,7 +1001,7 @@ Response style (strict):
 `)
 	if session.Mode == "PLAN" {
 		b.WriteString(`- PLAN mode response behavior (adaptive): Markdown text only, no tool-call syntax. Adapt your response to the conversation stage:
-1. **Exploratory / Architectural Discussion** (when the user is asking questions, debating trade-offs, investigating a bug without requesting a fix yet, or when critical design choices remain unresolved): respond naturally as a senior architect. Present your findings, trade-offs, and concrete options clearly using concise prose or bullets, and ask the user to confirm the preferred direction. Do NOT force an implementation plan or the "Ready to implement" trigger yet.
+1. **Exploratory / Architectural Discussion** (when the user is asking questions, debating trade-offs, investigating a bug without requesting a fix yet, or when critical design choices remain unresolved): respond naturally as a senior architect. Present your findings, trade-offs, and concrete options clearly using concise prose or bullets. If the user must choose a direction before the work can continue, call ask_user as the final action of that response with concrete options instead of ending with a list of questions in prose.
 2. **Actionable Implementation Plan** (when the user requests a concrete change/plan or confirms the design direction): output a structured plan for human architectural review before execution. Write NO raw code blocks, NO SQL queries, and NO verbose inline signatures: describe changes in prose and cite line numbers only as anchors. Use these exact sections in order:
 
 ## Diagnosis & Approach
@@ -983,8 +1015,7 @@ Group changes strictly by file path (1-2 clear sentences per item describing wha
 - **path/to/file.go (lines X-Y)**: Description of the structural change or new functions.
 - **path/to/new_file.go (new)**: Description of the module's responsibility.
 
-## Open Questions (Optional)
-Include only minor clarifications if needed.
+Do not add an "Open Questions" section: ask blocking questions with ask_user before writing the plan, or state a short assumption inline if you cannot ask.
 
 End the Actionable Implementation Plan with this exact line:
 Ready to implement — switch to BUILD to apply this plan.
@@ -1048,7 +1079,7 @@ func buildFinalPlanNote(reason string, planRounds, planToolCalls, usedRounds, us
 - "## Diagnosis & Approach": 2-4 sentences on the root problem and the high-level strategy.
 - "## Key Decisions": short bullets on trade-offs, edge cases, and patterns reused or avoided.
 - "## Implementation Plan": items grouped strictly by file path, each 1-2 sentences on what changes and why, citing line numbers only as anchors, e.g. "- **path/to/file.go (lines X-Y)**: change." and "- **path/to/new_file.go (new)**: responsibility.".
-- "## Open Questions (Optional)": only genuine ambiguities needing user confirmation before BUILD.
+- Do not add an "Open Questions" section: tools are disabled here, so state any remaining assumption in one short line.
 - Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
 No raw code blocks, no SQL queries, no verbose inline signatures, no raw tool output.
 Do not try to research further; if something is missing, state the assumption instead.`)

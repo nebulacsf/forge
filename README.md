@@ -32,7 +32,7 @@ Configured host/port are used when the flags are omitted.
 | Path | Purpose |
 | --- | --- |
 | `${FORGE_HOME:-~/.forge}/config.json` | Configuration (created on first run) |
-| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists, repo outline, symbol index) |
+| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists, clarifying questions, repo outline, symbol index) |
 | `${FORGE_HOME:-~/.forge}/forge.log` | Application log (rotated to `forge.log.1` at 10 MB) |
 
 Both the directory (0700) and the files are created automatically. `FORGE_HOME`
@@ -54,7 +54,7 @@ Sessions are stored per project; open tabs are restored after a reload.
 
 | Mode | Tools |
 | --- | --- |
-| **PLAN** (read-only) | `read_file`, `grep_search`, `symbol_lookup`, `list_directory`, `git_diff`, `update_checklist` |
+| **PLAN** (read-only) | `read_file`, `grep_search`, `symbol_lookup`, `list_directory`, `git_diff`, `update_checklist`, `ask_user` |
 | **BUILD** | all of the above, plus `patch_file`, `write_file`, `bash` |
 
 At the start of a new task the agent records it in the checklist before reading
@@ -93,10 +93,16 @@ In PLAN mode a completed turn ends with a **Plan ready — Switch to BUILD** car
 so it is always clear that files cannot change until you switch modes. The plan
 itself is a review document, not an implementation: it uses fixed sections
 (**Diagnosis & Approach**, **Key Decisions**, **Implementation Plan** grouped by
-file path, optional **Open Questions**) and never contains raw code blocks, SQL,
-or verbose inline signatures. If a
-model returns only reasoning and no final answer, Forge expands the reasoning
-card and warns you instead of leaving an apparently empty turn.
+file path) and never contains raw code blocks, SQL, or verbose inline signatures.
+If a genuine ambiguity blocks a correct plan, the agent calls `ask_user` instead
+of guessing. The questions are persisted in SQLite and rendered as an inline
+card in the chat. Each question offers single- or multi-choice options plus a
+custom answer field; sending the answers stores them and automatically starts
+the next turn, so the agent continues from what you chose. Answered cards remain
+in the transcript as a read-only record, and **Plan ready** is not shown while a
+question batch is still pending. If a model returns only reasoning and no final
+answer, Forge expands the reasoning card and warns you instead of leaving an
+apparently empty turn.
 
 `bash` runs in the project root with a timeout (default 30 s, capped at 600 s)
 and is killed as a process group on timeout or cancellation. Each call is a
@@ -109,7 +115,8 @@ checks for paths that do not exist yet. Writes are atomic.
 
 - Left rail: projects, add project, theme toggle, settings
 - Top: open session tabs
-- Center: chat with auto-resizing composer, **Send** and **Stop**
+- Center: chat with auto-resizing composer, **Send** and **Stop**, and inline
+  clarifying-question cards with selectable options and a custom answer
 - Right: collapsible inspector with usage/cost, active files, checklist
 
 Forge ships with dark and light themes. The theme can be switched from the left
@@ -313,9 +320,11 @@ can reduce the hit rate.
 | `GET/POST /api/projects` | List/register projects |
 | `PATCH/DELETE /api/projects/{id}` | Rename/recolor/move a project, or delete it with its chats |
 | `GET/POST /api/projects/{id}/sessions` | List (`?all=1` includes closed)/create sessions |
-| `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/close |
+| `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/close; includes `question_batches` |
 | `POST /api/sessions/{id}/compact` | Summarize the transcript and keep the last exchange |
-| `POST /api/chat/stream` | SSE agent turn (reasoning, content, tool, usage, checklist, done) |
+| `GET /api/sessions/{id}/questions` | List question batches and their answers |
+| `POST /api/sessions/{id}/questions/{qid}/answers` | Answer a question batch; returns the batch and the canonical user summary |
+| `POST /api/chat/stream` | SSE agent turn (reasoning, content, tool, usage, checklist, questions, done) |
 | `GET/POST/PATCH/DELETE` on checklist routes | Manual checklist edits |
 
 ## Security notes

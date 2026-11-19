@@ -77,6 +77,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{id}/messages", s.handleListMessages)
 	mux.HandleFunc("GET /api/sessions/{id}/checklist", s.handleListChecklist)
 	mux.HandleFunc("DELETE /api/sessions/{id}/checklist", s.handleClearChecklist)
+	mux.HandleFunc("GET /api/sessions/{id}/questions", s.handleListQuestions)
+	mux.HandleFunc("POST /api/sessions/{id}/questions/{qid}/answers", s.handleAnswerQuestions)
 
 	// Parallel agents: a run survives the browser. These endpoints let the UI
 	// re-attach to it, stop it explicitly, and know which chats are busy.
@@ -649,13 +651,19 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	questionBatches, err := s.store.ListQuestionBatches(id)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	_ = s.store.TouchProject(project.ID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"session":   session,
-		"project":   project,
-		"messages":  messageDTOs(messages),
-		"checklist": checklist,
+		"session":          session,
+		"project":          project,
+		"messages":         messageDTOs(messages),
+		"checklist":        checklist,
+		"question_batches": questionBatches,
 	})
 }
 

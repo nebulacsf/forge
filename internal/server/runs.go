@@ -111,6 +111,8 @@ func runActivity(evType string) string {
 		return "reporting usage"
 	case "checklist":
 		return "updating checklist"
+	case "questions":
+		return "waiting for your answers"
 	case "checkpoint":
 		return "checkpoint reached"
 	case "limit":

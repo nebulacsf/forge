@@ -50,9 +50,8 @@ func (m *mockOpenRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Messages) == 0 || req.Messages[0].Role != "system" ||
 		!strings.Contains(req.Messages[0].Content, "switch to BUILD") ||
-		!strings.Contains(req.Messages[0].Content, "FIRST action must be update_checklist") ||
 		!strings.Contains(req.Messages[0].Content, "Repository outline") ||
-		!strings.Contains(req.Messages[0].Content, "SYMBOL-FIRST RULE") ||
+		!strings.Contains(req.Messages[0].Content, "SYMBOL-FIRST") ||
 		!strings.Contains(req.Messages[0].Content, "Response style (strict)") ||
 		!strings.Contains(req.Messages[0].Content, "SHELL PATHS") {
 		http.Error(w, "PLAN system prompt missing required guidance", http.StatusBadRequest)
@@ -1317,26 +1316,31 @@ func TestBuildSystemPromptIsStableAndStateFree(t *testing.T) {
 }
 
 // TestBuildSystemPromptPLANFinalDetail pins the PLAN deliverable format: the
-// plan must arrive with evidence and open questions, not a one-line summary.
+// plan must arrive with evidence and no open-questions section, because
+// blocking questions are asked with ask_user before the plan.
 func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 	project := store.Project{Name: "demo", Path: "/tmp/demo"}
 	prompt := buildSystemPrompt(project, store.Session{Mode: "PLAN"}, 12, 96, 8, 24)
+	lower := strings.ToLower(prompt)
 	for _, want := range []string{
 		"## Diagnosis & Approach",
 		"## Key Decisions",
 		"## Implementation Plan",
-		"## Open Questions (Optional)",
-		"no raw code blocks",
-		"no SQL queries",
-		"no verbose inline signatures",
 		"Ready to implement — switch to BUILD to apply this plan.",
-		"never write a vague summary",
+		"ask_user",
+		"Answers to your questions:",
+		"never write vague summaries",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("PLAN system prompt missing %q", want)
 		}
 	}
-	for _, unwanted := range []string{"at most 7 one-line items", "BUILD final message", "## Decisions & assumptions", "## Findings"} {
+	for _, want := range []string{"no raw code blocks", "no sql queries", "no verbose inline signatures"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("PLAN system prompt missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"## Open Questions", "at most 7 one-line items", "BUILD final message", "## Decisions & assumptions", "## Findings"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Errorf("PLAN system prompt still contains %q", unwanted)
 		}
@@ -1348,16 +1352,16 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
 	project := store.Project{Name: "demo", Path: "/tmp/demo"}
 	prompt := buildSystemPrompt(project, store.Session{Mode: "BUILD"}, 12, 96, 8, 24)
-	if !strings.Contains(prompt, "concise but informative output") {
+	if !strings.Contains(prompt, "concise, factual summary") {
 		t.Error("BUILD system prompt is missing the expanded final-message rule")
 	}
-	if !strings.Contains(prompt, "what changed with file paths") {
+	if !strings.Contains(prompt, "exact files created/modified") {
 		t.Error("BUILD system prompt missing 'what changed' guidance")
 	}
-	if !strings.Contains(prompt, "what you verified") {
+	if !strings.Contains(prompt, "verification run and its real outcome") {
 		t.Error("BUILD system prompt missing 'what you verified' guidance")
 	}
-	if !strings.Contains(prompt, "next steps for the user") {
+	if !strings.Contains(prompt, "blockers, partial progress, or next steps") {
 		t.Error("BUILD system prompt missing 'next steps' guidance")
 	}
 	for _, unwanted := range []string{"## Diagnosis & Approach", "## Key Decisions", "## Implementation Plan", "## Open Questions"} {
@@ -1368,7 +1372,8 @@ func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
 }
 
 // TestBuildFinalPlanNoteRequestsDetailedPlan checks the forced final answer asks
-// for the same detailed deliverable.
+// for the same detailed deliverable and never reintroduces an open-questions
+// section (tools are disabled at that point).
 func TestBuildFinalPlanNoteRequestsDetailedPlan(t *testing.T) {
 	note := buildFinalPlanNote("", 8, 24, 8, 24, 1, false)
 	for _, want := range []string{
@@ -1376,12 +1381,15 @@ func TestBuildFinalPlanNoteRequestsDetailedPlan(t *testing.T) {
 		"## Diagnosis & Approach",
 		"## Key Decisions",
 		"## Implementation Plan",
-		"## Open Questions (Optional)",
 		"Ready to implement — switch to BUILD to apply this plan.",
+		"Do not add an \"Open Questions\" section",
 	} {
 		if !strings.Contains(note, want) {
 			t.Errorf("final plan note missing %q", want)
 		}
+	}
+	if strings.Contains(note, "## Open Questions") {
+		t.Error("final plan note must not request an Open Questions section")
 	}
 }
 
@@ -1400,5 +1408,126 @@ func TestBuildStateMessageCarriesVolatileState(t *testing.T) {
 		if !strings.Contains(state, want) {
 			t.Errorf("state message missing %q:\n%s", want, state)
 		}
+	}
+}
+
+// TestAskUserPausesTurnAndAnswers covers the whole clarify loop: the model
+// asks a question, the server emits it and ends the turn without another model
+// round, the UI endpoint stores the answer, and the canonical summary is
+// returned for the next user message.
+func TestAskUserPausesTurnAndAnswers(t *testing.T) {
+	mock := &toolLoopMock{tool: "ask_user", args: func(int) string {
+		return `{"questions":[{"question":"Which storage should Forge use?","context":"This decides the migration plan.","type":"single","options":[{"label":"SQLite","description":"local file"},{"label":"Postgres"}]}]}`
+	}}
+	app, st, session := chatBudgetFixture(t, "PLAN", mock, nil)
+
+	events := postChatEvents(t, app, map[string]any{
+		"session_id": session.ID,
+		"content":    "Plan the storage layer",
+	})
+	var sawQuestions, sawDone bool
+	for _, ev := range events {
+		switch ev["type"] {
+		case "questions":
+			sawQuestions = true
+			batch, _ := ev["question_batch"].(map[string]any)
+			if batch == nil || batch["id"] == nil {
+				t.Fatalf("questions event missing batch: %+v", ev)
+			}
+		case "done":
+			sawDone = true
+		}
+	}
+	if !sawQuestions {
+		t.Fatalf("expected a questions event, got %+v", events)
+	}
+	if !sawDone {
+		t.Fatalf("expected done after ask_user, got %+v", events)
+	}
+	if got := mock.requests.Load(); got != 1 {
+		t.Fatalf("model was called %d times, want 1 (ask_user must end the turn)", got)
+	}
+
+	batches, err := st.ListQuestionBatches(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 1 || len(batches[0].Questions) != 1 {
+		t.Fatalf("persisted batches = %+v", batches)
+	}
+	question := batches[0].Questions[0]
+	if question.AnsweredAt != "" {
+		t.Fatalf("question should be pending: %+v", question)
+	}
+
+	answer := map[string]any{"answers": []any{
+		map[string]any{"question_id": question.ID, "option_ids": []int64{question.Options[0].ID}, "text": "MySQL is also fine"},
+	}}
+	payload, _ := json.Marshal(answer)
+	url := fmt.Sprintf("%s/api/sessions/%d/questions/%d/answers", app.URL, session.ID, batches[0].ID)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("answer status %d: %s", resp.StatusCode, body)
+	}
+	var result struct {
+		Batch   store.QuestionBatch `json:"batch"`
+		Summary string              `json:"summary"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Batch.AnsweredAt == "" || len(result.Batch.Questions[0].AnswerOptionIDs) != 1 {
+		t.Fatalf("answer response batch = %+v", result.Batch)
+	}
+	if !strings.HasPrefix(result.Summary, "Answers to your questions:") {
+		t.Fatalf("summary prefix = %q", result.Summary)
+	}
+	if !strings.Contains(result.Summary, "SQLite") || !strings.Contains(result.Summary, "Which storage should Forge use?") || !strings.Contains(result.Summary, "MySQL is also fine") {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+
+	second, err := http.Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(second.Body)
+		t.Fatalf("second answer status = %d, want %d: %s", second.StatusCode, http.StatusConflict, body)
+	}
+
+	sessionResp, err := http.Get(fmt.Sprintf("%s/api/sessions/%d", app.URL, session.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionResp.Body.Close()
+	var payloadSession struct {
+		QuestionBatches []store.QuestionBatch `json:"question_batches"`
+	}
+	if err := json.NewDecoder(sessionResp.Body).Decode(&payloadSession); err != nil {
+		t.Fatal(err)
+	}
+	if len(payloadSession.QuestionBatches) != 1 || payloadSession.QuestionBatches[0].AnsweredAt == "" {
+		t.Fatalf("session payload question_batches = %+v", payloadSession.QuestionBatches)
+	}
+
+	questionsResp, err := http.Get(fmt.Sprintf("%s/api/sessions/%d/questions", app.URL, session.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer questionsResp.Body.Close()
+	var questionsPayload struct {
+		QuestionBatches []store.QuestionBatch `json:"question_batches"`
+	}
+	if err := json.NewDecoder(questionsResp.Body).Decode(&questionsPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(questionsPayload.QuestionBatches) != 1 || questionsPayload.QuestionBatches[0].AnsweredAt == "" {
+		t.Fatalf("questions endpoint = %+v", questionsPayload.QuestionBatches)
 	}
 }

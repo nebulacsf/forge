@@ -3,6 +3,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -16,6 +17,9 @@ import (
 
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
+
+// ErrAlreadyAnswered is returned when a question batch has already been answered.
+var ErrAlreadyAnswered = errors.New("questions already answered")
 
 type Project struct {
 	ID           int64   `json:"id"`
@@ -59,6 +63,62 @@ type ChecklistItem struct {
 	TaskText  string `json:"task_text"`
 	IsDone    bool   `json:"is_done"`
 	Position  int    `json:"position"`
+}
+
+// QuestionOption is one selectable answer for a clarifying question.
+type QuestionOption struct {
+	ID          int64  `json:"id"`
+	QuestionID  int64  `json:"question_id"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Position    int    `json:"position"`
+}
+
+// Question is one clarifying question asked by the agent. AnswerOptionIDs and
+// AnswerText are empty until the user answers the batch.
+type Question struct {
+	ID              int64            `json:"id"`
+	BatchID         int64            `json:"batch_id"`
+	SessionID       int64            `json:"session_id"`
+	Text            string           `json:"text"`
+	Context         string           `json:"context"`
+	Kind            string           `json:"kind"` // "single" or "multi"
+	Position        int              `json:"position"`
+	Options         []QuestionOption `json:"options"`
+	AnswerOptionIDs []int64          `json:"answer_option_ids"`
+	AnswerText      string           `json:"answer_text"`
+	AnsweredAt      string           `json:"answered_at,omitempty"`
+}
+
+// QuestionBatch groups the questions asked by one ask_user tool call.
+type QuestionBatch struct {
+	ID         int64      `json:"id"`
+	SessionID  int64      `json:"session_id"`
+	ToolCallID string     `json:"tool_call_id"`
+	CreatedAt  string     `json:"created_at"`
+	AnsweredAt string     `json:"answered_at,omitempty"`
+	Questions  []Question `json:"questions"`
+}
+
+// QuestionOptionInput is one option to persist for a new question.
+type QuestionOptionInput struct {
+	Label       string
+	Description string
+}
+
+// QuestionInput is one question to persist for a new batch.
+type QuestionInput struct {
+	Text    string
+	Context string
+	Kind    string
+	Options []QuestionOptionInput
+}
+
+// QuestionAnswerInput is the user's answer to one question.
+type QuestionAnswerInput struct {
+	QuestionID int64
+	OptionIDs  []int64
+	Text       string
 }
 
 // RepoOutlineFile is one cached file in a project's local repository map.
@@ -258,6 +318,35 @@ CREATE TABLE IF NOT EXISTS checklists (
 	position   INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS question_batches (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+	tool_call_id TEXT NOT NULL DEFAULT '',
+	created_at   TEXT NOT NULL,
+	answered_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS questions (
+	id                INTEGER PRIMARY KEY AUTOINCREMENT,
+	batch_id          INTEGER NOT NULL REFERENCES question_batches(id) ON DELETE CASCADE,
+	session_id        INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+	text              TEXT NOT NULL,
+	context           TEXT NOT NULL DEFAULT '',
+	kind              TEXT NOT NULL DEFAULT 'single' CHECK (kind IN ('single','multi')),
+	position          INTEGER NOT NULL DEFAULT 0,
+	answer_option_ids TEXT NOT NULL DEFAULT '[]',
+	answer_text       TEXT NOT NULL DEFAULT '',
+	answered_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS question_options (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+	label       TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	position    INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS repo_outline (
 	project_path TEXT NOT NULL,
 	file_path    TEXT NOT NULL,
@@ -294,6 +383,9 @@ CREATE TABLE IF NOT EXISTS project_symbols (
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, is_open, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_checklists_session ON checklists(session_id, position, id);
+CREATE INDEX IF NOT EXISTS idx_question_batches_session ON question_batches(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_questions_batch ON questions(batch_id, position, id);
+CREATE INDEX IF NOT EXISTS idx_question_options_question ON question_options(question_id, position, id);
 CREATE INDEX IF NOT EXISTS idx_project_symbols_name ON project_symbols(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_project_symbols_kind ON project_symbols(project_id, kind, name);
 `
@@ -871,6 +963,297 @@ func (s *Store) ReplaceChecklist(sessionID int64, tasks []string) error {
 		pos++
 	}
 	return tx.Commit()
+}
+
+// ---------------------------------------------------------------------------
+// Clarifying questions
+
+// CreateQuestionBatch persists one ask_user call as a batch of questions.
+func (s *Store) CreateQuestionBatch(sessionID int64, toolCallID string, inputs []QuestionInput) (QuestionBatch, error) {
+	if sessionID <= 0 {
+		return QuestionBatch{}, fmt.Errorf("session id is required")
+	}
+	if len(inputs) == 0 {
+		return QuestionBatch{}, fmt.Errorf("at least one question is required")
+	}
+	batch := QuestionBatch{
+		SessionID:  sessionID,
+		ToolCallID: strings.TrimSpace(toolCallID),
+		CreatedAt:  now(),
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return QuestionBatch{}, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`
+		INSERT INTO question_batches (session_id, tool_call_id, created_at)
+		VALUES (?, ?, ?)`, sessionID, batch.ToolCallID, batch.CreatedAt)
+	if err != nil {
+		return QuestionBatch{}, err
+	}
+	batch.ID, _ = res.LastInsertId()
+	batch.Questions = make([]Question, 0, len(inputs))
+	for pos, input := range inputs {
+		text := strings.TrimSpace(input.Text)
+		if text == "" {
+			return QuestionBatch{}, fmt.Errorf("question text is required")
+		}
+		kind := strings.ToLower(strings.TrimSpace(input.Kind))
+		if kind == "" {
+			kind = "single"
+		}
+		if kind != "single" && kind != "multi" {
+			return QuestionBatch{}, fmt.Errorf("question kind must be single or multi")
+		}
+		context := strings.TrimSpace(input.Context)
+		qRes, err := tx.Exec(`
+			INSERT INTO questions (batch_id, session_id, text, context, kind, position)
+			VALUES (?, ?, ?, ?, ?, ?)`, batch.ID, sessionID, text, context, kind, pos)
+		if err != nil {
+			return QuestionBatch{}, err
+		}
+		qID, _ := qRes.LastInsertId()
+		q := Question{
+			ID: qID, BatchID: batch.ID, SessionID: sessionID,
+			Text: text, Context: context, Kind: kind, Position: pos,
+			Options: []QuestionOption{},
+		}
+		for optPos, opt := range input.Options {
+			label := strings.TrimSpace(opt.Label)
+			if label == "" {
+				continue
+			}
+			description := strings.TrimSpace(opt.Description)
+			oRes, err := tx.Exec(`
+				INSERT INTO question_options (question_id, label, description, position)
+				VALUES (?, ?, ?, ?)`, qID, label, description, optPos)
+			if err != nil {
+				return QuestionBatch{}, err
+			}
+			oID, _ := oRes.LastInsertId()
+			q.Options = append(q.Options, QuestionOption{
+				ID: oID, QuestionID: qID, Label: label, Description: description, Position: optPos,
+			})
+		}
+		batch.Questions = append(batch.Questions, q)
+	}
+	if err := tx.Commit(); err != nil {
+		return QuestionBatch{}, err
+	}
+	return batch, nil
+}
+
+// ListQuestionBatches returns every question batch of a session, oldest first.
+func (s *Store) ListQuestionBatches(sessionID int64) ([]QuestionBatch, error) {
+	rows, err := s.db.Query(`
+		SELECT id, session_id, tool_call_id, created_at, COALESCE(answered_at, '')
+		FROM question_batches WHERE session_id = ? ORDER BY id ASC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	batches := []QuestionBatch{}
+	byID := map[int64]int{}
+	for rows.Next() {
+		var b QuestionBatch
+		if err := rows.Scan(&b.ID, &b.SessionID, &b.ToolCallID, &b.CreatedAt, &b.AnsweredAt); err != nil {
+			return nil, err
+		}
+		byID[b.ID] = len(batches)
+		batches = append(batches, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(batches) == 0 {
+		return batches, nil
+	}
+
+	qRows, err := s.db.Query(`
+		SELECT id, batch_id, session_id, text, context, kind, position,
+		       answer_option_ids, answer_text, COALESCE(answered_at, '')
+		FROM questions WHERE session_id = ?
+		ORDER BY batch_id ASC, position ASC, id ASC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer qRows.Close()
+	// Remember where every question landed so its options can be attached
+	// after all questions have been read.
+	qLoc := map[int64][2]int{}
+	for qRows.Next() {
+		var (
+			q   Question
+			raw string
+		)
+		if err := qRows.Scan(&q.ID, &q.BatchID, &q.SessionID, &q.Text, &q.Context,
+			&q.Kind, &q.Position, &raw, &q.AnswerText, &q.AnsweredAt); err != nil {
+			return nil, err
+		}
+		q.AnswerOptionIDs = []int64{}
+		if strings.TrimSpace(raw) != "" {
+			if err := json.Unmarshal([]byte(raw), &q.AnswerOptionIDs); err != nil {
+				q.AnswerOptionIDs = []int64{}
+			}
+		}
+		q.Options = []QuestionOption{}
+		bi, ok := byID[q.BatchID]
+		if !ok {
+			continue
+		}
+		batches[bi].Questions = append(batches[bi].Questions, q)
+		qLoc[q.ID] = [2]int{bi, len(batches[bi].Questions) - 1}
+	}
+	if err := qRows.Err(); err != nil {
+		return nil, err
+	}
+
+	oRows, err := s.db.Query(`
+		SELECT o.id, o.question_id, o.label, o.description, o.position
+		FROM question_options o
+		JOIN questions q ON q.id = o.question_id
+		WHERE q.session_id = ?
+		ORDER BY o.question_id ASC, o.position ASC, o.id ASC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer oRows.Close()
+	for oRows.Next() {
+		var o QuestionOption
+		if err := oRows.Scan(&o.ID, &o.QuestionID, &o.Label, &o.Description, &o.Position); err != nil {
+			return nil, err
+		}
+		if loc, ok := qLoc[o.QuestionID]; ok {
+			q := &batches[loc[0]].Questions[loc[1]]
+			q.Options = append(q.Options, o)
+		}
+	}
+	return batches, oRows.Err()
+}
+
+// AnswerQuestionBatch stores the user's answers and marks the batch answered.
+func (s *Store) AnswerQuestionBatch(sessionID, batchID int64, answers []QuestionAnswerInput) (QuestionBatch, error) {
+	if sessionID <= 0 || batchID <= 0 {
+		return QuestionBatch{}, fmt.Errorf("session and batch ids are required")
+	}
+	var answeredAt sql.NullString
+	err := s.db.QueryRow(`SELECT answered_at FROM question_batches WHERE id = ? AND session_id = ?`,
+		batchID, sessionID).Scan(&answeredAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return QuestionBatch{}, ErrNotFound
+	}
+	if err != nil {
+		return QuestionBatch{}, err
+	}
+	if answeredAt.Valid && answeredAt.String != "" {
+		return QuestionBatch{}, ErrAlreadyAnswered
+	}
+
+	batches, err := s.ListQuestionBatches(sessionID)
+	if err != nil {
+		return QuestionBatch{}, err
+	}
+	var batch QuestionBatch
+	for _, b := range batches {
+		if b.ID == batchID {
+			batch = b
+			break
+		}
+	}
+	if batch.ID == 0 {
+		return QuestionBatch{}, ErrNotFound
+	}
+
+	answerByQuestion := make(map[int64]QuestionAnswerInput, len(answers))
+	for _, a := range answers {
+		if a.QuestionID <= 0 {
+			continue
+		}
+		if _, exists := answerByQuestion[a.QuestionID]; exists {
+			return QuestionBatch{}, fmt.Errorf("duplicate answer for question %d", a.QuestionID)
+		}
+		answerByQuestion[a.QuestionID] = a
+	}
+	if len(answerByQuestion) != len(batch.Questions) {
+		return QuestionBatch{}, fmt.Errorf("every question must be answered")
+	}
+
+	ts := now()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return QuestionBatch{}, err
+	}
+	defer tx.Rollback()
+	// Claim the batch first so two concurrent submissions cannot both write.
+	claim, err := tx.Exec(`
+		UPDATE question_batches SET answered_at = ?
+		WHERE id = ? AND session_id = ? AND answered_at IS NULL`, ts, batchID, sessionID)
+	if err != nil {
+		return QuestionBatch{}, err
+	}
+	if n, _ := claim.RowsAffected(); n == 0 {
+		return QuestionBatch{}, ErrAlreadyAnswered
+	}
+	for _, q := range batch.Questions {
+		a, ok := answerByQuestion[q.ID]
+		if !ok {
+			return QuestionBatch{}, fmt.Errorf("question %d is unanswered", q.ID)
+		}
+		ids := uniquePositiveIDs(a.OptionIDs)
+		if q.Kind == "single" && len(ids) > 1 {
+			return QuestionBatch{}, fmt.Errorf("question %d accepts only one option", q.ID)
+		}
+		valid := make(map[int64]bool, len(q.Options))
+		for _, o := range q.Options {
+			valid[o.ID] = true
+		}
+		for _, id := range ids {
+			if !valid[id] {
+				return QuestionBatch{}, fmt.Errorf("option %d does not belong to question %d", id, q.ID)
+			}
+		}
+		text := strings.TrimSpace(a.Text)
+		if len(ids) == 0 && text == "" {
+			return QuestionBatch{}, fmt.Errorf("question %d needs an option or a custom answer", q.ID)
+		}
+		raw, err := json.Marshal(ids)
+		if err != nil {
+			return QuestionBatch{}, err
+		}
+		if _, err := tx.Exec(`
+			UPDATE questions SET answer_option_ids = ?, answer_text = ?, answered_at = ?
+			WHERE id = ? AND batch_id = ?`, string(raw), text, ts, q.ID, batchID); err != nil {
+			return QuestionBatch{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return QuestionBatch{}, err
+	}
+
+	batches, err = s.ListQuestionBatches(sessionID)
+	if err != nil {
+		return QuestionBatch{}, err
+	}
+	for _, b := range batches {
+		if b.ID == batchID {
+			return b, nil
+		}
+	}
+	return QuestionBatch{}, ErrNotFound
+}
+
+func uniquePositiveIDs(ids []int64) []int64 {
+	seen := make(map[int64]bool, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

@@ -84,6 +84,8 @@ function makeView(sessionId, projectId = 0) {
     turnTimerEl: null,
     checklist: [],
     files: new Map(),
+    questionBatches: [],
+    renderedQuestions: new Set(),
     usage: { ...EMPTY_USAGE },
   };
 }
@@ -212,6 +214,7 @@ const VIEW_DEFAULTS = {
   toolCards: () => new Map(),
   files: () => new Map(),
   checklist: () => [],
+  questionBatches: () => [],
   messageIndex: -1,
   turnSegment: 1,
   turnTimerEl: null,
@@ -224,7 +227,7 @@ for (const field of [
   'toolCards', 'sawCancelled', 'turnHadContent', 'turnHadError', 'turnReasoningOnly',
   'turnRound', 'turnLimit', 'turnSegment', 'turnSegmentSize', 'messageIndex',
   'sessionTimeBase', 'turnBaseTime', 'turnStartedAt', 'turnElapsedMs', 'turnClock',
-  'turnTimerEl', 'checklist', 'files',
+  'turnTimerEl', 'checklist', 'files', 'questionBatches',
 ]) {
   Object.defineProperty(state, field, {
     configurable: true,
@@ -593,6 +596,7 @@ async function loadSession(id) {
     const view = viewFor(id, { create: true });
     view.finishedUnseen = false;
     view.checklist = data.checklist || [];
+    view.questionBatches = Array.isArray(data.question_batches) ? data.question_batches : [];
     view.sessionTimeBase = Number(data.session.duration_ms || 0);
     if (!view.streaming) {
       view.turnBaseTime = view.sessionTimeBase;
@@ -736,9 +740,10 @@ function renderTabs() {
     tab.draggable = true;
     tab.dataset.id = String(session.id);
     // Background agents stay visible: a spinner while the run is live and a dot
-    // when it finished while the user was looking at another chat.
-    const running = runIndex.has(session.id) || !!viewFor(session.id)?.streaming;
-    const unseen = !!viewFor(session.id)?.finishedUnseen;
+    // when it finished (or paused for questions) while the user was elsewhere.
+    const sessionView = viewFor(session.id);
+    const running = runIndex.has(session.id) || !!sessionView?.streaming;
+    const unseen = !!sessionView?.finishedUnseen;
     if (running) {
       tab.classList.add('running');
       const dot = document.createElement('span');
@@ -749,7 +754,9 @@ function renderTabs() {
       tab.classList.add('unseen');
       const dot = document.createElement('span');
       dot.className = 'tab-unseen-dot';
-      dot.title = 'Finished while you were away — open to see the result';
+      dot.title = hasPendingQuestions(sessionView)
+        ? 'Waiting for your answers — open to respond'
+        : 'Finished while you were away — open to see the result';
       tab.appendChild(dot);
     }
     // Click only opens the chat; it never moves the tab.
@@ -882,11 +889,24 @@ async function patchSession(payload) {
 
 /* ── Session rendering ───────────────────────────────────────────── */
 
+// messageHasToolCalls reports whether a persisted assistant message is an
+// intermediate tool round. Only a final, content-only message is a real plan.
+function messageHasToolCalls(msg) {
+  try {
+    const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : JSON.parse(msg.tool_calls || '[]');
+    return Array.isArray(calls) && calls.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function renderSession(messages) {
   const container = messagesEl();
+  const view = currentView();
   state.currentRound = null;
   state.toolCards = new Map();
   state.messageIndex = -1;
+  if (view) view.renderedQuestions = new Set();
   container.innerHTML = '';
   let hasContent = false;
   for (const msg of messages) {
@@ -907,8 +927,16 @@ function renderSession(messages) {
   else showEmpty('chat');
   document.title = `${state.session?.title || 'Forge'} · Forge`;
   const last = messages[messages.length - 1];
-  if (state.session?.mode === 'PLAN' && last?.role === 'assistant' && (last.content || '').trim()) {
+  if (state.session?.mode === 'PLAN' && last?.role === 'assistant' &&
+      (last.content || '').trim() && !messageHasToolCalls(last) && !hasPendingQuestions(view)) {
     addPlanReadyCard();
+  }
+  // Batches whose tool call never made it to the transcript (a run interrupted
+  // between persisting the questions and the tool message, or history compacted
+  // afterwards) still need a card, otherwise the user would never see them.
+  for (const batch of (view?.questionBatches || [])) {
+    if (view.renderedQuestions && view.renderedQuestions.has(batch.id)) continue;
+    renderQuestionCard(container, batch);
   }
   maybeScroll(true);
 }
@@ -947,6 +975,243 @@ function addPlanReadyCard() {
   });
   card.querySelector('.plan-ready-close').addEventListener('click', () => card.remove());
   messagesEl().appendChild(card);
+}
+
+/* ── Clarifying questions (ask_user) ─────────────────────────────── */
+
+function hasPendingQuestions(view) {
+  return (view?.questionBatches || []).some((batch) => !batch.answered_at);
+}
+
+function batchForCall(view, callId) {
+  if (!view || !callId) return null;
+  return (view.questionBatches || []).find((batch) => batch && batch.tool_call_id === callId) || null;
+}
+
+function questionOptionLabel(question, id) {
+  const option = (question.options || []).find((opt) => opt.id === id);
+  return option ? option.label : '';
+}
+
+function questionAnswerText(question) {
+  const parts = [];
+  for (const id of question.answer_option_ids || []) {
+    const label = questionOptionLabel(question, id);
+    if (label) parts.push(label);
+  }
+  const custom = (question.answer_text || '').trim();
+  if (custom) parts.push(custom);
+  return parts.join('; ');
+}
+
+// renderQuestionCard draws one ask_user batch. A pending batch is interactive;
+// an answered batch (or readOnly) is a compact record of the chosen answers.
+function renderQuestionCard(host, batch, { readOnly = false, replace = null } = {}) {
+  const view = currentView();
+  if (view && batch.id) {
+    if (!(view.renderedQuestions instanceof Set)) view.renderedQuestions = new Set();
+    view.renderedQuestions.add(batch.id);
+  }
+  const sessionId = view?.sessionId || state.activeSessionId;
+  const answered = !!batch.answered_at;
+  const locked = readOnly || answered;
+
+  const card = document.createElement('div');
+  card.className = 'question-card' + (locked ? ' is-answered' : '');
+  card.dataset.batch = String(batch.id);
+
+  const head = document.createElement('div');
+  head.className = 'question-head';
+  head.innerHTML =
+    '<span class="question-head-icon"><i class="bi bi-question-circle"></i></span>' +
+    '<div class="question-head-text"><strong>Forge needs your input</strong><span class="question-head-sub"></span></div>';
+  head.querySelector('.question-head-text strong').textContent = locked
+    ? 'Question answered'
+    : 'Forge needs your input';
+  head.querySelector('.question-head-sub').textContent = locked
+    ? 'Your answers are part of the conversation'
+    : `${batch.questions.length} question${batch.questions.length === 1 ? '' : 's'} waiting for you`;
+  if (!locked) {
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'question-close';
+    close.title = 'Dismiss';
+    close.setAttribute('aria-label', 'Dismiss questions');
+    close.innerHTML = '&times;';
+    close.addEventListener('click', () => card.remove());
+    head.appendChild(close);
+  }
+
+  const body = document.createElement('div');
+  body.className = 'question-body';
+  const selections = new Map();
+  const customs = new Map();
+
+  for (const question of batch.questions || []) {
+    const item = document.createElement('div');
+    item.className = 'question-item';
+    item.dataset.question = String(question.id);
+
+    const title = document.createElement('div');
+    title.className = 'question-title';
+    title.textContent = question.text;
+    item.appendChild(title);
+
+    const context = (question.context || '').trim();
+    if (context) {
+      const note = document.createElement('div');
+      note.className = 'question-context';
+      note.textContent = context;
+      item.appendChild(note);
+    }
+
+    if (locked) {
+      const answer = document.createElement('div');
+      answer.className = 'question-answer';
+      answer.textContent = questionAnswerText(question) || '(no answer)';
+      item.appendChild(answer);
+      body.appendChild(item);
+      continue;
+    }
+
+    selections.set(question.id, new Set(question.answer_option_ids || []));
+    customs.set(question.id, question.answer_text || '');
+
+    const options = document.createElement('div');
+    options.className = 'question-options';
+    let custom = null;
+
+    for (const option of question.options || []) {
+      const label = document.createElement('label');
+      label.className = 'question-option';
+      const input = document.createElement('input');
+      input.type = question.kind === 'multi' ? 'checkbox' : 'radio';
+      input.name = `question-${batch.id}-${question.id}`;
+      input.value = String(option.id);
+      input.checked = selections.get(question.id).has(option.id);
+      const text = document.createElement('span');
+      text.className = 'question-option-text';
+      const labelText = document.createElement('span');
+      labelText.className = 'question-option-label';
+      labelText.textContent = option.label;
+      text.appendChild(labelText);
+      if ((option.description || '').trim()) {
+        const desc = document.createElement('span');
+        desc.className = 'question-option-desc';
+        desc.textContent = option.description;
+        text.appendChild(desc);
+      }
+      label.appendChild(input);
+      label.appendChild(text);
+      input.addEventListener('change', () => {
+        const chosen = selections.get(question.id);
+        if (question.kind === 'multi') {
+          if (input.checked) chosen.add(option.id);
+          else chosen.delete(option.id);
+        } else if (input.checked) {
+          chosen.clear();
+          chosen.add(option.id);
+          if (custom) {
+            custom.value = '';
+            customs.set(question.id, '');
+          }
+        }
+        item.classList.remove('needs-answer');
+      });
+      options.appendChild(label);
+    }
+    item.appendChild(options);
+
+    const customWrap = document.createElement('div');
+    customWrap.className = 'question-custom';
+    custom = document.createElement('input');
+    custom.type = 'text';
+    custom.className = 'question-custom-input';
+    custom.placeholder = 'Or type your own answer…';
+    custom.setAttribute('aria-label', `Your own answer for: ${question.text}`);
+    custom.value = customs.get(question.id);
+    custom.addEventListener('input', () => {
+      customs.set(question.id, custom.value);
+      if (question.kind !== 'multi' && custom.value.trim()) {
+        selections.get(question.id).clear();
+        for (const input of options.querySelectorAll('input')) input.checked = false;
+      }
+      item.classList.remove('needs-answer');
+    });
+    customWrap.appendChild(custom);
+    item.appendChild(customWrap);
+    body.appendChild(item);
+  }
+
+  const foot = document.createElement('div');
+  foot.className = 'question-actions';
+  if (!locked) {
+    const hint = document.createElement('span');
+    hint.className = 'question-hint';
+    hint.textContent = 'Choose an option or write your own answer for every question.';
+    const send = document.createElement('button');
+    send.type = 'button';
+    send.className = 'btn btn-accent';
+    send.textContent = 'Send answers';
+    send.addEventListener('click', () => {
+      submitQuestionAnswers(batch, selections, customs, card, send, sessionId);
+    });
+    foot.appendChild(hint);
+    foot.appendChild(send);
+  }
+
+  card.appendChild(head);
+  card.appendChild(body);
+  if (!locked) card.appendChild(foot);
+  if (replace && replace.parentElement) replace.replaceWith(card);
+  else host.appendChild(card);
+  return card;
+}
+
+async function submitQuestionAnswers(batch, selections, customs, card, button, sessionId) {
+  if (state.streaming) {
+    toast('Wait for the current turn to finish before answering.', 'error');
+    return;
+  }
+  const answers = [];
+  let missing = false;
+  for (const question of batch.questions || []) {
+    const optionIds = Array.from(selections.get(question.id) || []);
+    const text = (customs.get(question.id) || '').trim();
+    if (!optionIds.length && !text) {
+      missing = true;
+      const item = card.querySelector(`.question-item[data-question="${question.id}"]`);
+      if (item) item.classList.add('needs-answer');
+    }
+    answers.push({ question_id: question.id, option_ids: optionIds, text });
+  }
+  if (missing) {
+    toast('Answer every question before sending.', 'error');
+    return;
+  }
+  button.disabled = true;
+  try {
+    const data = await api(`/api/sessions/${sessionId}/questions/${batch.id}/answers`, {
+      method: 'POST',
+      body: JSON.stringify({ answers }),
+    });
+    const view = viewFor(sessionId, { create: true });
+    if (view) {
+      if (!Array.isArray(view.questionBatches)) view.questionBatches = [];
+      const index = view.questionBatches.findIndex((b) => b.id === batch.id);
+      if (index >= 0) view.questionBatches[index] = data.batch;
+      else view.questionBatches.push(data.batch);
+      withView(view, () => {
+        renderQuestionCard(card.parentElement || view.el, data.batch, { readOnly: true, replace: card });
+      });
+    } else {
+      card.remove();
+    }
+    await runTurn({ content: data.summary, userText: data.summary, sessionId });
+  } catch (err) {
+    button.disabled = false;
+    toast(err.message, 'error');
+  }
 }
 
 function appendUserMessage(text, attachments = []) {
@@ -1001,6 +1266,14 @@ function renderAssistantHistory(msg) {
     if (!hasContent) card.el.open = true;
   }
   for (const call of calls) {
+    const name = call.function?.name || call.name || '';
+    if (name === 'ask_user') {
+      const batch = batchForCall(currentView(), call.id);
+      if (batch) {
+        renderQuestionCard(round.events, batch);
+        continue;
+      }
+    }
     addHistoricalToolCall(round, call);
   }
   if (hasContent) {
@@ -1070,15 +1343,17 @@ async function continueTurn() {
   await runTurn({ isContinue: true, userText: 'Continue from where you left off.' });
 }
 
-async function runTurn({ content = '', isContinue = false, userText = content, attachments = [] }) {
-  const sessionId = state.session?.id || state.activeSessionId;
+async function runTurn({ content = '', isContinue = false, userText = content, attachments = [], sessionId = state.session?.id || state.activeSessionId }) {
   const view = viewFor(sessionId, { create: true });
-  removePlanReadyCard();
-  updateSendState();
-  appendUserMessage(userText, attachments);
-  hideEmpty();
-  view.messageIndex = -1;
-  maybeScroll(true);
+  if (!view) return;
+  withView(view, () => {
+    removePlanReadyCard();
+    updateSendState();
+    appendUserMessage(userText, attachments);
+    if (viewIsActive(view)) hideEmpty();
+    view.messageIndex = -1;
+    maybeScroll(true);
+  });
 
   withView(view, () => {
     state.streaming = true;
@@ -1095,7 +1370,8 @@ async function runTurn({ content = '', isContinue = false, userText = content, a
     startTurnClock();
     beginRound(0);
   });
-  const modeAtSend = state.session?.mode === 'BUILD' ? 'BUILD' : 'PLAN';
+  const target = state.session?.id === sessionId ? state.session : sessionById(sessionId);
+  const modeAtSend = target?.mode === 'BUILD' ? 'BUILD' : 'PLAN';
   setRunStatus({ session_id: sessionId, state: 'running', mode: modeAtSend });
   renderTabs();
 
@@ -1126,9 +1402,11 @@ async function runTurn({ content = '', isContinue = false, userText = content, a
       withView(view, () => {
         const users = messagesEl().querySelectorAll('.msg-user');
         if (users.length) users[users.length - 1].remove();
-        if (!messagesEl().querySelector('.msg-user, .assistant-round')) showEmpty('chat');
+        if (!messagesEl().querySelector('.msg-user, .assistant-round') && viewIsActive(view)) {
+          showEmpty('chat');
+        }
       });
-      if (!isContinue && !$('promptInput').value.trim()) {
+      if (viewIsActive(view) && !isContinue && !$('promptInput').value.trim()) {
         $('promptInput').value = content;
         resizePrompt();
       }
@@ -1162,7 +1440,7 @@ function finishTurnView(view, modeAtSend = '') {
     state.turnSegment = 1;
     state.turnSegmentSize = 0;
     if (!view.sawCancelled && !view.turnHadError && !view.turnReasoningOnly &&
-        modeAtSend === 'PLAN' && view.turnHadContent) {
+        modeAtSend === 'PLAN' && view.turnHadContent && !hasPendingQuestions(view)) {
       addPlanReadyCard();
     }
   });
@@ -1178,7 +1456,12 @@ function finishTurnView(view, modeAtSend = '') {
   } else if (!view.sawCancelled) {
     view.finishedUnseen = true;
     const session = state.sessions.find((s) => s.id === view.sessionId);
-    toast(`${session?.title || 'Background agent'} finished`, 'success');
+    const title = session?.title || 'Background agent';
+    if (hasPendingQuestions(view)) {
+      toast(`${title} needs your answers`, 'success');
+    } else {
+      toast(`${title} finished`, 'success');
+    }
   }
   runIndex.delete(view.sessionId);
   updateSessionTabCosts();
@@ -1344,6 +1627,9 @@ function handleEvent(ev) {
     case 'tool_start': {
       const round = ensureRound();
       removeThinking(round);
+      // ask_user renders as a question card on the `questions` event instead of
+      // a generic tool row.
+      if (ev.name === 'ask_user') break;
       const card = addToolCard(round, ev);
       state.toolCards.set(ev.id, card);
       round.hasEvents = true;
@@ -1359,6 +1645,7 @@ function handleEvent(ev) {
       break;
     }
     case 'tool_end': {
+      if (ev.name === 'ask_user') break;
       const round = state.currentRound || ensureRound();
       let card = state.toolCards.get(ev.id);
       if (!card) {
@@ -1380,6 +1667,26 @@ function handleEvent(ev) {
       state.checklist = Array.isArray(ev.checklist) ? ev.checklist : [];
       renderChecklist();
       break;
+    case 'questions': {
+      const batch = ev.question_batch;
+      if (!batch) break;
+      const round = ensureRound();
+      removeThinking(round);
+      const view = currentView();
+      // A reattach after a reload can replay this event while the card is
+      // already on screen from the session payload; do not render it twice.
+      const alreadyRendered = !!(view?.renderedQuestions && view.renderedQuestions.has(batch.id));
+      if (!Array.isArray(state.questionBatches)) state.questionBatches = [];
+      const index = state.questionBatches.findIndex((b) => b.id === batch.id);
+      if (index >= 0) state.questionBatches[index] = batch;
+      else state.questionBatches.push(batch);
+      if (!alreadyRendered) {
+        renderQuestionCard(round.events, batch);
+        round.hasEvents = true;
+        maybeScroll();
+      }
+      break;
+    }
     case 'session':
       if (ev.session) {
         syncSession(ev.session);

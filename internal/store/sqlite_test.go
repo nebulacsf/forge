@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -283,5 +284,137 @@ func TestOpenAddsCachedTokensColumn(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("%s.%s column count = %d, want 1", table, column, count)
 		}
+	}
+}
+
+func TestQuestionBatchesCreateListAnswerAndCascade(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	project, err := st.CreateProject("Questions", "/tmp/questions", "#6f8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "Questions", "model", "PLAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.CreateQuestionBatch(session.ID, "", nil); err == nil {
+		t.Fatal("empty question batch should be rejected")
+	}
+	batch, err := st.CreateQuestionBatch(session.ID, "call_ask_1", []QuestionInput{
+		{
+			Text: "Which database should Forge use?",
+			Kind: "single",
+			Options: []QuestionOptionInput{
+				{Label: "SQLite", Description: "local file"},
+				{Label: "Postgres"},
+			},
+		},
+		{
+			Text:    "Which platforms must be supported?",
+			Context: "This changes the packaging plan.",
+			Kind:    "multi",
+			Options: []QuestionOptionInput{{Label: "Linux"}, {Label: "macOS"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.ID == 0 || batch.ToolCallID != "call_ask_1" || len(batch.Questions) != 2 {
+		t.Fatalf("batch = %+v", batch)
+	}
+	q0, q1 := batch.Questions[0], batch.Questions[1]
+	if q0.Kind != "single" || len(q0.Options) != 2 || q0.Options[0].Description != "local file" {
+		t.Fatalf("single question = %+v", q0)
+	}
+	if q1.Kind != "multi" || q1.Context == "" || len(q1.Options) != 2 {
+		t.Fatalf("multi question = %+v", q1)
+	}
+	if len(q0.AnswerOptionIDs) != 0 || q0.AnswerText != "" || q0.AnsweredAt != "" {
+		t.Fatalf("new question should be unanswered: %+v", q0)
+	}
+
+	batches, err := st.ListQuestionBatches(session.ID)
+	if err != nil || len(batches) != 1 || len(batches[0].Questions) != 2 {
+		t.Fatalf("ListQuestionBatches = %+v, %v", batches, err)
+	}
+	other, err := st.CreateSession(project.ID, "Other", "model", "PLAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherBatches, err := st.ListQuestionBatches(other.ID); err != nil || len(otherBatches) != 0 {
+		t.Fatalf("other session batches = %+v, %v", otherBatches, err)
+	}
+
+	invalid := []struct {
+		name    string
+		answers []QuestionAnswerInput
+	}{
+		{"missing question", []QuestionAnswerInput{{QuestionID: q0.ID, OptionIDs: []int64{q0.Options[0].ID}}}},
+		{"duplicate answer", []QuestionAnswerInput{
+			{QuestionID: q0.ID, OptionIDs: []int64{q0.Options[0].ID}},
+			{QuestionID: q0.ID, OptionIDs: []int64{q0.Options[1].ID}},
+			{QuestionID: q1.ID, OptionIDs: []int64{q1.Options[0].ID}},
+		}},
+		{"empty answer", []QuestionAnswerInput{
+			{QuestionID: q0.ID},
+			{QuestionID: q1.ID, OptionIDs: []int64{q1.Options[0].ID}},
+		}},
+		{"two options on single", []QuestionAnswerInput{
+			{QuestionID: q0.ID, OptionIDs: []int64{q0.Options[0].ID, q0.Options[1].ID}},
+			{QuestionID: q1.ID, OptionIDs: []int64{q1.Options[0].ID}},
+		}},
+		{"foreign option", []QuestionAnswerInput{
+			{QuestionID: q0.ID, OptionIDs: []int64{q1.Options[0].ID}},
+			{QuestionID: q1.ID, OptionIDs: []int64{q1.Options[0].ID}},
+		}},
+	}
+	for _, tc := range invalid {
+		if _, err := st.AnswerQuestionBatch(session.ID, batch.ID, tc.answers); err == nil {
+			t.Errorf("%s: expected an error", tc.name)
+		}
+	}
+
+	answered, err := st.AnswerQuestionBatch(session.ID, batch.ID, []QuestionAnswerInput{
+		{QuestionID: q0.ID, OptionIDs: []int64{q0.Options[0].ID}},
+		{QuestionID: q1.ID, OptionIDs: []int64{q1.Options[0].ID, q1.Options[1].ID}, Text: "also Windows"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answered.AnsweredAt == "" {
+		t.Fatal("batch should be marked answered")
+	}
+	aq0, aq1 := answered.Questions[0], answered.Questions[1]
+	if len(aq0.AnswerOptionIDs) != 1 || aq0.AnswerOptionIDs[0] != q0.Options[0].ID || aq0.AnsweredAt == "" {
+		t.Fatalf("answered single question = %+v", aq0)
+	}
+	if len(aq1.AnswerOptionIDs) != 2 || aq1.AnswerText != "also Windows" || aq1.AnsweredAt == "" {
+		t.Fatalf("answered multi question = %+v", aq1)
+	}
+	if _, err := st.AnswerQuestionBatch(session.ID, batch.ID, []QuestionAnswerInput{
+		{QuestionID: q0.ID, OptionIDs: []int64{q0.Options[1].ID}},
+		{QuestionID: q1.ID, OptionIDs: []int64{q1.Options[0].ID}},
+	}); !errors.Is(err, ErrAlreadyAnswered) {
+		t.Fatalf("second answer error = %v, want ErrAlreadyAnswered", err)
+	}
+	if _, err := st.AnswerQuestionBatch(session.ID, 999999, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown batch error = %v, want ErrNotFound", err)
+	}
+
+	if err := st.DeleteSession(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	batches, err = st.ListQuestionBatches(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 0 {
+		t.Fatalf("question batches survived session deletion: %+v", batches)
 	}
 }

@@ -33,6 +33,12 @@ const (
 	maxSearchFile    = 2 << 20
 	maxReadLines     = 200
 	maxReadLineRunes = 400
+
+	maxAskQuestions     = 4
+	maxAskOptions       = 6
+	maxAskQuestionRunes = 500
+	maxAskOptionRunes   = 160
+	maxAskContextRunes  = 500
 )
 
 var (
@@ -57,6 +63,10 @@ type Result struct {
 	IsError          bool         `json:"is_error"`
 	ChecklistChanged bool         `json:"checklist_changed"`
 	Files            []FileAction `json:"files,omitempty"`
+	// QuestionBatch is set by ask_user. The server emits it to the UI and ends
+	// the turn instead of asking the model for another response.
+	QuestionBatch  *store.QuestionBatch `json:"question_batch,omitempty"`
+	AwaitingAnswer bool                 `json:"awaiting_answer,omitempty"`
 }
 
 // Manager executes tools rooted at a single project directory.
@@ -102,6 +112,7 @@ var (
 		"list_directory":   true,
 		"git_diff":         true,
 		"update_checklist": true,
+		"ask_user":         true,
 	}
 	buildOnlyTools = map[string]bool{
 		"patch_file": true,
@@ -221,6 +232,50 @@ func Specs(mode string) []llm.Tool {
 				}, "action"),
 			},
 		},
+		{
+			Type: "function",
+			Function: llm.ToolFunctionSpec{
+				Name: "ask_user",
+				Description: "Ask the user 1-4 clarifying questions in a single call when the work genuinely depends on a decision only they can make. " +
+					"Each question offers concrete options (single or multiple choice) and the UI always allows a custom answer. " +
+					"The turn ends immediately and the user answers in the chat; do not write the plan or final answer in that same response. " +
+					"Never call ask_user twice in the same response; combine the questions instead. " +
+					"In PLAN, use it as the final action of the research phase only when a real ambiguity blocks a correct plan. " +
+					"In BUILD, use it only when you are truly blocked.",
+				Parameters: objectSchema(map[string]any{
+					"questions": map[string]any{
+						"type":        "array",
+						"description": "Questions to ask the user, in display order.",
+						"minItems":    1,
+						"maxItems":    4,
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"question": stringProp("Question text shown to the user."),
+								"context":  stringProp("Optional short context explaining why the answer matters."),
+								"type":     enumProp("single for one choice, multi for several (default single).", "single", "multi"),
+								"options": map[string]any{
+									"type":        "array",
+									"description": "Suggested answers, 0-6. A custom answer is always available in the UI.",
+									"maxItems":    6,
+									"items": map[string]any{
+										"type": "object",
+										"properties": map[string]any{
+											"label":       stringProp("Short option label."),
+											"description": stringProp("Optional explanation of the option."),
+										},
+										"required":             []string{"label"},
+										"additionalProperties": false,
+									},
+								},
+							},
+							"required":             []string{"question"},
+							"additionalProperties": false,
+						},
+					},
+				}, "questions"),
+			},
+		},
 	}
 	if strings.EqualFold(mode, "BUILD") {
 		tools = append(tools,
@@ -264,9 +319,16 @@ func Specs(mode string) []llm.Tool {
 	return tools
 }
 
-// Execute runs a tool by name. Unknown tool names and malformed arguments are
-// reported as tool errors rather than aborting the stream.
+// Execute runs a tool by name without an associated tool-call id. Unknown tool
+// names and malformed arguments are reported as tool errors rather than
+// aborting the stream.
 func (m *Manager) Execute(ctx context.Context, name string, rawArgs json.RawMessage) Result {
+	return m.ExecuteCall(ctx, name, rawArgs, "")
+}
+
+// ExecuteCall runs a tool by name. callID is persisted with ask_user so the UI
+// can attach the stored questions to the historical tool call.
+func (m *Manager) ExecuteCall(ctx context.Context, name string, rawArgs json.RawMessage, callID string) Result {
 	if err := ctx.Err(); err != nil {
 		return Result{Content: "Tool cancelled: " + err.Error(), IsError: true}
 	}
@@ -340,6 +402,14 @@ func (m *Manager) Execute(ctx context.Context, name string, rawArgs json.RawMess
 			return fail("invalid arguments: " + err.Error())
 		}
 		return m.updateChecklist(a.Action, a.TaskText, a.ID, a.Done, a.Tasks)
+	case "ask_user":
+		var a struct {
+			Questions []askUserQuestion `json:"questions"`
+		}
+		if err := json.Unmarshal(rawArgs, &a); err != nil {
+			return fail("invalid arguments: " + err.Error())
+		}
+		return m.askUser(callID, a.Questions)
 	case "patch_file":
 		var a struct {
 			Path       string `json:"path"`
@@ -879,6 +949,90 @@ func (m *Manager) checklistResult(prefix string) Result {
 		}
 	}
 	return Result{Content: b.String(), ChecklistChanged: true}
+}
+
+// ---------------------------------------------------------------------------
+// ask_user
+
+type askUserOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+type askUserQuestion struct {
+	Question string          `json:"question"`
+	Context  string          `json:"context"`
+	Type     string          `json:"type"`
+	Options  []askUserOption `json:"options"`
+}
+
+// askUser persists a batch of clarifying questions and asks the server to end
+// the turn so the user can answer them in the UI.
+func (m *Manager) askUser(callID string, questions []askUserQuestion) Result {
+	if m.Store == nil || m.SessionID == 0 {
+		return fail("ask_user: questions are unavailable for this session")
+	}
+	if len(questions) == 0 {
+		return fail("ask_user: at least one question is required")
+	}
+	if len(questions) > maxAskQuestions {
+		return fail(fmt.Sprintf("ask_user: at most %d questions per call", maxAskQuestions))
+	}
+	inputs := make([]store.QuestionInput, 0, len(questions))
+	seenQuestions := make(map[string]bool, len(questions))
+	for i, q := range questions {
+		text := truncateRunes(strings.TrimSpace(q.Question), maxAskQuestionRunes)
+		if text == "" {
+			return fail(fmt.Sprintf("ask_user: question %d is empty", i+1))
+		}
+		key := strings.ToLower(text)
+		if seenQuestions[key] {
+			return fail("ask_user: duplicate question: " + text)
+		}
+		seenQuestions[key] = true
+		kind := strings.ToLower(strings.TrimSpace(q.Type))
+		if kind == "" {
+			kind = "single"
+		}
+		if kind != "single" && kind != "multi" {
+			return fail(fmt.Sprintf("ask_user: question %d type must be single or multi", i+1))
+		}
+		if len(q.Options) > maxAskOptions {
+			return fail(fmt.Sprintf("ask_user: question %d has more than %d options", i+1, maxAskOptions))
+		}
+		opts := make([]store.QuestionOptionInput, 0, len(q.Options))
+		seenLabels := make(map[string]bool, len(q.Options))
+		for _, o := range q.Options {
+			label := truncateRunes(strings.TrimSpace(o.Label), maxAskOptionRunes)
+			if label == "" {
+				return fail(fmt.Sprintf("ask_user: question %d has an empty option label", i+1))
+			}
+			labelKey := strings.ToLower(label)
+			if seenLabels[labelKey] {
+				return fail(fmt.Sprintf("ask_user: question %d has duplicate option labels", i+1))
+			}
+			seenLabels[labelKey] = true
+			opts = append(opts, store.QuestionOptionInput{
+				Label:       label,
+				Description: truncateRunes(strings.TrimSpace(o.Description), maxAskContextRunes),
+			})
+		}
+		inputs = append(inputs, store.QuestionInput{
+			Text:    text,
+			Context: truncateRunes(strings.TrimSpace(q.Context), maxAskContextRunes),
+			Kind:    kind,
+			Options: opts,
+		})
+	}
+	batch, err := m.Store.CreateQuestionBatch(m.SessionID, callID, inputs)
+	if err != nil {
+		return fail("ask_user: " + err.Error())
+	}
+	return Result{
+		Content:        fmt.Sprintf("Asked the user %d question(s). The turn ends here and the user will answer in the chat.", len(batch.Questions)),
+		QuestionBatch:  &batch,
+		AwaitingAnswer: true,
+	}
 }
 
 // ---------------------------------------------------------------------------

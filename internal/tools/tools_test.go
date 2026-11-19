@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"forge/internal/store"
 )
 
 func newTestManager(t *testing.T, mode string, maxRead int) (*Manager, string) {
@@ -197,7 +199,7 @@ func TestGrepListAndBash(t *testing.T) {
 }
 
 func TestAllowedByMode(t *testing.T) {
-	readOnly := []string{"read_file", "grep_search", "list_directory", "git_diff", "update_checklist"}
+	readOnly := []string{"read_file", "grep_search", "list_directory", "git_diff", "update_checklist", "ask_user"}
 	for _, name := range readOnly {
 		if !Allowed("PLAN", name) || !Allowed("BUILD", name) {
 			t.Errorf("%s should be allowed in both modes", name)
@@ -227,5 +229,150 @@ func TestInvalidRegex(t *testing.T) {
 	res := run(t, m, "grep_search", map[string]any{"pattern": "("})
 	if !res.IsError {
 		t.Errorf("invalid regex should fail: %+v", res)
+	}
+}
+
+func newQuestionManager(t *testing.T) (*Manager, *store.Store, store.Session) {
+	t.Helper()
+	root := t.TempDir()
+	st, err := store.Open(filepath.Join(root, "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	project, err := st.CreateProject("Questions", root, "#6f8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "Questions", "model", "PLAN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(root, 1000, time.Second, st, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Mode = "PLAN"
+	return m, st, session
+}
+
+func TestAskUserPersistsQuestions(t *testing.T) {
+	m, st, session := newQuestionManager(t)
+	raw, err := json.Marshal(map[string]any{
+		"questions": []any{
+			map[string]any{
+				"question": "Which storage should Forge use?",
+				"context":  "This decides the migration plan.",
+				"type":     "single",
+				"options": []any{
+					map[string]any{"label": "SQLite", "description": "local file"},
+					map[string]any{"label": "Postgres"},
+				},
+			},
+			map[string]any{
+				"question": "Which platforms must be supported?",
+				"type":     "multi",
+				"options": []any{
+					map[string]any{"label": "Linux"},
+					map[string]any{"label": "macOS"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := m.ExecuteCall(context.Background(), "ask_user", raw, "call_ask_42")
+	if res.IsError {
+		t.Fatalf("ask_user failed: %s", res.Content)
+	}
+	if !res.AwaitingAnswer || res.QuestionBatch == nil {
+		t.Fatalf("ask_user result = %+v", res)
+	}
+	batch := res.QuestionBatch
+	if batch.ID == 0 || batch.ToolCallID != "call_ask_42" || len(batch.Questions) != 2 {
+		t.Fatalf("question batch = %+v", batch)
+	}
+	if batch.Questions[0].Kind != "single" || batch.Questions[1].Kind != "multi" {
+		t.Fatalf("question kinds = %q, %q", batch.Questions[0].Kind, batch.Questions[1].Kind)
+	}
+	if len(batch.Questions[0].Options) != 2 || batch.Questions[0].Options[0].Description != "local file" {
+		t.Fatalf("options = %+v", batch.Questions[0].Options)
+	}
+	batches, err := st.ListQuestionBatches(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 1 || batches[0].ToolCallID != "call_ask_42" || len(batches[0].Questions) != 2 {
+		t.Fatalf("persisted batches = %+v", batches)
+	}
+}
+
+func TestAskUserValidation(t *testing.T) {
+	m, _, _ := newQuestionManager(t)
+	question := func(text string) map[string]any {
+		return map[string]any{"question": text}
+	}
+	tooManyQuestions := make([]any, 0, maxAskQuestions+1)
+	for i := 0; i <= maxAskQuestions; i++ {
+		tooManyQuestions = append(tooManyQuestions, question(fmt.Sprintf("Question %d?", i+1)))
+	}
+	tooManyOptions := make([]any, 0, maxAskOptions+1)
+	for i := 0; i <= maxAskOptions; i++ {
+		tooManyOptions = append(tooManyOptions, map[string]any{"label": fmt.Sprintf("Option %d", i+1)})
+	}
+	cases := []struct {
+		name      string
+		questions []any
+		want      string
+	}{
+		{"empty", []any{}, "at least one question"},
+		{"too many questions", tooManyQuestions, "at most 4 questions"},
+		{"duplicate questions", []any{question("Same?"), question("Same?")}, "duplicate question"},
+		{"empty question", []any{question("   ")}, "is empty"},
+		{"invalid type", []any{map[string]any{"question": "Pick one", "type": "many"}}, "type must be single or multi"},
+		{"too many options", []any{map[string]any{"question": "Pick one", "options": tooManyOptions}}, "more than 6 options"},
+		{"empty option label", []any{map[string]any{"question": "Pick one", "options": []any{map[string]any{"label": "  "}}}}, "empty option label"},
+		{"duplicate option labels", []any{map[string]any{"question": "Pick one", "options": []any{
+			map[string]any{"label": "A"}, map[string]any{"label": "a"},
+		}}}, "duplicate option labels"},
+	}
+	for _, tc := range cases {
+		res := run(t, m, "ask_user", map[string]any{"questions": tc.questions})
+		if !res.IsError || !strings.Contains(res.Content, tc.want) {
+			t.Errorf("%s: result = %+v, want error containing %q", tc.name, res, tc.want)
+		}
+	}
+}
+
+func TestAskUserRequiresStore(t *testing.T) {
+	m, _ := newTestManager(t, "PLAN", 100)
+	res := run(t, m, "ask_user", map[string]any{
+		"questions": []any{map[string]any{"question": "Anything?"}},
+	})
+	if !res.IsError || !strings.Contains(res.Content, "unavailable") {
+		t.Fatalf("ask_user without a store = %+v", res)
+	}
+}
+
+func TestAskUserWorksInBuildMode(t *testing.T) {
+	m, st, session := newQuestionManager(t)
+	m.Mode = "BUILD"
+	res := run(t, m, "ask_user", map[string]any{
+		"questions": []any{map[string]any{
+			"question": "Keep going?",
+			"type":     "single",
+			"options":  []any{map[string]any{"label": "Yes"}, map[string]any{"label": "No"}},
+		}},
+	})
+	if res.IsError {
+		t.Fatalf("ask_user in BUILD failed: %s", res.Content)
+	}
+	if !res.AwaitingAnswer || res.QuestionBatch == nil {
+		t.Fatalf("ask_user in BUILD result = %+v", res)
+	}
+	batches, err := st.ListQuestionBatches(session.ID)
+	if err != nil || len(batches) != 1 {
+		t.Fatalf("persisted batches = %+v, %v", batches, err)
 	}
 }

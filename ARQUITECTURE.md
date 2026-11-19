@@ -9,7 +9,7 @@
 **Single binary** (Go + embedded assets) serving a **SPA** and exposing REST API + SSE. Uses **OpenRouter** (OpenAI-compatible API) for LLM and **local SQLite** (`~/.forge/forge.db`) for persistence. Config in `~/.forge/config.json`.
 
 **Two modes:**
-- **PLAN** — Read-only (explore, search, checklist)
+- **PLAN** — Read-only (explore, search, checklist, clarify with `ask_user`)
 - **BUILD** — Read + write + command execution
 
 ---
@@ -85,7 +85,10 @@ POST /api/chat/stream (session_id, content)
 │       5. SSE: tool_end (result/error/duration)         │
 │       6. If checklist changed → SSE: checklist         │
 │    F. Save assistant + tool calls + results            │
-│    G. Stop on loop_detected / tool_error_limit / cost  │
+│    G. IF ask_user ran:                                 │
+│       - SSE: questions (persisted batch) → done → END  │
+│       (the user answers in the chat; no extra round)   │
+│    H. Stop on loop_detected / tool_error_limit / cost  │
 │   END FOR                                               │
 │   IF turn budget spent → SSE: limit → END              │
 │   IF auto-continue → SSE: checkpoint → next segment    │
@@ -131,8 +134,14 @@ six-call window and:
 
 | Tool | PLAN | BUILD |
 |------|:----:|:-----:|
-| read_file, grep_search, symbol_lookup, list_directory, git_diff, update_checklist | ✅ | ✅ |
+| read_file, grep_search, symbol_lookup, list_directory, git_diff, update_checklist, ask_user | ✅ | ✅ |
 | patch_file, write_file, bash | ❌ | ✅ |
+
+`ask_user` is a terminal tool: it persists one batch of 1–4 questions with up to
+6 options each, emits a `questions` SSE event, and ends the turn. The answer
+endpoint stores the selected option IDs plus free text, returns a canonical
+"Answers to your questions:" summary, and the frontend sends that summary as the
+next user message to resume the agent.
 
 **Bounded reads:** `read_file` requires `start_line` and `end_line`; at most 200
 lines are returned, each prefixed with its real line number (`142 | code`).
@@ -234,13 +243,19 @@ projects: id, name, path(UNIQUE), icon_color, last_opened_at, total_cost_usd, se
 sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), tokens_in/out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
 messages: id, session_id(FK), role(user|assistant|tool), reasoning, content, tool_calls(JSON), duration_ms, created_at
 checklists: id, session_id(FK), task_text, is_done, position
+question_batches: id, session_id(FK), tool_call_id, created_at, answered_at
+questions: id, batch_id(FK), session_id(FK), text, context, kind(single|multi), position, answer_option_ids(JSON), answer_text, answered_at
+question_options: id, question_id(FK), label, description, position
 repo_outline: project_path, file_path, language, mtime_ns, size_bytes, symbols, updated_at
               PRIMARY KEY(project_path, file_path)
 ```
 
 Indexes: sessions(project_id, is_open, updated_at), messages(session_id, id),
-checklists(session_id, position, id). `repo_outline` is covered by its composite
-primary key `(project_path, file_path)`.
+checklists(session_id, position, id), question_batches(session_id, id),
+questions(batch_id, position, id), question_options(question_id, position, id).
+`repo_outline` is covered by its composite primary key
+`(project_path, file_path)`. Deleting a session cascades to its question batches,
+questions, and options.
 
 `repo_outline` is keyed by the project's absolute CWD. Rows are upserted only
 when a file's mtime or size changes; removed files are pruned in the same
@@ -261,19 +276,21 @@ transaction.
 | GET/PATCH/DELETE | `/api/sessions/{id}` | Session CRUD |
 | POST | `/api/sessions/{id}/compact` | Compact |
 | GET | `/api/sessions/{id}/messages` | History |
+| GET | `/api/sessions/{id}/questions` | Question batches and answers |
+| POST | `/api/sessions/{id}/questions/{qid}/answers` | Answer a batch; returns the batch and canonical summary |
 | GET/POST/PATCH/DELETE | `/api/checklist` | Checklist items |
 | **POST** | **`/api/chat/stream`** | **Agent turn (SSE)** |
 | GET | `/` | Embedded SPA |
 
 **SSE Events** (from `/api/chat/stream`):
-`round_start`, `reasoning`, `content`, `tool_start`, `tool_end`, `tool_blocked`, `usage`, `checklist`, `session`, `checkpoint`, `limit`, `done`, `cancelled`, `error`
+`round_start`, `reasoning`, `content`, `tool_start`, `tool_end`, `tool_blocked`, `usage`, `checklist`, `questions`, `session`, `checkpoint`, `limit`, `done`, `cancelled`, `error`
 
 ---
 
 ## Frontend (`web/`)
 **Vanilla ES6 SPA** (Bootstrap 5, marked.js, highlight.js):
 - **Left:** Project rail + add/theme/settings buttons
-- **Center:** Session tabs + chat (messages + composer)
+- **Center:** Session tabs + chat (messages, inline clarifying-question cards, composer)
 - **Right (XL+):** Collapsible inspector with usage/cost, active files, checklist
 - **Themes:** `data-theme` / `data-bs-theme` drive custom tokens, Bootstrap, and highlight.js; preference stored in `localStorage`
 - **Timers:** Live session and per-response timers; persisted as `sessions.duration_ms` and `messages.duration_ms`
@@ -329,7 +346,7 @@ transaction.
 | Area | Status | Idea |
 |------|--------|------|
 | Providers | OpenRouter only | Plugin interface for other compatible APIs |
-| Tools | 8 built-in | Dynamic registration (MCP, custom scripts) |
+| Tools | 10 built-in | Dynamic registration (MCP, custom scripts) |
 | Auth | None (local) | Optional token for remote access |
 | Multi-user | Single-user | User isolation, own projects |
 | Telemetry | Local logs | Opt-in metrics, trace export |
@@ -342,15 +359,16 @@ transaction.
 main.go                      # Entry point, wiring, lifecycle
 internal/
   config/config.go           # Config load/save/validate, paths
-  store/sqlite.go            # Schema, CRUD projects/sessions/messages/checklists
+  store/sqlite.go            # Schema, CRUD projects/sessions/messages/checklists/questions
   llm/openrouter.go          # Streaming chat client, SSE parsing
   llm/models.go              # Model catalog fetch + builtin fallback
   server/router.go           # HTTP routes, middleware, APIs config/models/projects/sessions/checklist
+  server/questions.go        # Question batch API + canonical answer summary
   server/stream.go           # handleChatStream — core agent loop
   server/history.go          # History pruning: recent rounds verbatim, older rounds stubbed in place
   server/guard.go            # Per-turn loop / error-streak detector
   server/compact.go          # Conversation summarization
-  tools/tools.go             # Tool defs + execution (read/grep/list/git/patch/write/bash/checklist)
+  tools/tools.go             # Tool defs + execution (read/grep/list/git/patch/write/bash/checklist/ask_user)
   tools/scanner.go           # Zero-AI repo map (Go AST + regex), SQLite cache, compact renderer
   logx/logx.go               # Leveled logging with file output
 web/
