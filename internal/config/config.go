@@ -77,7 +77,8 @@ type DefaultsConfig struct {
 	HistoryKeepRecent     int `json:"history_keep_recent_rounds"`
 	HistoryMaxResult      int `json:"history_max_result_chars"`
 	HistoryMaxArg         int `json:"history_max_arg_chars"`
-	HistoryPruneChunk     int `json:"history_prune_chunk_rounds"`
+	HistoryPruneChunk       int `json:"history_prune_chunk_rounds"`
+	BrowserNotifications  bool  `json:"browser_notifications"`
 }
 
 // Default returns the shipped configuration.
@@ -116,7 +117,8 @@ func Default() Config {
 			HistoryKeepRecent: 0,
 			HistoryMaxResult:  16000,
 			HistoryMaxArg:     4000,
-			HistoryPruneChunk: 0,
+			HistoryPruneChunk:      0,
+			BrowserNotifications: false,
 		},
 	}
 }

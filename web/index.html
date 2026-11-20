@@ -653,6 +653,22 @@
           </section>
 
           <section class="settings-section">
+            <div class="settings-section-title"><i class="bi bi-bell"></i>Notifications</div>
+            <div class="settings-section-desc">
+              Receive a browser notification when a background agent finishes a task or needs your input.
+            </div>
+            <div class="form-check form-switch setting-switch">
+              <input id="browserNotifications" class="form-check-input" type="checkbox">
+              <label class="form-check-label" for="browserNotifications">Enable browser notifications</label>
+              <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About browser notifications"
+                 data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                 title="Shows a system notification when an agent completes or fails while Forge is in a background tab or window. The browser asks for permission the first time you enable this switch and save, which must happen from a real click."></i>
+            </div>
+            <div id="notificationStatus" class="form-text"></div>
+            <div id="notificationHelp" class="settings-hint"></div>
+          </section>
+
+          <section class="settings-section">
             <div class="settings-section-title"><i class="bi bi-bug"></i>Logging &amp; diagnostics</div>
             <div class="settings-section-desc">
               Both switches apply immediately and are saved to the config file.

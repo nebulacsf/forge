@@ -1447,21 +1447,37 @@ function finishTurnView(view, modeAtSend = '') {
   // The chrome is repainted for every finished run, foreground or background:
   // when a background agent ends, the Stop button of the chat on screen is
   // re-derived from the run index instead of keeping its previous state.
-  if (viewIsActive(view)) {
+  const onScreen = viewIsActive(view);
+  const session = state.sessions.find((s) => s.id === view.sessionId);
+  const title = session?.title || 'Background agent';
+  // The system notification is driven by what the user can actually see, not by
+  // which chat is mounted: a turn that ends in the chat on screen still deserves
+  // a notification when the whole tab is in the background. notifyBrowser owns
+  // that check, so it is called for every outcome below.
+  if (onScreen) {
     updateControls();
     maybeScroll(true);
+    if (view.turnHadError) {
+      // The transcript already shows the failure inline; no toast on top of it.
+    }
   } else if (view.turnHadError) {
-    const session = state.sessions.find((s) => s.id === view.sessionId);
-    toast(`${session?.title || 'Background agent'} failed — open the chat for details`, 'error');
+    toast(`${title} failed — open the chat for details`, 'error');
   } else if (!view.sawCancelled) {
     view.finishedUnseen = true;
-    const session = state.sessions.find((s) => s.id === view.sessionId);
-    const title = session?.title || 'Background agent';
     if (hasPendingQuestions(view)) {
       toast(`${title} needs your answers`, 'success');
     } else {
       toast(`${title} finished`, 'success');
     }
+  }
+  if (view.turnHadError) {
+    notifyBrowser(title, 'failed — open the chat for details');
+  } else if (view.sawCancelled) {
+    // A stop requested by the user needs no alert.
+  } else if (hasPendingQuestions(view)) {
+    notifyBrowser(title, 'needs your answers');
+  } else {
+    notifyBrowser(title, 'finished');
   }
   runIndex.delete(view.sessionId);
   updateSessionTabCosts();
@@ -3431,6 +3447,8 @@ function openSettings() {
   $('serverHost').value = cfg.server.host || '127.0.0.1';
   $('serverPort').value = cfg.server.port || 7890;
   $('autoBrowser').checked = !!cfg.server.auto_open_browser;
+  $('browserNotifications').checked = !!cfg.defaults.browser_notifications;
+  renderNotificationStatus();
   $('debugToggle').checked = !!cfg.server.debug || !!state.debugActive;
   $('debugLLMToggle').checked = !!cfg.server.debug_llm || !!state.llmDebugActive;
   $('logPath').textContent = state.logPath || '~/.forge/forge.log';
@@ -3497,9 +3515,20 @@ async function saveSettings(e) {
   cfg.server.host = $('serverHost').value.trim();
   cfg.server.port = Number($('serverPort').value) || 7890;
   cfg.server.auto_open_browser = $('autoBrowser').checked;
+  cfg.defaults.browser_notifications = $('browserNotifications').checked;
   cfg.server.debug = $('debugToggle').checked;
   cfg.server.debug_llm = $('debugLLMToggle').checked;
   if (cfg.server.debug_llm) cfg.server.debug = true;
+  // Saving is a user gesture, so the browser shows the permission prompt here.
+  // Asking from the stream callback would be silently denied.
+  if (cfg.defaults.browser_notifications) {
+    const perm = await ensureNotificationPermission();
+    if (perm === 'denied') {
+      toast('Browser notifications are blocked — allow them for this site (padlock icon) and try again', 'error');
+    } else if (perm === 'unsupported') {
+      toast('This browser cannot show notifications', 'error');
+    }
+  }
 
   const before = state.config;
   try {
@@ -3568,6 +3597,7 @@ function resetDefaults() {
   $('serverHost').value = '127.0.0.1';
   $('serverPort').value = 7890;
   $('autoBrowser').checked = true;
+  $('browserNotifications').checked = false;
   $('debugToggle').checked = false;
   $('debugLLMToggle').checked = false;
   $('baseURL').value = 'https://openrouter.ai/api/v1';
@@ -4173,6 +4203,88 @@ function toast(message, type = 'error') {
   }
 }
 
+/* ── Browser notifications ───────────────────────────────────────── */
+
+// notificationsSupported reports whether this browser can show system
+// notifications at all. Safari on iOS and some embedded webviews cannot.
+function notificationsSupported() {
+  return typeof window !== 'undefined' && 'Notification' in window;
+}
+
+// notificationsWanted is true when the user enabled the setting. It is the
+// single guard shared by the permission prompt and the actual notification.
+function notificationsWanted() {
+  return !!state.config?.defaults?.browser_notifications;
+}
+
+// notificationStatus explains the current permission in the settings modal so
+// a silently blocked browser is visible instead of looking like a no-op.
+function renderNotificationStatus() {
+  const el = $('notificationStatus');
+  const help = $('notificationHelp');
+  if (!el) return;
+  if (!notificationsSupported()) {
+    el.className = 'form-text text-warning';
+    el.textContent = 'This browser does not support notifications.';
+    return;
+  }
+  const perm = Notification.permission;
+  if (perm === 'granted') {
+    el.className = 'form-text text-success';
+    el.textContent = 'Permission granted — notifications will appear while Forge is in the background.';
+  } else if (perm === 'denied') {
+    el.className = 'form-text text-warning';
+    el.textContent = 'Blocked by the browser. Reset the permission from the site settings (padlock icon) and enable it again.';
+  } else {
+    el.className = 'form-text';
+    el.textContent = 'Permission not requested yet — enable this switch and allow the browser prompt.';
+  }
+  if (help) {
+    help.textContent = perm === 'denied'
+      ? 'The browser refused notifications for this site. Open the padlock icon in the address bar, allow notifications, then toggle this switch again.'
+      : 'Notifications appear only while Forge is in a background tab or window; a turn that ends in the tab you are looking at just shows the in-app toast.';
+  }
+}
+
+// ensureNotificationPermission asks for the permission from a user gesture.
+// Browsers ignore (and silently deny) requestPermission calls made without
+// transient user activation, which is why this is only invoked from clicks.
+async function ensureNotificationPermission() {
+  if (!notificationsSupported()) return 'unsupported';
+  if (Notification.permission !== 'default') return Notification.permission;
+  try {
+    return await Notification.requestPermission();
+  } catch {
+    return Notification.permission;
+  }
+}
+
+// notifyBrowser shows a system notification for a finished turn. It never asks
+// for permission: that only happens from the settings UI, where a user gesture
+// exists. The visibility check is about the whole tab, so a turn that ends in
+// the chat on screen still notifies while the user is in another window.
+function notifyBrowser(title, body) {
+  if (!notificationsWanted()) return;
+  if (!notificationsSupported()) return;
+  if (Notification.permission !== 'granted') return;
+  // The user is looking at Forge: the in-app toast is enough.
+  if (!document.hidden && document.hasFocus()) return;
+  try {
+    const n = new Notification(title, {
+      body,
+      icon: 'images/logo.png',
+      tag: 'forge-turn-end',
+      renotify: true,
+    });
+    n.onclick = () => {
+      window.focus();
+      n.close();
+    };
+  } catch {
+    // A revoked permission or a platform refusal must never break the turn.
+  }
+}
+
 /* ── Events ──────────────────────────────────────────────────────── */
 
 function bindEvents() {
@@ -4282,6 +4394,23 @@ function bindEvents() {
   $('settingsForm').addEventListener('submit', saveSettings);
   $('renameTabForm').addEventListener('submit', saveRenameTab);
   $('resetDefaultsBtn').addEventListener('click', resetDefaults);
+  // Toggling the switch is the user gesture that lets the browser show its
+  // permission prompt. Without a gesture Chrome denies it silently, which is
+  // why the prompt never happens from the stream callback.
+  $('browserNotifications').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    if (on) {
+      const perm = await ensureNotificationPermission();
+      if (perm === 'denied') {
+        e.target.checked = false;
+        toast('Notifications are blocked for this site — allow them from the padlock icon in the address bar', 'error');
+      } else if (perm === 'unsupported') {
+        e.target.checked = false;
+        toast('This browser cannot show notifications', 'error');
+      }
+    }
+    renderNotificationStatus();
+  });
   // Keep the derived token budget in sync while the two knobs are edited.
   ['defaultModel', 'historyPrunePercent', 'historyPruneMaxTokens'].forEach((id) => {
     const el = $(id);
