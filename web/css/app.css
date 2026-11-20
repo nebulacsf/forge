@@ -612,6 +612,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 .round-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .round-events { display: flex; flex-direction: column; gap: 0; }
+/* ask_user cards sit after the assistant content, never above it. */
+.round-questions { display: flex; flex-direction: column; }
+.round-questions:empty { display: none; }
+.round-questions .question-card { margin: 10px 0 6px; }
 
 /* Turn footer: per-response elapsed time. */
 .round-footer {

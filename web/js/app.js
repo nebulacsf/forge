@@ -1265,12 +1265,13 @@ function renderAssistantHistory(msg) {
     // A reasoning-only turn has no visible answer, so surface it.
     if (!hasContent) card.el.open = true;
   }
+  const askedBatches = [];
   for (const call of calls) {
     const name = call.function?.name || call.name || '';
     if (name === 'ask_user') {
       const batch = batchForCall(currentView(), call.id);
       if (batch) {
-        renderQuestionCard(round.events, batch);
+        askedBatches.push(batch);
         continue;
       }
     }
@@ -1281,6 +1282,11 @@ function renderAssistantHistory(msg) {
     const contentEl = ensureContentEl(round);
     renderMarkdownInto(contentEl, msg.content, true);
   }
+  // The ask_user card belongs after the assistant's explanatory text, not
+  // above it: the questions are the last thing the user should read.
+  for (const batch of askedBatches) {
+    renderQuestionCard(round.questions, batch);
+  }
   if (Number(msg.duration_ms) > 0) {
     addHistoricalTurnTime(round, Number(msg.duration_ms));
   }
@@ -1290,11 +1296,12 @@ function renderAssistantHistory(msg) {
 function makeRoundElement() {
   const el = document.createElement('div');
   el.className = 'assistant-round msg';
-  el.innerHTML = '<div class="round-avatar">F</div><div class="round-main"><div class="round-events"></div><div class="round-footer"></div></div>';
+  el.innerHTML = '<div class="round-avatar">F</div><div class="round-main"><div class="round-events"></div><div class="round-questions"></div><div class="round-footer"></div></div>';
   return {
     el,
     main: el.querySelector('.round-main'),
     events: el.querySelector('.round-events'),
+    questions: el.querySelector('.round-questions'),
     footer: el.querySelector('.round-footer'),
     reasoning: null,
     contentEl: null,
@@ -1697,7 +1704,7 @@ function handleEvent(ev) {
       if (index >= 0) state.questionBatches[index] = batch;
       else state.questionBatches.push(batch);
       if (!alreadyRendered) {
-        renderQuestionCard(round.events, batch);
+        renderQuestionCard(round.questions, batch);
         round.hasEvents = true;
         maybeScroll();
       }
@@ -1938,7 +1945,10 @@ function ensureContentEl(round) {
   if (!round.contentEl) {
     round.contentEl = document.createElement('div');
     round.contentEl.className = 'md mt-4';
-    if (round.footer) round.main.insertBefore(round.contentEl, round.footer);
+    // Questions are rendered after the assistant text, even when the content
+    // arrives before or after the `questions` event.
+    const anchor = round.questions || round.footer;
+    if (anchor) round.main.insertBefore(round.contentEl, anchor);
     else round.main.appendChild(round.contentEl);
     addRoundCopyButton(round);
   }
