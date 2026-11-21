@@ -4,7 +4,7 @@ GO          ?= go
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 BUILD_FLAGS := -trimpath -buildvcs=false
 
-.PHONY: all build run dev test vet fmt clean install
+.PHONY: all build run dev test vet fmt clean install vendor
 
 all: build
 
@@ -31,3 +31,9 @@ install:
 
 clean:
 	rm -f $(BINARY)
+
+# Re-download the pinned frontend libraries under web/vendor. Only needed when
+# bumping a version in scripts/vendor.sh; the files are committed for offline
+# builds.
+vendor:
+	./scripts/vendor.sh

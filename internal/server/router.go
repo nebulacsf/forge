@@ -95,7 +95,15 @@ func (s *Server) Handler() http.Handler {
 
 	fileServer := http.FileServer(http.FS(s.web))
 	mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
+		// Vendored libraries are pinned by the ?v= query in index.html, so they
+		// can be cached aggressively. Everything else (index.html, app.js,
+		// app.css) stays revalidated so a rebuilt binary or a dev edit is picked
+		// up immediately.
+		if strings.HasPrefix(r.URL.Path, "/vendor/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
 		fileServer.ServeHTTP(w, r)
 	}))
 

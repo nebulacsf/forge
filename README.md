@@ -16,6 +16,7 @@ make build      # CGO_ENABLED=0, stripped static binary at ./forge
 make run        # build, then start and open the browser
 make test       # unit/integration tests
 make vet
+make vendor     # re-download the pinned frontend assets (only when bumping versions)
 ```
 
 Or directly:
@@ -122,6 +123,13 @@ checks for paths that do not exist yet. Writes are atomic.
 Forge ships with dark and light themes. The theme can be switched from the left
 rail; the choice is stored in `localStorage` and applied before the first paint
 to avoid a flash. The initial theme is dark.
+
+All third-party frontend assets (Bootstrap, Bootstrap Icons, marked and
+highlight.js) are vendored under `web/vendor` and embedded in the binary, so the
+UI loads with no network access. The files are pinned by version and refreshed
+with `make vendor`; the vendored URLs carry the version as a query string and
+are served with a long-lived immutable cache, while `index.html`, `app.js` and
+`app.css` stay revalidated.
 
 The right panel can be collapsed from its header and reopened from the session
 bar. The active-files list is collapsed by default and remembers whether it was
