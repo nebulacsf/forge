@@ -88,6 +88,10 @@ function makeView(sessionId, projectId = 0) {
     files: new Map(),
     questionBatches: [],
     renderedQuestions: new Set(),
+    // Compaction markers: each one records where the context window starts and
+    // the summary that replaced the older messages. The transcript stays whole,
+    // so these are drawn as cards inside the history instead of hiding it.
+    compactions: [],
     usage: { ...EMPTY_USAGE },
   };
 }
@@ -642,6 +646,7 @@ async function loadSession(id) {
     view.finishedUnseen = false;
     view.checklist = data.checklist || [];
     view.questionBatches = Array.isArray(data.question_batches) ? data.question_batches : [];
+    view.compactions = Array.isArray(data.compactions) ? data.compactions : [];
     view.sessionTimeBase = Number(data.session.duration_ms || 0);
     if (!view.streaming) {
       view.turnBaseTime = view.sessionTimeBase;
@@ -659,7 +664,7 @@ async function loadSession(id) {
         sessionOut: data.session.tokens_out || 0,
         sessionCost: data.session.cost_usd || 0,
         projectCost: data.project.total_cost_usd || 0,
-        contextTokens: estimateContext(data.messages || []),
+        contextTokens: estimateContext(data.messages || [], view.compactions),
         contextExact: false,
         cached: data.session.cached_tokens || 0,
         rounds: Math.max(seededRounds, usePrune ? prune.rounds : 0),
@@ -956,13 +961,28 @@ function renderSession(messages) {
   if (view) view.renderedQuestions = new Set();
   container.innerHTML = '';
   let hasContent = false;
+  // Compaction cards are drawn where the context boundary sits: right before
+  // the first message that still goes to the model. Older summaries stay in the
+  // transcript, so the history never disappears from view.
+  const pending = (view?.compactions || []).slice().sort((a, b) => a.start_message_id - b.start_message_id);
+  const drawCompactionsUpTo = (messageId) => {
+    while (pending.length && pending[0].start_message_id <= messageId) {
+      appendCompactionCard(pending.shift());
+      hasContent = true;
+    }
+  };
   for (const msg of messages) {
+    drawCompactionsUpTo(Number(msg.id) || 0);
     if (msg.role === 'user') {
       appendUserMessage(msg.content);
       hasContent = true;
     } else if (msg.role === 'assistant') {
       if (renderAssistantHistory(msg)) hasContent = true;
     }
+  }
+  while (pending.length) {
+    appendCompactionCard(pending.shift());
+    hasContent = true;
   }
   renderSessionProviderOptions();
   $('modelInput').value = state.session?.model || '';
@@ -987,6 +1007,44 @@ function renderSession(messages) {
     renderQuestionCard(container, batch);
   }
   maybeScroll(true);
+}
+
+// appendCompactionCard renders a compaction marker inside the transcript. The
+// summary is what the model saw instead of the messages above it; the messages
+// themselves stay visible, so the card is a marker, not a replacement.
+function appendCompactionCard(compaction) {
+  const wrap = document.createElement('div');
+  wrap.className = 'compaction';
+  wrap.dataset.compaction = String(compaction.id);
+  const removed = Number(compaction.removed) || 0;
+  wrap.innerHTML = `
+    <div class="compaction-head">
+      <div class="compaction-icon"><i class="bi bi-archive"></i></div>
+      <div class="compaction-body">
+        <strong>Context compacted</strong>
+        <span>${removed > 0
+          ? `${formatNum(removed)} earlier message${removed === 1 ? '' : 's'} summarized for the model`
+          : 'Earlier messages summarized for the model'}. The full history is still here.</span>
+      </div>
+      <button type="button" class="compaction-toggle" aria-expanded="false">
+        <span>Summary</span><i class="bi bi-chevron-down"></i>
+      </button>
+    </div>
+    <div class="compaction-summary md" hidden></div>`;
+  const summary = wrap.querySelector('.compaction-summary');
+  const toggle = wrap.querySelector('.compaction-toggle');
+  const text = String(compaction.summary || '').replace(/^Conversation summary \(context compacted\):\s*/i, '');
+  toggle.addEventListener('click', () => {
+    const open = summary.hasAttribute('hidden');
+    if (open && !summary.dataset.rendered) {
+      renderMarkdownInto(summary, text, true);
+      summary.dataset.rendered = '1';
+    }
+    summary.toggleAttribute('hidden', !open);
+    toggle.setAttribute('aria-expanded', String(open));
+    wrap.classList.toggle('open', open);
+  });
+  messagesEl().appendChild(wrap);
 }
 
 function removePlanReadyCard() {
@@ -1604,12 +1662,15 @@ async function compactConversation() {
     state.currentRound = null;
     state.toolCards = new Map();
     state.messageIndex = -1;
+    const view = currentView();
+    if (view) view.compactions = Array.isArray(data.compactions) ? data.compactions : [];
+    // The transcript is re-rendered in full: compaction only shrinks the
+    // context sent to the model, the history stays readable.
     renderSession(data.messages || []);
-    state.usage.contextTokens = estimateContext(data.messages || []);
+    state.usage.contextTokens = estimateContext(data.messages || [], view?.compactions || []);
     state.usage.contextExact = false;
     updateUsageUI();
     toast(`Context compacted — ${data.removed} earlier messages summarized`, 'success');
-    addNotice('Conversation compacted. Older messages were replaced by a summary; the recent exchange was kept.', 'stopped');
   } catch (err) {
     if (err.name === 'AbortError') {
       addNotice('Stopped', 'stopped');
@@ -2613,10 +2674,17 @@ function isCodeFile(path) {
   return /\.(go|js|ts|tsx|jsx|py|rs|rb|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|sh|bash|zsh|sql|html|css|scss|less|json|yaml|yml|toml|xml|md|lua|ex|exs|erl|hs|clj|vue|svelte)$/i.test(path);
 }
 
-function estimateContext(messages) {
+// estimateContext mirrors what the agent actually sends: after a compaction the
+// window starts at the newest start_message_id and includes its summary, while
+// the transcript keeps showing every message.
+function estimateContext(messages, compactions = []) {
   if (!messages || !messages.length) return 0;
+  const last = (compactions || [])[compactions.length - 1];
+  const startID = last ? Number(last.start_message_id) || 0 : 0;
   let chars = 1800;
+  if (last && startID > 0) chars += String(last.summary || '').length;
   for (const m of messages) {
+    if (startID > 0 && (Number(m.id) || 0) < startID) continue;
     if (m.role === 'user') chars += (m.content || '').length;
     if (m.role === 'assistant') {
       chars += (m.content || '').length;

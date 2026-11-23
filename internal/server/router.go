@@ -796,12 +796,20 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Compactions are returned alongside the full transcript: the UI renders
+	// every message and shows each summary card where the context boundary is.
+	compactions, err := s.store.ListCompactions(id)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	_ = s.store.TouchProject(project.ID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"session":          session,
 		"project":          project,
 		"messages":         messageDTOs(messages),
+		"compactions":      compactions,
 		"checklist":        checklist,
 		"question_batches": questionBatches,
 	})

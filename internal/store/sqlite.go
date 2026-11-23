@@ -60,6 +60,20 @@ type Message struct {
 	CreatedAt  string `json:"created_at"`
 }
 
+// Compaction records one time the conversation was summarized. The transcript
+// itself is never deleted: StartMessageID is the first message that still goes
+// to the model verbatim, while everything before it is represented by Summary.
+// The UI keeps rendering the whole history and shows the summary in place, so
+// the user never loses the past while the agent gets a smaller context.
+type Compaction struct {
+	ID             int64  `json:"id"`
+	SessionID      int64  `json:"session_id"`
+	StartMessageID int64  `json:"start_message_id"`
+	Summary        string `json:"summary"`
+	Removed        int    `json:"removed"`
+	CreatedAt      string `json:"created_at"`
+}
+
 type ChecklistItem struct {
 	ID        int64  `json:"id"`
 	SessionID int64  `json:"session_id"`
@@ -313,6 +327,15 @@ CREATE TABLE IF NOT EXISTS messages (
 	created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS compactions (
+	id               INTEGER PRIMARY KEY AUTOINCREMENT,
+	session_id       INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+	start_message_id INTEGER NOT NULL DEFAULT 0,
+	summary          TEXT NOT NULL DEFAULT '',
+	removed          INTEGER NOT NULL DEFAULT 0,
+	created_at       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS checklists (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -397,6 +420,7 @@ CREATE TABLE IF NOT EXISTS project_symbols (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, is_open, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_compactions_session ON compactions(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_checklists_session ON checklists(session_id, position, id);
 CREATE INDEX IF NOT EXISTS idx_question_batches_session ON question_batches(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_questions_batch ON questions(batch_id, position, id);
@@ -862,35 +886,122 @@ func (s *Store) SetMessageDuration(id, durationMS int64) error {
 	return err
 }
 
-// ReplaceMessages replaces a session's transcript with a summary message
-// followed by the kept messages. Used by /compact.
-func (s *Store) ReplaceMessages(sessionID int64, summary string, keep []Message) error {
+// AppendCompaction records that the conversation was summarized. The transcript
+// rows are left untouched: startMessageID is the first message that still goes
+// to the model, so the older rows stay visible in the UI while the agent sees
+// the summary instead.
+func (s *Store) AppendCompaction(sessionID int64, summary string, startMessageID int64, summarized int) (Compaction, error) {
+	ts := now()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return Compaction{}, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id = ?`, sessionID); err != nil {
-		return err
+	res, err := tx.Exec(`
+		INSERT INTO compactions (session_id, start_message_id, summary, removed, created_at)
+		VALUES (?, ?, ?, ?, ?)`, sessionID, startMessageID, summary, summarized, ts)
+	if err != nil {
+		return Compaction{}, err
 	}
-	ts := now()
-	if _, err := tx.Exec(`
-		INSERT INTO messages (session_id, role, reasoning, content, tool_calls, duration_ms, created_at)
-		VALUES (?, 'assistant', '', ?, '', 0, ?)`, sessionID, summary, ts); err != nil {
-		return err
+	id, _ := res.LastInsertId()
+	if _, err := tx.Exec(`UPDATE sessions SET updated_at = ? WHERE id = ?`, ts, sessionID); err != nil {
+		return Compaction{}, err
 	}
-	for _, m := range keep {
-		if strings.TrimSpace(m.Content) == "" && strings.TrimSpace(m.ToolCalls) == "" {
-			continue
+	if err := tx.Commit(); err != nil {
+		return Compaction{}, err
+	}
+	return Compaction{
+		ID: id, SessionID: sessionID, StartMessageID: startMessageID,
+		Summary: summary, Removed: summarized, CreatedAt: ts,
+	}, nil
+}
+
+func (s *Store) ListCompactions(sessionID int64) ([]Compaction, error) {
+	rows, err := s.db.Query(`
+		SELECT id, session_id, start_message_id, summary, removed, created_at
+		FROM compactions WHERE session_id = ? ORDER BY id ASC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Compaction{}
+	for rows.Next() {
+		var c Compaction
+		if err := rows.Scan(&c.ID, &c.SessionID, &c.StartMessageID, &c.Summary, &c.Removed, &c.CreatedAt); err != nil {
+			return nil, err
 		}
-		if _, err := tx.Exec(`
-			INSERT INTO messages (session_id, role, reasoning, content, tool_calls, duration_ms, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			sessionID, m.Role, m.Reasoning, m.Content, m.ToolCalls, m.DurationMS, ts); err != nil {
-			return err
-		}
+		out = append(out, c)
 	}
-	return tx.Commit()
+	return out, rows.Err()
+}
+
+// LatestCompaction returns the newest compaction of a session. ok is false when
+// the session was never compacted, which means the whole history is the context.
+func (s *Store) LatestCompaction(sessionID int64) (Compaction, bool, error) {
+	var c Compaction
+	err := s.db.QueryRow(`
+		SELECT id, session_id, start_message_id, summary, removed, created_at
+		FROM compactions WHERE session_id = ? ORDER BY id DESC LIMIT 1`, sessionID).
+		Scan(&c.ID, &c.SessionID, &c.StartMessageID, &c.Summary, &c.Removed, &c.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Compaction{}, false, nil
+	}
+	if err != nil {
+		return Compaction{}, false, err
+	}
+	return c, true, nil
+}
+
+// ContextWindow returns the summary that currently replaces older messages
+// (empty when the session was never compacted) plus the messages that still
+// belong to the live context window.
+func (s *Store) ContextWindow(sessionID int64) (string, []Message, error) {
+	compaction, ok, err := s.LatestCompaction(sessionID)
+	if err != nil {
+		return "", nil, err
+	}
+	if !ok {
+		rows, err := s.ListMessages(sessionID)
+		return "", rows, err
+	}
+	rows, err := s.db.Query(`
+		SELECT id, session_id, role, reasoning, content, COALESCE(tool_calls, ''), duration_ms, created_at
+		FROM messages WHERE session_id = ? AND id >= ? ORDER BY id ASC`,
+		sessionID, compaction.StartMessageID)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Reasoning, &m.Content, &m.ToolCalls, &m.DurationMS, &m.CreatedAt); err != nil {
+			return "", nil, err
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, err
+	}
+	return compaction.Summary, out, nil
+}
+
+// ContextMessages is the transcript the agent sends to the provider: the newest
+// summary followed by the messages that are still inside the context window.
+// The full history stays in SQLite and in the UI.
+func (s *Store) ContextMessages(sessionID int64) ([]Message, error) {
+	summary, rows, err := s.ContextWindow(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(summary) == "" {
+		return rows, nil
+	}
+	out := make([]Message, 0, len(rows)+1)
+	// The summary is stored as an assistant turn so the user/assistant
+	// alternation of the following messages stays intact.
+	out = append(out, Message{SessionID: sessionID, Role: "assistant", Content: summary})
+	return append(out, rows...), nil
 }
 
 // ---------------------------------------------------------------------------

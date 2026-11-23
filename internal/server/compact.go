@@ -23,8 +23,10 @@ const (
 	compactSummaryPrefix    = "Conversation summary (context compacted):\n\n"
 )
 
-// handleCompactSession summarizes the transcript into one message and replaces
-// the older history so the next turn starts with a smaller context.
+// handleCompactSession summarizes the conversation so the next turn starts with
+// a smaller context. Nothing is deleted: the compaction is recorded with the ID
+// of the first message that stays in context, so the full transcript remains
+// visible in the UI while the agent only sends the summary plus the tail.
 func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -55,7 +57,9 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "No LLM provider is configured. Open Settings and add one.")
 		return
 	}
-	messages, err := s.store.ListMessages(id)
+	// Summarize only what the model currently sees, so a second compaction
+	// never re-summarizes content that was already folded into a summary.
+	messages, err := s.store.ContextMessages(id)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -72,9 +76,9 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keep := compactKeep(messages)
+	startID, kept := compactTailStart(messages)
 	text := compactSummaryPrefix + summary
-	if err := s.store.ReplaceMessages(id, text, keep); err != nil {
+	if _, err := s.store.AppendCompaction(id, text, startID, len(messages)-kept); err != nil {
 		logx.Error("compact persist failed", "session", id, "error", err)
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -95,16 +99,23 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	compactions, err := s.store.ListCompactions(id)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	removed := len(messages) - kept
 	logx.Info("conversation compacted", "session", id, "model", session.Model,
-		"removed", len(messages)-len(keep), "kept", len(keep),
+		"removed", removed, "kept", kept, "start_message_id", startID,
 		"summary_chars", len(summary), "prompt_tokens", usage.PromptTokens,
 		"completion_tokens", usage.CompletionTokens, "cost", usage.Cost)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"session":  fresh,
-		"messages": messageDTOs(updated),
-		"summary":  text,
-		"removed":  len(messages) - len(keep),
+		"session":     fresh,
+		"messages":    messageDTOs(updated),
+		"compactions": compactions,
+		"summary":     text,
+		"removed":     removed,
 	})
 }
 
@@ -232,29 +243,33 @@ func compactMessageText(m store.Message) string {
 	}
 }
 
-// compactKeep retains the last normal user/assistant exchange so the next turn
-// still has immediate context.
-func compactKeep(messages []store.Message) []store.Message {
+// compactTailStart returns the ID of the first message that stays in the
+// context window after compaction, plus how many messages are kept. The kept
+// tail is the last normal user/assistant exchange so the next turn still has
+// immediate context. When the transcript ends inside a tool round nothing is
+// kept and the boundary points past the newest row, leaving only the summary in
+// the window. The messages themselves are never deleted.
+func compactTailStart(messages []store.Message) (int64, int) {
 	if len(messages) == 0 {
-		return nil
+		return 0, 0
 	}
 	last := messages[len(messages)-1]
-	if last.Role == "user" && strings.TrimSpace(last.ToolCalls) == "" && strings.TrimSpace(last.Content) != "" {
-		return []store.Message{{Role: "user", Content: last.Content}}
+	if last.ID > 0 && last.Role == "user" &&
+		strings.TrimSpace(last.ToolCalls) == "" && strings.TrimSpace(last.Content) != "" {
+		return last.ID, 1
 	}
-	if len(messages) < 2 {
-		return nil
-	}
-	prev := messages[len(messages)-2]
-	if prev.Role == "user" && last.Role == "assistant" &&
-		strings.TrimSpace(prev.ToolCalls) == "" && strings.TrimSpace(last.ToolCalls) == "" &&
-		strings.TrimSpace(prev.Content) != "" && strings.TrimSpace(last.Content) != "" {
-		return []store.Message{
-			{Role: "user", Content: prev.Content},
-			{Role: "assistant", Content: last.Content},
+	if len(messages) >= 2 {
+		prev := messages[len(messages)-2]
+		if prev.ID > 0 && prev.Role == "user" && last.Role == "assistant" &&
+			strings.TrimSpace(prev.ToolCalls) == "" && strings.TrimSpace(last.ToolCalls) == "" &&
+			strings.TrimSpace(prev.Content) != "" && strings.TrimSpace(last.Content) != "" {
+			return prev.ID, 2
 		}
 	}
-	return nil
+	if last.ID > 0 {
+		return last.ID + 1, 0
+	}
+	return 0, 0
 }
 
 func clipText(text string, limit int) string {

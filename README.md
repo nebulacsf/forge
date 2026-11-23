@@ -92,6 +92,11 @@ checkpoint/auto-continue behavior.
   report the requested vs. returned range.
 - **Line-numbered output.** Every line is prefixed with its real line number
   (`142 | func Save() {`) so the agent can pick precise edit locations.
+- **Non-destructive compaction.** `/compact` stores a `compactions` row with the
+  summary and the ID of the first message that still goes to the model. The next
+  turns send the summary plus that tail; the transcript itself is never deleted,
+  so the history stays visible and each summary renders as an expandable
+  **Context compacted** card where the new window starts.
 - **Local repo map.** Forge scans the project with Go's AST (and fast regex
   scanners for other languages), caches symbols and line numbers in SQLite, and
   injects a compact outline into every request as the trailing ephemeral state
@@ -213,7 +218,7 @@ only to fail because of the mode.
 
 | Command | Action |
 | --- | --- |
-| `/compact` | Summarize older messages into one summary and keep the last exchange, freeing context |
+| `/compact` | Summarize the older messages into a summary the model receives instead of them. Nothing is deleted: the full history stays in the transcript and the summary is shown as an expandable **Context compacted** card where the new context window starts |
 
 ### Keyboard shortcuts
 
@@ -398,7 +403,7 @@ can reduce the hit rate.
 | `PATCH/DELETE /api/projects/{id}` | Rename/recolor/move a project, or delete it with its chats |
 | `GET/POST /api/projects/{id}/sessions` | List (`?all=1` includes closed)/create sessions |
 | `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/provider/close; includes `question_batches` |
-| `POST /api/sessions/{id}/compact` | Summarize the transcript and keep the last exchange |
+| `POST /api/sessions/{id}/compact` | Record a compaction: the summary plus the newest exchange become the context sent to the model, while the stored transcript is left untouched (`compactions` in the payload) |
 | `GET /api/sessions/{id}/questions` | List question batches and their answers |
 | `POST /api/sessions/{id}/questions/{qid}/answers` | Answer a question batch; returns the batch and the canonical user summary |
 | `POST /api/chat/stream` | SSE agent turn (reasoning, content, tool, usage, checklist, questions, done) |
