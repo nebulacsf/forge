@@ -70,7 +70,7 @@ func TestStreamChatTracesFullPayloads(t *testing.T) {
 	srv := httptest.NewServer(sseStream(t))
 	defer srv.Close()
 
-	client := New("sk-secret-trace-key", srv.URL)
+	client := New(Profile{Name: "OpenRouter", APIKey: "sk-secret-trace-key", BaseURL: srv.URL})
 	req := ChatRequest{
 		Model: "test/model",
 		Messages: []Message{
@@ -137,7 +137,7 @@ func TestStreamChatTracesProviderErrorBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := New("sk-secret-trace-key", srv.URL)
+	client := New(Profile{Name: "OpenRouter", APIKey: "sk-secret-trace-key", BaseURL: srv.URL})
 	_, err := client.StreamChat(context.Background(), ChatRequest{Model: "test/model"}, nil)
 	if err == nil {
 		t.Fatal("expected a provider error")
@@ -158,7 +158,7 @@ func TestStreamChatSilentWithoutLLMTrace(t *testing.T) {
 	srv := httptest.NewServer(sseStream(t))
 	defer srv.Close()
 
-	client := New("sk-secret-trace-key", srv.URL)
+	client := New(Profile{Name: "OpenRouter", APIKey: "sk-secret-trace-key", BaseURL: srv.URL})
 	if _, err := client.StreamChat(context.Background(), ChatRequest{
 		Model:    "test/model",
 		Messages: []Message{{Role: "user", Content: "user-message-trace"}},

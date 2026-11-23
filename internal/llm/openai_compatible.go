@@ -1,4 +1,3 @@
-// Package llm implements a streaming OpenRouter (OpenAI-compatible) client.
 package llm
 
 import (
@@ -16,95 +15,33 @@ import (
 	"forge/internal/logx"
 )
 
-// ToolCall is both the wire representation and Forge's persisted form. Result,
-// Error, Status and DurationMS are local-only fields and are omitted from
-// requests to the provider.
-type ToolCall struct {
-	ID         string       `json:"id"`
-	Type       string       `json:"type"`
-	Function   ToolFunction `json:"function"`
-	Result     string       `json:"result,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	Status     string       `json:"status,omitempty"`
-	DurationMS int64        `json:"duration_ms,omitempty"`
-}
-
-type ToolFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
-
-type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
-}
-
-type Tool struct {
-	Type     string           `json:"type"`
-	Function ToolFunctionSpec `json:"function"`
-}
-
-type ToolFunctionSpec struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
-}
-
-type ChatRequest struct {
-	Model         string         `json:"model"`
-	Messages      []Message      `json:"messages"`
-	Tools         []Tool         `json:"tools,omitempty"`
-	ToolChoice    string         `json:"tool_choice,omitempty"`
-	Stream        bool           `json:"stream"`
-	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
-}
-
-type StreamOptions struct {
-	IncludeUsage bool `json:"include_usage"`
-}
-
-// Usage mirrors OpenRouter's usage object.
-type Usage struct {
-	PromptTokens        int64   `json:"prompt_tokens"`
-	CompletionTokens    int64   `json:"completion_tokens"`
-	TotalTokens         int64   `json:"total_tokens"`
-	Cost                float64 `json:"cost"`
-	PromptTokensDetails struct {
-		CachedTokens int64 `json:"cached_tokens"`
-	} `json:"prompt_tokens_details"`
-	CompletionTokensDetails struct {
-		ReasoningTokens int64 `json:"reasoning_tokens"`
-	} `json:"completion_tokens_details"`
-}
-
-type StreamResult struct {
-	Content   string
-	Reasoning string
-	ToolCalls []ToolCall
-	Usage     Usage
-	Model     string
-	ID        string
-}
-
-// Delta is emitted while text streams in.
-type Delta struct {
-	Kind string // "reasoning" or "content"
-	Text string
-}
-
-type Client struct {
-	APIKey  string
-	BaseURL string
+// OpenAICompatibleProvider speaks the OpenAI chat-completions protocol over
+// HTTP + SSE. It is intentionally free of provider-specific branches; all
+// variation comes from the Profile.
+type OpenAICompatibleProvider struct {
+	profile Profile
 	HTTP    *http.Client
 }
 
-func New(apiKey, baseURL string) *Client {
-	return &Client{
-		APIKey:  strings.TrimSpace(apiKey),
-		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+var _ Provider = (*OpenAICompatibleProvider)(nil)
+
+// New builds a provider from a profile. The profile is normalised here so the
+// rest of the client can assume a clean base URL and a non-nil header map.
+func New(p Profile) *OpenAICompatibleProvider {
+	p.ID = strings.TrimSpace(p.ID)
+	p.Name = strings.TrimSpace(p.Name)
+	p.Driver = strings.ToLower(strings.TrimSpace(p.Driver))
+	if p.Driver == "" {
+		p.Driver = DriverOpenAICompatible
+	}
+	p.BaseURL = normalizeBaseURL(p.BaseURL)
+	p.APIKey = strings.TrimSpace(p.APIKey)
+	p.DefaultModel = strings.TrimSpace(p.DefaultModel)
+	if p.ExtraHeaders == nil {
+		p.ExtraHeaders = map[string]string{}
+	}
+	return &OpenAICompatibleProvider{
+		profile: p,
 		HTTP: &http.Client{
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
@@ -115,6 +52,75 @@ func New(apiKey, baseURL string) *Client {
 			},
 		},
 	}
+}
+
+// Profile returns a copy of the client configuration. The caller may mutate the
+// returned header map without affecting the client.
+func (c *OpenAICompatibleProvider) Profile() Profile {
+	p := c.profile
+	p.ExtraHeaders = make(map[string]string, len(c.profile.ExtraHeaders))
+	for k, v := range c.profile.ExtraHeaders {
+		p.ExtraHeaders[k] = v
+	}
+	return p
+}
+
+func (c *OpenAICompatibleProvider) displayName() string {
+	if name := strings.TrimSpace(c.profile.Name); name != "" {
+		return name
+	}
+	if id := strings.TrimSpace(c.profile.ID); id != "" {
+		return id
+	}
+	return "provider"
+}
+
+// normalizeBaseURL removes trailing slashes and a trailing endpoint suffix so
+// both "https://host/v1", "https://host/v1/" and
+// "https://host/v1/chat/completions" work.
+func normalizeBaseURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimRight(raw, "/")
+	for _, suffix := range []string{"/chat/completions", "/models"} {
+		if strings.HasSuffix(raw, suffix) {
+			raw = strings.TrimSuffix(raw, suffix)
+			raw = strings.TrimRight(raw, "/")
+			break
+		}
+	}
+	return raw
+}
+
+func (c *OpenAICompatibleProvider) endpoint(path string) string {
+	return c.profile.BaseURL + path
+}
+
+func (c *OpenAICompatibleProvider) applyHeaders(req *http.Request, stream bool) {
+	req.Header.Set("Content-Type", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	if c.profile.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.profile.APIKey)
+	}
+	for name, value := range c.profile.ExtraHeaders {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		req.Header.Set(name, value)
+	}
+}
+
+func (c *OpenAICompatibleProvider) post(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	c.applyHeaders(httpReq, true)
+	return c.HTTP.Do(httpReq)
 }
 
 type streamChunk struct {
@@ -153,9 +159,9 @@ type apiError struct {
 
 // StreamChat sends a streaming completion request and invokes onDelta for each
 // text fragment. It blocks until the stream finishes or ctx is cancelled.
-func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(Delta) error) (*StreamResult, error) {
-	if c.APIKey == "" {
-		return nil, errors.New("OpenRouter API key is not configured")
+func (c *OpenAICompatibleProvider) StreamChat(ctx context.Context, req ChatRequest, onDelta func(StreamDelta) error) (*StreamResult, error) {
+	if strings.TrimSpace(c.profile.BaseURL) == "" {
+		return nil, fmt.Errorf("%s base URL is not configured", c.displayName())
 	}
 	req.Stream = true
 	req.StreamOptions = &StreamOptions{IncludeUsage: true}
@@ -164,37 +170,50 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
 
-	endpoint := c.BaseURL + "/chat/completions"
+	endpoint := c.endpoint("/chat/completions")
 	callID := nextCallID()
 	traceRequest(callID, endpoint, body)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
-	httpReq.Header.Set("HTTP-Referer", "https://github.com/forge-harness/forge")
-	httpReq.Header.Set("X-Title", "Forge")
-
-	logx.Debug("provider request", "call", callID, "url", endpoint, "model", req.Model,
-		"messages", len(req.Messages), "tools", len(req.Tools))
+	logx.Debug("provider request", "call", callID, "provider", c.displayName(),
+		"url", endpoint, "model", req.Model, "messages", len(req.Messages), "tools", len(req.Tools))
 
 	started := time.Now()
-	resp, err := c.HTTP.Do(httpReq)
+	resp, err := c.post(ctx, endpoint, body)
 	if err != nil {
-		return nil, fmt.Errorf("connect to OpenRouter: %w", err)
+		return nil, fmt.Errorf("connect to %s: %w", c.displayName(), err)
+	}
+
+	// A few local gateways reject unknown request fields. Retry once without
+	// stream_options rather than forcing every endpoint to support it.
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		resp.Body.Close()
+		if strings.Contains(strings.ToLower(string(data)), "stream_options") {
+			req.StreamOptions = nil
+			body, err = json.Marshal(req)
+			if err != nil {
+				return nil, fmt.Errorf("encode request: %w", err)
+			}
+			traceRequest(callID, endpoint, body)
+			resp, err = c.post(ctx, endpoint, body)
+			if err != nil {
+				return nil, fmt.Errorf("connect to %s: %w", c.displayName(), err)
+			}
+		} else {
+			traceErrorBody(callID, resp.StatusCode, data)
+			return nil, providerError(resp.StatusCode, data, c.displayName())
+		}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		traceErrorBody(callID, resp.StatusCode, data)
-		return nil, providerError(resp.StatusCode, data)
+		return nil, providerError(resp.StatusCode, data, c.displayName())
 	}
 	traceResponse(callID, resp.StatusCode, resp.Header)
-	logx.Debug("provider response", "call", callID, "status", resp.StatusCode, "latency", time.Since(started).Round(time.Millisecond).String())
+	logx.Debug("provider response", "call", callID, "provider", c.displayName(),
+		"status", resp.StatusCode, "latency", time.Since(started).Round(time.Millisecond).String())
 
 	result := &StreamResult{}
 	chunks := 0
@@ -215,7 +234,7 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 				continue
 			}
 			if line == "[DONE]" {
-				logx.LLMTrace("llm stream done", "call", callID)
+				logx.LLMTrace("llm stream done", "call", callID, "provider", c.displayName())
 				return io.EOF
 			}
 			traceChunk(callID, line)
@@ -227,7 +246,7 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 				continue
 			}
 			if chunk.Error != nil && chunk.Error.Message != "" {
-				return fmt.Errorf("OpenRouter: %s", chunk.Error.Message)
+				return fmt.Errorf("%s: %s", c.displayName(), chunk.Error.Message)
 			}
 			chunks++
 			if chunk.ID != "" {
@@ -342,7 +361,8 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 		result.ToolCalls = append(result.ToolCalls, call)
 	}
 	traceResult(callID, result)
-	logx.Debug("provider stream complete", "call", callID, "model", result.Model, "chunks", chunks,
+	logx.Debug("provider stream complete", "call", callID, "provider", c.displayName(),
+		"model", result.Model, "chunks", chunks,
 		"content_chars", len(result.Content), "reasoning_chars", len(result.Reasoning),
 		"tool_calls", len(result.ToolCalls), "prompt_tokens", result.Usage.PromptTokens,
 		"completion_tokens", result.Usage.CompletionTokens, "cost", result.Usage.Cost,
@@ -351,10 +371,10 @@ func (c *Client) StreamChat(ctx context.Context, req ChatRequest, onDelta func(D
 	return result, streamErr
 }
 
-func providerError(status int, body []byte) error {
+func providerError(status int, body []byte, name string) error {
 	var apiErr apiError
 	if json.Unmarshal(body, &apiErr) == nil && apiErr.Error.Message != "" {
-		return fmt.Errorf("OpenRouter (%d): %s", status, apiErr.Error.Message)
+		return fmt.Errorf("%s (%d): %s", name, status, apiErr.Error.Message)
 	}
 	msg := strings.TrimSpace(string(body))
 	if len(msg) > 500 {
@@ -363,5 +383,5 @@ func providerError(status int, body []byte) error {
 	if msg == "" {
 		msg = http.StatusText(status)
 	}
-	return fmt.Errorf("OpenRouter (%d): %s", status, msg)
+	return fmt.Errorf("%s (%d): %s", name, status, msg)
 }

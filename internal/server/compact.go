@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"forge/internal/config"
 	"forge/internal/llm"
 	"forge/internal/logx"
 	"forge/internal/store"
@@ -51,9 +50,9 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	cfg := s.cfg.Get()
-	if strings.TrimSpace(cfg.Providers.OpenRouter.APIKey) == "" {
-		apiError(w, http.StatusBadRequest, "OpenRouter API key is not configured. Open Settings and add your key.")
+	provider, err := s.providerForSession(session)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, "No LLM provider is configured. Open Settings and add one.")
 		return
 	}
 	messages, err := s.store.ListMessages(id)
@@ -66,7 +65,7 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	summary, usage, err := s.summarizeConversation(r.Context(), cfg, session, project, messages)
+	summary, usage, err := s.summarizeConversation(r.Context(), provider, session, project, messages)
 	if err != nil {
 		logx.Warn("compact failed", "session", id, "model", session.Model, "error", err)
 		apiError(w, http.StatusBadGateway, "Could not compact the conversation: "+err.Error())
@@ -109,7 +108,7 @@ func (s *Server) handleCompactSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) summarizeConversation(ctx context.Context, cfg config.Config, session store.Session, project store.Project, messages []store.Message) (string, llm.Usage, error) {
+func (s *Server) summarizeConversation(ctx context.Context, provider store.ProviderProfile, session store.Session, project store.Project, messages []store.Message) (string, llm.Usage, error) {
 	ctx, cancel := context.WithTimeout(ctx, compactTimeout)
 	defer cancel()
 
@@ -123,9 +122,16 @@ func (s *Server) summarizeConversation(ctx context.Context, cfg config.Config, s
 	}
 	user += "\nWrite the summary now."
 
-	client := llm.New(cfg.Providers.OpenRouter.APIKey, cfg.Providers.OpenRouter.BaseURL)
+	client, err := s.providerClient(provider)
+	if err != nil {
+		return "", llm.Usage{}, err
+	}
+	model := strings.TrimSpace(session.Model)
+	if model == "" {
+		model = s.defaultModelFor(provider)
+	}
 	result, err := client.StreamChat(ctx, llm.ChatRequest{
-		Model: session.Model,
+		Model: model,
 		Messages: []llm.Message{
 			{Role: "system", Content: compactSystemPrompt},
 			{Role: "user", Content: user},

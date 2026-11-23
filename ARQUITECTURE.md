@@ -6,7 +6,7 @@
 
 ## What is Forge
 
-**Single binary** (Go + embedded assets) serving a **SPA** and exposing REST API + SSE. Uses **OpenRouter** (OpenAI-compatible API) for LLM and **local SQLite** (`~/.forge/forge.db`) for persistence. Config in `~/.forge/config.json`.
+**Single binary** (Go + embedded assets) serving a **SPA** and exposing REST API + SSE. Uses a **generic OpenAI-compatible LLM layer** (OpenRouter, Ollama, LM Studio, vLLM, Groq, DeepSeek, OpenCode Go, custom gateways) and **local SQLite** (`~/.forge/forge.db`) for persistence. Config in `~/.forge/config.json`; provider profiles live in SQLite.
 
 **Two modes:**
 - **PLAN** — Read-only (explore, search, checklist, clarify with `ask_user`)
@@ -21,7 +21,7 @@
 │                      FORGE BINARY                          │
 ├──────────────┬──────────────┬──────────────┬───────────────┤
 │   config     │    store     │     llm      │    tools      │
-│  (config.go) │ (sqlite.go)  │(openrouter.go)│  (tools.go)   │
+│  (config.go) │ (sqlite.go)  │(provider.go) │  (tools.go)   │
 └──────┬───────┴──────┬───────┴──────┬───────┴───────┬───────┘
        │              │              │               │
        └──────────────┼──────────────┼───────────────┘
@@ -39,10 +39,10 @@
                             │
               ┌─────────────┴─────────────┐
               ▼                           ▼
-       ┌─────────────┐             ┌─────────────┐
-       │  OpenRouter │             │ Project Dir │
-       │  (LLM API)  │             │  (file ops) │
-       └─────────────┘             └─────────────┘
+       ┌─────────────────────┐     ┌─────────────┐
+       │ OpenAI-compatible   │     │ Project Dir │
+       │ provider (selected) │     │  (file ops) │
+       └─────────────────────┘     └─────────────┘
 ```
 
 ---
@@ -50,7 +50,7 @@
 ## Core Flows
 
 ### 1. Startup (`main.go`)
-1. Parse flags → 2. Load config → 3. Init logging → 4. Open SQLite (WAL, migrate) → 5. Embed assets → 6. Mount HTTP handler → 7. Listen + open browser (if loopback) → 8. Graceful shutdown (SIGINT/TERM, 3s)
+1. Parse flags → 2. Load config → 3. Init logging → 4. Open SQLite (WAL, migrate) → 5. Seed the `openrouter` provider from legacy config/env when the provider table is empty → 6. Embed assets → 7. Mount HTTP handler → 8. Listen + open browser (if loopback) → 9. Graceful shutdown (SIGINT/TERM, 3s)
 
 ### 2. Chat Turn (`stream.go:handleChatStream`) — **Core loop**
 ```
@@ -58,7 +58,7 @@ POST /api/chat/stream (session_id, content)
          │
          ▼
 ┌────────────────────────────────────────────────────────┐
-│ 1. Validate session/project/API key                    │
+│ 1. Validate session/project; resolve session provider   │
 │ 2. Save user message                                   │
 │ 3. Create tools.Manager (project root, mode)           │
 │ 4. Ensure local repo outline (AST/regex scan, cached)  │
@@ -177,8 +177,9 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
 - Pruning is **budget driven**. The request must fit in
   `min(model context length × history_prune_percent, history_prune_max_tokens)`
   tokens, i.e. 70% of the window capped at 120,000 by default. The context
-  length comes from the built-in model table (`llm.BuiltinContextLength`); an
-  unknown model falls back to the token cap alone. The ceiling covers the whole
+  length comes from the selected provider's cached catalog, then the built-in
+  OpenRouter-style table (`llm.BuiltinContextLength`); an unknown model falls
+  back to the token cap alone. The ceiling covers the whole
   request: system prompt, tool definitions, and conversation. Tool rounds are
   kept verbatim from the newest backwards until the ceiling is reached, so a
   large-context model actually gets to use its window.
@@ -227,12 +228,17 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
 - `defaults.history_*` control history pruning (see 3.2)
 - `defaults.plan_rounds` / `defaults.plan_tool_calls` bound PLAN research
   (defaults 16 / 64; clamped to 24 / 200)
-- Hot-reload: invalidates model cache if API key/base URL changes
+- Hot-reload: invalidates the model cache when legacy config changes; provider
+  profiles are read from SQLite on every turn, so provider changes need no restart
 
-### 6. Model Catalog (`router.go`)
-- Cache TTL: 6h (OpenRouter) / 2m (builtin fallback)
-- `GET /api/models?refresh=1` forces refresh
-- Falls back to `BuiltinModels()` on failure
+### 6. Model Catalog & Providers (`router.go`, `providers.go`)
+- Profiles live in `llm_providers`; one row is `is_active` (partial unique index).
+- Sessions may pin `provider_id`; empty means "follow the active provider".
+- Cache is per provider: TTL 6h, or 2m after a fallback.
+- `GET /api/models?provider_id=…&refresh=1` forces a refresh
+- OpenRouter falls back to `BuiltinModels()`; other providers fall back to their
+  default model.
+- CRUD + `POST /api/providers/test` validate connectivity and `/models` support.
 
 ---
 
@@ -240,7 +246,7 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
 
 ```
 projects: id, name, path(UNIQUE), icon_color, last_opened_at, total_cost_usd, session_count
-sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), tokens_in/out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
+sessions: id, project_id(FK), title, model, mode(PLAN|BUILD), provider_id, tokens_in/out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
 messages: id, session_id(FK), role(user|assistant|tool), reasoning, content, tool_calls(JSON), duration_ms, created_at
 checklists: id, session_id(FK), task_text, is_done, position
 question_batches: id, session_id(FK), tool_call_id, created_at, answered_at
@@ -248,11 +254,14 @@ questions: id, batch_id(FK), session_id(FK), text, context, kind(single|multi), 
 question_options: id, question_id(FK), label, description, position
 repo_outline: project_path, file_path, language, mtime_ns, size_bytes, symbols, updated_at
               PRIMARY KEY(project_path, file_path)
+llm_providers: id(TEXT PK), name, driver('openai_compatible'), base_url, api_key,
+               default_model, extra_headers_json, is_active, created_at
 ```
 
 Indexes: sessions(project_id, is_open, updated_at), messages(session_id, id),
 checklists(session_id, position, id), question_batches(session_id, id),
-questions(batch_id, position, id), question_options(question_id, position, id).
+questions(batch_id, position, id), question_options(question_id, position, id),
+and a partial unique index on `llm_providers(is_active) WHERE is_active = 1`.
 `repo_outline` is covered by its composite primary key
 `(project_path, file_path)`. Deleting a session cascades to its question batches,
 questions, and options.
@@ -269,7 +278,10 @@ transaction.
 |--------|----------|-------------|
 | GET | `/api/health` | Health check |
 | GET/PUT | `/api/config` | Config |
-| GET | `/api/models` | Model catalog |
+| GET | `/api/models` | Model catalog for the selected/active provider |
+| GET/POST | `/api/providers` | List (masked keys)/create provider profiles |
+| PUT/DELETE | `/api/providers/{id}` | Update/delete; `is_active` switches the global default |
+| POST | `/api/providers/test` | Connectivity + `/models` probe |
 | GET/POST | `/api/projects` | Projects |
 | PATCH/DELETE | `/api/projects/{id}` | Project rename/recolor/move, delete (cascades chats) |
 | GET/POST | `/api/projects/{id}/sessions` | Sessions (`?all=1` includes closed tabs) |
@@ -294,7 +306,8 @@ transaction.
 - **Right (XL+):** Collapsible inspector with usage/cost, active files, checklist
 - **Themes:** `data-theme` / `data-bs-theme` drive custom tokens, Bootstrap, and highlight.js; preference stored in `localStorage`
 - **Timers:** Live session and per-response timers; persisted as `sessions.duration_ms` and `messages.duration_ms`
-- **Modals:** Add Project, Settings — the Settings form is grouped into ordered sections (provider, model, BUILD limits, PLAN budget, tool limits, context/history, server, logging) and every field carries an inline tooltip explaining its unit, default and effect
+- **Chat controls:** provider selector (per-chat override + global default) and model input
+- **Modals:** Add Project, Settings — the Settings form is grouped into ordered sections (LLM providers with presets/test/edit, model, BUILD limits, PLAN budget, tool limits, context/history, server, logging) and every field carries an inline tooltip explaining its unit, default and effect
 - **SSE:** `EventSource` parses typed events → incremental DOM updates
 
 ---
@@ -308,8 +321,8 @@ transaction.
 | Sizes | Read window 200 lines (10MB file max), grep skips >2MB, scanner skips >512KB, outputs truncated |
 | Bash | `NO_COLOR=1`, `TERM=dumb`, timeout (default 30s, max 600s) |
 | Runaway turns | Segment/turn round budgets, optional per-turn USD cap, loop guard (`server/guard.go`) |
-| Config | 0600; API key masked in responses |
-| DB | WAL, FK cascade |
+| Config | 0600; legacy API key masked in responses |
+| DB | WAL, FK cascade; provider keys stored in `llm_providers` and never returned raw; DB mode 0600 |
 | Network | Default bind 127.0.0.1; warning if non-loopback |
 
 ---
@@ -345,7 +358,7 @@ transaction.
 
 | Area | Status | Idea |
 |------|--------|------|
-| Providers | OpenRouter only | Plugin interface for other compatible APIs |
+| Providers | `openai_compatible` driver + profiles | Additional drivers (native APIs, OAuth) behind `llm.Provider` |
 | Tools | 10 built-in | Dynamic registration (MCP, custom scripts) |
 | Auth | None (local) | Optional token for remote access |
 | Multi-user | Single-user | User isolation, own projects |
@@ -360,9 +373,12 @@ main.go                      # Entry point, wiring, lifecycle
 internal/
   config/config.go           # Config load/save/validate, paths
   store/sqlite.go            # Schema, CRUD projects/sessions/messages/checklists/questions
-  llm/openrouter.go          # Streaming chat client, SSE parsing
-  llm/models.go              # Model catalog fetch + builtin fallback
-  server/router.go           # HTTP routes, middleware, APIs config/models/projects/sessions/checklist
+  store/providers.go         # Provider profile CRUD, active invariant, session binding
+  llm/provider.go            # Profile + Provider/ChatClient interface + driver factory
+  llm/openai_compatible.go   # Generic streaming chat client, SSE + tool calls + usage
+  llm/models.go              # Model catalog fetch/probe + builtin fallback
+  server/providers.go        # Provider resolver, CRUD/test handlers, legacy seeding
+  server/router.go           # HTTP routes, middleware, APIs config/models/providers/projects/sessions/checklist
   server/questions.go        # Question batch API + canonical answer summary
   server/stream.go           # handleChatStream — core agent loop
   server/history.go          # History pruning: recent rounds verbatim, older rounds stubbed in place

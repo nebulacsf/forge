@@ -11,6 +11,8 @@ const state = {
   debugActive: false,
   llmDebugActive: false,
   apiKeySet: false,
+  providers: [],
+  activeProviderId: '',
   models: new Map(),
   modelsSource: '',
   projects: [],
@@ -301,8 +303,10 @@ async function init() {
   }
   try {
     await loadConfig();
-    $('modelInput').value = state.config?.defaults?.model || '';
-    loadModels();
+    await loadProviders();
+    const provider = activeProvider();
+    $('modelInput').value = (provider && provider.default_model) || state.config?.defaults?.model || '';
+    loadModels(state.activeProviderId);
     await loadProjects();
     if (!state.projects.length) {
       showEmpty('project');
@@ -352,9 +356,13 @@ async function loadConfig() {
   state.apiKeySet = !!data.api_key_set;
 }
 
-async function loadModels() {
+async function loadModels(providerId = '', { refresh = false } = {}) {
   try {
-    const data = await api('/api/models');
+    const params = new URLSearchParams();
+    if (providerId) params.set('provider_id', providerId);
+    if (refresh) params.set('refresh', '1');
+    const query = params.toString();
+    const data = await api('/api/models' + (query ? `?${query}` : ''));
     const list = Array.isArray(data.models) ? data.models : [];
     state.models = new Map(list.map((m) => [String(m.id), m]));
     state.modelsSource = data.source || '';
@@ -363,6 +371,41 @@ async function loadModels() {
   } catch {
     /* Keep the built-in heuristics when the catalog is unavailable. */
   }
+}
+
+async function loadProviders() {
+  try {
+    const data = await api('/api/providers');
+    state.providers = Array.isArray(data.providers) ? data.providers : [];
+    state.activeProviderId = data.active_id ||
+      (state.providers.find((p) => p.is_active) || {}).id || '';
+    renderProviderSettings();
+    renderSessionProviderOptions();
+  } catch (err) {
+    state.providers = [];
+    state.activeProviderId = '';
+    renderProviderSettings();
+    renderSessionProviderOptions();
+    toast(err.message, 'error');
+  }
+}
+
+function providerById(id) {
+  return state.providers.find((p) => p.id === id) || null;
+}
+
+function activeProvider() {
+  return providerById(state.activeProviderId) ||
+    state.providers.find((p) => p.is_active) || null;
+}
+
+function effectiveProviderID() {
+  return (state.session && state.session.provider_id) || state.activeProviderId || '';
+}
+
+function providerName(id) {
+  const p = providerById(id);
+  return p ? p.name : (id || 'Default');
 }
 
 function renderModelOptions(list) {
@@ -586,6 +629,8 @@ async function loadSession(id) {
     state.session = data.session;
     state.activeProject = data.project;
     state.activeProjectId = data.project.id;
+    renderSessionProviderOptions();
+    loadModels(effectiveProviderID());
     // Opening a tab must never reorder the bar: update the entry where it is.
     const tabIndex = state.sessions.findIndex((s) => s.id === id);
     if (tabIndex >= 0) state.sessions[tabIndex] = { ...state.sessions[tabIndex], ...data.session };
@@ -672,7 +717,9 @@ function clearSession() {
   state.session = null;
   if (state.activeProjectId) localStorage.removeItem(`forge.session.${state.activeProjectId}`);
   messagesEl().innerHTML = '';
-  $('modelInput').value = state.config?.defaults?.model || '';
+  renderSessionProviderOptions();
+  const defaultProvider = activeProvider();
+  $('modelInput').value = (defaultProvider && defaultProvider.default_model) || state.config?.defaults?.model || '';
   setModeUI(state.config?.defaults?.mode || 'PLAN');
   renderTabs();
   renderInspector();
@@ -917,6 +964,7 @@ function renderSession(messages) {
       if (renderAssistantHistory(msg)) hasContent = true;
     }
   }
+  renderSessionProviderOptions();
   $('modelInput').value = state.session?.model || '';
   setModeUI(state.session?.mode || 'PLAN');
   renderFiles();
@@ -2796,6 +2844,7 @@ function renderChrome() {
   $('stopBtn').title = stopping ? 'Stopping the agent…' : 'Stop generation';
 
   $('modelInput').disabled = running || !hasSession;
+  $('sessionProviderSelect').disabled = running || !hasSession || !state.providers.length;
   for (const btn of $('modeToggle').querySelectorAll('button')) {
     btn.disabled = running || !hasSession;
   }
@@ -3426,18 +3475,407 @@ function initTooltips(root) {
   });
 }
 
+/* ── Provider settings ───────────────────────────────────────────── */
+
+const PROVIDER_PRESETS = {
+  openrouter: {
+    name: 'OpenRouter',
+    base_url: 'https://openrouter.ai/api/v1',
+    default_model: '',
+    extra_headers: {
+      'HTTP-Referer': 'https://github.com/forge-harness/forge',
+      'X-Title': 'Forge',
+    },
+    keyHelp: 'Create a key at openrouter.ai/keys. Leave blank to keep the current key.',
+  },
+  ollama: {
+    name: 'Ollama Local',
+    base_url: 'http://localhost:11434/v1',
+    default_model: 'qwen2.5-coder:7b',
+    extra_headers: {},
+    keyHelp: 'Local Ollama usually needs no key. Start it with `ollama serve`.',
+  },
+  lmstudio: {
+    name: 'LM Studio',
+    base_url: 'http://localhost:1234/v1',
+    default_model: '',
+    extra_headers: {},
+    keyHelp: 'Start the LM Studio local server and load a model first.',
+  },
+  custom: {
+    name: '',
+    base_url: '',
+    default_model: '',
+    extra_headers: {},
+    keyHelp: 'Leave blank for local endpoints that do not require auth.',
+  },
+};
+
+function renderProviderSettings() {
+  const select = $('activeProviderSelect');
+  const list = $('providerList');
+  if (!select || !list) return;
+
+  select.innerHTML = '';
+  if (!state.providers.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No provider configured';
+    select.appendChild(opt);
+    select.disabled = true;
+  } else {
+    select.disabled = false;
+    for (const p of state.providers) {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = `${p.name}${p.is_active ? ' · active' : ''}`;
+      select.appendChild(opt);
+    }
+    select.value = state.activeProviderId || state.providers[0].id;
+  }
+
+  list.innerHTML = '';
+  if (!state.providers.length) {
+    const empty = document.createElement('div');
+    empty.className = 'provider-empty';
+    empty.textContent = 'No providers yet. Add OpenRouter, a local endpoint, or a custom OpenAI-compatible URL.';
+    list.appendChild(empty);
+    return;
+  }
+  for (const p of state.providers) {
+    const row = document.createElement('div');
+    row.className = 'provider-row' + (p.is_active ? ' is-active' : '');
+
+    const main = document.createElement('div');
+    main.className = 'provider-row-main';
+    const name = document.createElement('div');
+    name.className = 'provider-row-name';
+    name.textContent = p.name;
+    if (p.is_active) {
+      const badge = document.createElement('span');
+      badge.className = 'provider-badge';
+      badge.textContent = 'active';
+      name.appendChild(badge);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'provider-row-meta';
+    const bits = [p.base_url];
+    if (p.default_model) bits.push(p.default_model);
+    if (p.api_key_set) bits.push('key set');
+    meta.textContent = bits.join(' · ');
+    main.append(name, meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'provider-row-actions';
+    if (!p.is_active) {
+      const activate = document.createElement('button');
+      activate.type = 'button';
+      activate.className = 'btn btn-outline-secondary';
+      activate.textContent = 'Activate';
+      activate.addEventListener('click', () => activateProvider(p.id));
+      actions.appendChild(activate);
+    }
+    const test = document.createElement('button');
+    test.type = 'button';
+    test.className = 'btn btn-outline-secondary';
+    test.title = 'Test connection';
+    test.innerHTML = '<i class="bi bi-activity"></i>';
+    test.addEventListener('click', () => testProviderFromList(p));
+    actions.appendChild(test);
+
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'btn btn-outline-secondary';
+    edit.innerHTML = '<i class="bi bi-pencil"></i>';
+    edit.title = 'Edit provider';
+    edit.addEventListener('click', () => openProviderEditor(p));
+    actions.appendChild(edit);
+
+    row.append(main, actions);
+    list.appendChild(row);
+  }
+}
+
+function renderSessionProviderOptions() {
+  const select = $('sessionProviderSelect');
+  if (!select) return;
+  const current = (state.session && state.session.provider_id) || '';
+  select.innerHTML = '';
+  const dflt = document.createElement('option');
+  dflt.value = '';
+  dflt.textContent = `Default · ${providerName(state.activeProviderId)}`;
+  select.appendChild(dflt);
+  for (const p of state.providers) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.name;
+    select.appendChild(opt);
+  }
+  select.value = current;
+  select.disabled = !state.session || !state.providers.length;
+}
+
+function openProviderEditor(provider = null) {
+  const editing = !!provider;
+  $('providerEditID').value = editing ? provider.id : '';
+  $('providerEditorTitle').textContent = editing ? 'Edit provider' : 'New provider';
+  $('providerName').value = editing ? provider.name : '';
+  $('providerBaseURL').value = editing ? provider.base_url : '';
+  $('providerDefaultModel').value = editing ? provider.default_model || '' : '';
+  $('providerHeaders').value = editing && provider.extra_headers &&
+    Object.keys(provider.extra_headers).length
+    ? JSON.stringify(provider.extra_headers, null, 2)
+    : '';
+  $('providerActive').checked = editing ? !!provider.is_active : !state.providers.length;
+  $('deleteProviderBtn').classList.toggle('d-none', !editing);
+  $('providerAPIKey').value = '';
+  $('providerAPIKey').type = 'password';
+  $('providerAPIKey').placeholder = editing && provider.api_key_set
+    ? `•••••••• (${provider.api_key_hint || 'configured'}) — leave blank to keep`
+    : 'sk-…';
+  $('providerKeyHelp').textContent = editing && provider.api_key_set
+    ? 'A key is stored. Leave blank to keep it, or paste a new key.'
+    : 'Stored locally in the Forge database.';
+  const status = $('providerTestStatus');
+  status.textContent = '';
+  status.className = 'provider-test-status';
+  document.querySelectorAll('#providerPresets .provider-preset').forEach((b) => b.classList.remove('is-active'));
+  $('providerEditor').classList.remove('d-none');
+  $('providerName').focus();
+}
+
+function closeProviderEditor() {
+  $('providerEditor').classList.add('d-none');
+  $('providerEditID').value = '';
+  $('providerTestStatus').textContent = '';
+  $('providerTestStatus').className = 'provider-test-status';
+}
+
+function applyProviderPreset(key) {
+  const preset = PROVIDER_PRESETS[key];
+  if (!preset) return;
+  $('providerName').value = preset.name;
+  $('providerBaseURL').value = preset.base_url;
+  $('providerDefaultModel').value = preset.default_model ||
+    (key === 'openrouter' ? (state.config?.defaults?.model || '') : '');
+  $('providerHeaders').value = Object.keys(preset.extra_headers || {}).length
+    ? JSON.stringify(preset.extra_headers, null, 2)
+    : '';
+  $('providerKeyHelp').textContent = preset.keyHelp;
+  $('providerActive').checked = !state.providers.length;
+  $('deleteProviderBtn').classList.add('d-none');
+  $('providerEditID').value = '';
+  $('providerEditorTitle').textContent = 'New provider';
+  $('providerAPIKey').value = '';
+  $('providerTestStatus').textContent = '';
+  $('providerTestStatus').className = 'provider-test-status';
+  document.querySelectorAll('#providerPresets .provider-preset').forEach((b) => {
+    b.classList.toggle('is-active', b.dataset.preset === key);
+  });
+}
+
+function readProviderForm() {
+  const rawHeaders = $('providerHeaders').value.trim();
+  let headers = {};
+  if (rawHeaders) {
+    try {
+      const parsed = JSON.parse(rawHeaders);
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+        throw new Error('Extra headers must be a JSON object');
+      }
+      for (const [key, value] of Object.entries(parsed)) {
+        if (typeof value !== 'string') throw new Error(`Header "${key}" must be a string`);
+        headers[key] = value;
+      }
+    } catch (err) {
+      toast(`Extra headers: ${err.message}`, 'error');
+      return null;
+    }
+  }
+  const id = $('providerEditID').value.trim();
+  const key = $('providerAPIKey').value.trim();
+  return {
+    id,
+    name: $('providerName').value.trim(),
+    driver: 'openai_compatible',
+    base_url: $('providerBaseURL').value.trim(),
+    api_key: key || (id ? '__KEEP__' : ''),
+    default_model: $('providerDefaultModel').value.trim(),
+    extra_headers: headers,
+    is_active: $('providerActive').checked,
+  };
+}
+
+async function saveProviderEditor() {
+  const body = readProviderForm();
+  if (!body) return;
+  if (!body.name || !body.base_url) {
+    toast('Provider name and base URL are required', 'error');
+    return;
+  }
+  const editing = !!body.id;
+  try {
+    const data = await api(editing ? `/api/providers/${encodeURIComponent(body.id)}` : '/api/providers', {
+      method: editing ? 'PUT' : 'POST',
+      body: JSON.stringify(body),
+    });
+    const saved = data.provider;
+    closeProviderEditor();
+    await loadProviders();
+    if (saved && saved.is_active) {
+      state.activeProviderId = saved.id;
+      await loadModels(saved.id, { refresh: true });
+      await adoptProviderModel(saved.id);
+    } else {
+      await loadModels(effectiveProviderID());
+    }
+    renderSessionProviderOptions();
+    toast(editing ? 'Provider updated' : 'Provider added', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function deleteProviderEditor() {
+  const id = $('providerEditID').value.trim();
+  if (!id) return;
+  const p = providerById(id);
+  if (!window.confirm(`Delete provider "${p ? p.name : id}"? Chats pinned to it fall back to the active provider.`)) {
+    return;
+  }
+  try {
+    await api(`/api/providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    closeProviderEditor();
+    await loadProviders();
+    await loadModels(effectiveProviderID(), { refresh: true });
+    await adoptProviderModel(effectiveProviderID());
+    renderSessionProviderOptions();
+    toast('Provider deleted', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function activateProvider(id) {
+  const p = providerById(id);
+  if (!p) return;
+  try {
+    await api(`/api/providers/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        id: p.id,
+        name: p.name,
+        driver: p.driver,
+        base_url: p.base_url,
+        api_key: '__KEEP__',
+        default_model: p.default_model,
+        extra_headers: p.extra_headers || {},
+        is_active: true,
+      }),
+    });
+    state.activeProviderId = id;
+    await loadProviders();
+    if (!state.session || !state.session.provider_id) {
+      await loadModels(id, { refresh: true });
+      await adoptProviderModel(id);
+    }
+    renderSessionProviderOptions();
+    toast(`Active provider: ${p.name}`, 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function switchSessionProvider(id) {
+  if (!state.session) return;
+  const updated = await patchSession({ provider_id: id });
+  if (!updated) {
+    renderSessionProviderOptions();
+    return;
+  }
+  renderSessionProviderOptions();
+  const effective = id || state.activeProviderId;
+  await loadModels(effective, { refresh: true });
+  await adoptProviderModel(effective);
+  toast(`Provider: ${providerName(effective)}`, 'success');
+}
+
+async function adoptProviderModel(providerID) {
+  if (!state.session || !state.models.size) return;
+  if (state.models.has(state.session.model)) return;
+  const p = providerById(providerID);
+  const fallback = (p && p.default_model) || state.models.keys().next().value;
+  if (!fallback || fallback === state.session.model) return;
+  const updated = await patchSession({ model: fallback });
+  if (updated) {
+    $('modelInput').value = updated.model;
+    updateUsageUI();
+  }
+}
+
+function setProviderTestStatus(text, kind = '') {
+  const el = $('providerTestStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'provider-test-status' + (kind ? ` is-${kind}` : '');
+}
+
+async function runProviderTest(body) {
+  const data = await api('/api/providers/test', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  return data;
+}
+
+async function testProviderEditor() {
+  const body = readProviderForm();
+  if (!body) return;
+  if (!body.base_url) {
+    setProviderTestStatus('Enter a base URL first.', 'error');
+    return;
+  }
+  setProviderTestStatus('Testing connection…');
+  try {
+    const data = await runProviderTest(body);
+    if (data.ok) {
+      const count = data.models_supported ? ` · ${data.count} models` : '';
+      setProviderTestStatus(`${data.message}${count}`, 'ok');
+    } else {
+      setProviderTestStatus(data.message || 'Connection failed', 'error');
+    }
+  } catch (err) {
+    setProviderTestStatus(err.message, 'error');
+  }
+}
+
+async function testProviderFromList(p) {
+  try {
+    const data = await runProviderTest({
+      id: p.id,
+      name: p.name,
+      driver: p.driver,
+      base_url: p.base_url,
+      api_key: '',
+      default_model: p.default_model,
+      extra_headers: p.extra_headers || {},
+    });
+    if (data.ok) {
+      const count = data.models_supported ? ` · ${data.count} models` : '';
+      toast(`${p.name}: ${data.message}${count}`, 'success');
+    } else {
+      toast(`${p.name}: ${data.message || 'connection failed'}`, 'error');
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
 function openSettings() {
   if (!state.config) return;
   const cfg = state.config;
-  $('apiKey').value = '';
-  $('apiKey').type = 'password';
-  $('apiKey').placeholder = state.apiKeySet
-    ? '•••••••• (configured) — leave blank to keep'
-    : 'sk-or-v1-…';
-  $('apiKeyHelp').innerHTML = state.apiKeySet
-    ? 'A key is configured. Leave blank to keep it, or paste a new key.'
-    : 'Stored locally in <code>~/.forge/config.json</code>.';
-  $('baseURL').value = cfg.providers.openrouter.base_url || '';
+  renderProviderSettings();
+  renderSessionProviderOptions();
   $('defaultModel').value = cfg.defaults.model || '';
   $('defaultMode').value = cfg.defaults.mode || 'PLAN';
   $('maxRead').value = cfg.defaults.max_file_read_chars || 25000;
@@ -3497,9 +3935,8 @@ async function saveSettings(e) {
   e.preventDefault();
   if (!state.config) return;
   const cfg = JSON.parse(JSON.stringify(state.config));
-  cfg.providers.openrouter.base_url = $('baseURL').value.trim();
-  const key = $('apiKey').value.trim();
-  cfg.providers.openrouter.api_key = key || '__KEEP__';
+  // Provider credentials now live in the llm_providers table. The legacy
+  // OpenRouter section stays untouched so older config files keep working.
   cfg.defaults.model = $('defaultModel').value.trim();
   cfg.defaults.mode = $('defaultMode').value;
   cfg.defaults.max_file_read_chars = Number($('maxRead').value) || 25000;
@@ -3610,7 +4047,6 @@ function resetDefaults() {
   $('browserNotifications').checked = false;
   $('debugToggle').checked = false;
   $('debugLLMToggle').checked = false;
-  $('baseURL').value = 'https://openrouter.ai/api/v1';
   renderEffectiveBudget();
   toast('Defaults restored — click Save settings to persist', 'success');
 }
@@ -4426,8 +4862,26 @@ function bindEvents() {
     const el = $(id);
     if (el) el.addEventListener('input', renderEffectiveBudget);
   });
-  $('toggleKey').addEventListener('click', () => {
-    const input = $('apiKey');
+  $('activeProviderSelect').addEventListener('change', () => {
+    const id = $('activeProviderSelect').value;
+    if (id && id !== state.activeProviderId) activateProvider(id);
+  });
+  $('sessionProviderSelect').addEventListener('change', () => {
+    if (!state.session) return;
+    switchSessionProvider($('sessionProviderSelect').value);
+  });
+  $('addProviderBtn').addEventListener('click', () => openProviderEditor(null));
+  $('closeProviderEditor').addEventListener('click', closeProviderEditor);
+  $('cancelProviderBtn').addEventListener('click', closeProviderEditor);
+  $('saveProviderBtn').addEventListener('click', saveProviderEditor);
+  $('deleteProviderBtn').addEventListener('click', deleteProviderEditor);
+  $('testProviderBtn').addEventListener('click', testProviderEditor);
+  $('providerPresets').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-preset]');
+    if (btn) applyProviderPreset(btn.dataset.preset);
+  });
+  $('toggleProviderKey').addEventListener('click', () => {
+    const input = $('providerAPIKey');
     input.type = input.type === 'password' ? 'text' : 'password';
   });
 

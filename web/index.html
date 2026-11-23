@@ -78,6 +78,11 @@
       <!-- Chat -->
       <main class="chat-panel d-flex flex-column flex-grow-1 min-w-0">
         <div class="chat-controls d-flex align-items-center flex-shrink-0">
+          <div class="provider-control" id="providerControl">
+            <i class="bi bi-router"></i>
+            <select id="sessionProviderSelect" class="provider-select" aria-label="Provider"
+                    title="Provider for this chat"></select>
+          </div>
           <div class="model-control">
             <i class="bi bi-cpu"></i>
             <input id="modelInput" class="model-input" list="modelOptions" spellcheck="false"
@@ -390,41 +395,95 @@
         </div>
         <div class="modal-body settings-body">
           <section class="settings-section">
-            <div class="settings-section-title"><i class="bi bi-plug"></i>Provider &amp; credentials</div>
+            <div class="settings-section-title"><i class="bi bi-plug"></i>LLM providers</div>
             <div class="settings-section-desc">
-              How Forge authenticates with the model API. Used by every session and every model.
+              Connect any OpenAI-compatible endpoint. The active provider is used by chats without a
+              per-chat override. Provider changes apply immediately; the Save button below only stores
+              the other settings.
             </div>
-            <div class="mb-3">
-              <div class="setting-label">
-                <label for="apiKey" class="form-label">OpenRouter API key</label>
-                <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the API key"
-                   data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                   title="Secret carried as the Bearer token on every model request. Stored in plain text in the local config file and sent only to the base URL below. Leave blank to keep the current key."></i>
+            <div class="row g-2 align-items-end">
+              <div class="col-md-8">
+                <label for="activeProviderSelect" class="form-label">Active provider</label>
+                <select id="activeProviderSelect" class="form-select"></select>
               </div>
-              <div class="input-group">
-                <input id="apiKey" type="password" class="form-control" autocomplete="off"
-                       placeholder="sk-or-v1-…">
-                <button id="toggleKey" class="btn btn-outline-secondary" type="button" title="Show / hide">
-                  <i class="bi bi-eye"></i>
+              <div class="col-md-4">
+                <button type="button" id="addProviderBtn" class="btn btn-outline-secondary w-100">
+                  <i class="bi bi-plus-lg me-1"></i>Add provider
                 </button>
               </div>
-              <div id="apiKeyHelp" class="form-text">Stored locally in <code>~/.forge/config.json</code>.</div>
             </div>
-            <div>
-              <div class="setting-label">
-                <label for="baseURL" class="form-label">Base URL</label>
-                <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the base URL"
-                   data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                   title="OpenAI-compatible endpoint that serves the model catalog and the chat completions. Point it at a proxy or a self-hosted gateway if you do not use OpenRouter directly. Must start with http:// or https://."></i>
+            <div id="providerList" class="provider-list mt-3"></div>
+
+            <div id="providerEditor" class="provider-editor d-none mt-3">
+              <div class="provider-editor-head">
+                <div class="settings-section-title mb-0">
+                  <i class="bi bi-sliders"></i><span id="providerEditorTitle">New provider</span>
+                </div>
+                <button type="button" id="closeProviderEditor" class="btn-close" aria-label="Close"></button>
               </div>
-              <input id="baseURL" class="form-control" spellcheck="false">
+              <div class="provider-presets" id="providerPresets">
+                <button type="button" class="provider-preset" data-preset="openrouter">OpenRouter</button>
+                <button type="button" class="provider-preset" data-preset="ollama">Ollama Local</button>
+                <button type="button" class="provider-preset" data-preset="lmstudio">LM Studio</button>
+                <button type="button" class="provider-preset" data-preset="custom">Custom</button>
+              </div>
+              <input type="hidden" id="providerEditID">
+              <div class="row g-3">
+                <div class="col-md-6">
+                  <label for="providerName" class="form-label">Name</label>
+                  <input id="providerName" class="form-control" spellcheck="false" placeholder="My provider">
+                </div>
+                <div class="col-md-6">
+                  <label for="providerDefaultModel" class="form-label">Default model</label>
+                  <input id="providerDefaultModel" class="form-control" list="modelOptions" spellcheck="false" placeholder="model-id">
+                </div>
+                <div class="col-12">
+                  <label for="providerBaseURL" class="form-label">Base URL</label>
+                  <input id="providerBaseURL" class="form-control" spellcheck="false" placeholder="https://openrouter.ai/api/v1">
+                  <div class="form-text">Include the version prefix (for example <code>/v1</code>). A trailing <code>/chat/completions</code> is accepted too.</div>
+                </div>
+                <div class="col-12">
+                  <label for="providerAPIKey" class="form-label">API key <span class="text-muted">(optional)</span></label>
+                  <div class="input-group">
+                    <input id="providerAPIKey" type="password" class="form-control" autocomplete="off" placeholder="sk-…">
+                    <button id="toggleProviderKey" class="btn btn-outline-secondary" type="button" title="Show / hide">
+                      <i class="bi bi-eye"></i>
+                    </button>
+                  </div>
+                  <div id="providerKeyHelp" class="form-text">Stored locally in the Forge database. Leave blank to keep the current key.</div>
+                </div>
+                <div class="col-12">
+                  <label for="providerHeaders" class="form-label">Extra headers <span class="text-muted">(JSON, optional)</span></label>
+                  <textarea id="providerHeaders" class="form-control provider-headers" rows="3" spellcheck="false" placeholder='{"HTTP-Referer": "https://github.com/forge-harness/forge"}'></textarea>
+                </div>
+                <div class="col-12">
+                  <div class="form-check form-switch setting-switch">
+                    <input id="providerActive" class="form-check-input" type="checkbox">
+                    <label class="form-check-label" for="providerActive">Set as the active provider</label>
+                  </div>
+                </div>
+              </div>
+              <div class="provider-editor-actions">
+                <button type="button" id="testProviderBtn" class="btn btn-outline-secondary">
+                  <i class="bi bi-activity me-1"></i>Test connection
+                </button>
+                <button type="button" id="deleteProviderBtn" class="btn btn-ghost text-danger d-none">
+                  <i class="bi bi-trash me-1"></i>Delete
+                </button>
+                <div class="ms-auto d-flex gap-2">
+                  <button type="button" id="cancelProviderBtn" class="btn btn-ghost">Cancel</button>
+                  <button type="button" id="saveProviderBtn" class="btn btn-accent">Save provider</button>
+                </div>
+              </div>
+              <div id="providerTestStatus" class="provider-test-status"></div>
             </div>
           </section>
 
           <section class="settings-section">
             <div class="settings-section-title"><i class="bi bi-cpu"></i>Model &amp; mode</div>
             <div class="settings-section-desc">
-              Starting point for new chats. Existing chats remember their own model and mode.
+              Fallback for new chats. A provider's own default model wins when set; existing chats
+              remember their own model, provider and mode.
             </div>
             <div class="row g-3">
               <div class="col-md-8">
@@ -432,7 +491,7 @@
                   <label for="defaultModel" class="form-label">Default model</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the default model"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Model preset applied to brand-new sessions. Its context window feeds the history budget below. You can still switch models per chat from the header."></i>
+                     title="Fallback model for brand-new sessions when the active provider has no default model. Its context window feeds the history budget below. You can still switch models per chat from the header."></i>
                 </div>
                 <input id="defaultModel" class="form-control" list="modelOptions" spellcheck="false">
               </div>

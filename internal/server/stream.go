@@ -146,12 +146,16 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := s.cfg.Get()
-	if strings.TrimSpace(cfg.Providers.OpenRouter.APIKey) == "" {
-		apiError(w, http.StatusBadRequest, "OpenRouter API key is not configured. Open Settings and add your key.")
+	provider, err := s.providerForSession(session)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, "No LLM provider is configured. Open Settings and add one.")
 		return
 	}
 	if strings.TrimSpace(session.Model) == "" {
-		session.Model = cfg.Defaults.Model
+		session.Model = s.defaultModelFor(provider)
+		if strings.TrimSpace(session.Model) == "" {
+			session.Model = cfg.Defaults.Model
+		}
 		if updated, err := s.store.UpdateSession(session.ID, nil, &session.Model, nil, nil); err == nil {
 			session = updated
 		}
@@ -197,19 +201,20 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusConflict, err.Error())
 		return
 	}
-	go s.runTurn(rn, session, project, announce, cfg)
+	go s.runTurn(rn, session, project, announce, cfg, provider)
 	s.tailRun(w, r, rn, 0)
 }
 
 // runTurn is the agent loop. It runs on the run's own context, so the browser
 // can go away without stopping the turn, and it publishes every event into the
 // run log instead of writing to the HTTP socket.
-func (s *Server) runTurn(rn *run, session store.Session, project store.Project, announce *store.Session, cfg config.Config) {
+func (s *Server) runTurn(rn *run, session store.Session, project store.Project, announce *store.Session, cfg config.Config, provider store.ProviderProfile) {
 	stream := &runPublisher{rn: rn}
 	ctx := rn.ctx
 	turnStart := time.Now()
 	defer rn.finish("turn_end")
-	logx.Info("turn start", "session", session.ID, "project", project.ID, "model", session.Model, "mode", session.Mode)
+	logx.Info("turn start", "session", session.ID, "project", project.ID, "provider", provider.ID,
+		"model", session.Model, "mode", session.Mode)
 	if announce != nil {
 		stream.send(chatEvent{Type: "session", Session: announce})
 	}
@@ -266,7 +271,11 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			"chars", utf8.RuneCountInString(outline))
 	}
 
-	client := llm.New(cfg.Providers.OpenRouter.APIKey, cfg.Providers.OpenRouter.BaseURL)
+	client, err := s.providerClient(provider)
+	if err != nil {
+		stream.fail("Provider configuration error: " + err.Error())
+		return
+	}
 	specs := tools.Specs(session.Mode)
 
 	segmentSize := cfg.Defaults.MaxToolRounds
@@ -412,7 +421,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			// A zero budget means the user disabled it, so the legacy round-based
 			// knobs decide the window instead. ReservedChars covers everything the
 			// budget must also pay for: tool definitions and the ephemeral tail.
-			tokenBudget := cfg.Defaults.PruneTokenBudget(llm.BuiltinContextLength(session.Model))
+			tokenBudget := cfg.Defaults.PruneTokenBudget(s.modelContextLength(provider.ID, session.Model))
 			reservedChars := toolSpecsChars(specs) + utf8.RuneCountInString(tailText)
 			history, hstats := buildHistory(rows, system, historyOptions{
 				KeepRecent:     keepRecent,

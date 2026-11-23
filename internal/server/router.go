@@ -42,15 +42,29 @@ type Server struct {
 	// so switching project or closing the browser no longer stops an agent.
 	runs *runRegistry
 
-	modelsMu     sync.Mutex
-	modelsList   []llm.ModelInfo
-	modelsSource string
-	modelsWarn   string
-	modelsAt     time.Time
+	modelsMu    sync.Mutex
+	modelsCache map[string]modelCacheEntry
+}
+
+// modelCacheEntry is the per-provider model catalog cache. Providers can be
+// switched without a restart, so a single global list is not enough.
+type modelCacheEntry struct {
+	models    []llm.ModelInfo
+	source    string
+	warning   string
+	fetchedAt time.Time
 }
 
 func New(cfg *config.Manager, st *store.Store, web fs.FS) *Server {
-	return &Server{cfg: cfg, store: st, web: web, runs: newRunRegistry()}
+	s := &Server{
+		cfg:         cfg,
+		store:       st,
+		web:         web,
+		runs:        newRunRegistry(),
+		modelsCache: map[string]modelCacheEntry{},
+	}
+	s.seedProviders()
+	return s
 }
 
 // Handler builds the complete HTTP handler.
@@ -61,6 +75,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
 	mux.HandleFunc("GET /api/models", s.handleListModels)
+
+	mux.HandleFunc("GET /api/providers", s.handleListProviders)
+	mux.HandleFunc("POST /api/providers", s.handleCreateProvider)
+	mux.HandleFunc("POST /api/providers/test", s.handleTestProvider)
+	mux.HandleFunc("PUT /api/providers/{id}", s.handleUpdateProvider)
+	mux.HandleFunc("DELETE /api/providers/{id}", s.handleDeleteProvider)
 
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
@@ -242,6 +262,9 @@ func maskAPIKey(key string) string {
 func (s *Server) publicConfig() map[string]any {
 	cfg := s.cfg.Get()
 	set := cfg.Providers.OpenRouter.APIKey != ""
+	if p, err := s.activeProvider(); err == nil {
+		set = p.APIKey != ""
+	}
 	cfg.Providers.OpenRouter.APIKey = maskAPIKey(cfg.Providers.OpenRouter.APIKey)
 	logPath, _ := config.LogPath(cfg)
 	return map[string]any{
@@ -254,47 +277,131 @@ func (s *Server) publicConfig() map[string]any {
 	}
 }
 
-// handleListModels proxies the provider's model catalog so the UI can use real
-// context-window sizes. It always succeeds, falling back to a built-in list.
+// handleListModels proxies the selected provider's model catalog so the UI can
+// use real context-window sizes. It always succeeds, falling back to a useful
+// list instead of failing the page.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	models, source, warning := s.modelCatalog(r.Context(), r.URL.Query().Get("refresh") == "1")
-	resp := map[string]any{"models": models, "source": source}
+	providerID := strings.TrimSpace(r.URL.Query().Get("provider_id"))
+	models, source, warning, resolved := s.modelCatalog(r.Context(), providerID, r.URL.Query().Get("refresh") == "1")
+	resp := map[string]any{"models": models, "source": source, "provider_id": resolved}
 	if warning != "" {
 		resp["warning"] = warning
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) modelCatalog(ctx context.Context, refresh bool) ([]llm.ModelInfo, string, string) {
+func (s *Server) modelCatalog(ctx context.Context, providerID string, refresh bool) ([]llm.ModelInfo, string, string, string) {
+	profile, err := s.providerByID(providerID)
+	if err != nil {
+		// Fall back to the built-in catalog when even provider resolution fails.
+		return llm.BuiltinModels(), "builtin", err.Error(), providerID
+	}
+	cacheKey := profile.ID
+	if cacheKey == "" {
+		cacheKey = "default"
+	}
+
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
-
-	ttl := modelsTTL
-	if s.modelsSource == "builtin" {
-		ttl = 2 * time.Minute
-	}
-	if !refresh && len(s.modelsList) > 0 && time.Since(s.modelsAt) < ttl {
-		return s.modelsList, s.modelsSource, s.modelsWarn
+	if s.modelsCache == nil {
+		s.modelsCache = map[string]modelCacheEntry{}
 	}
 
-	cfg := s.cfg.Get()
-	client := llm.New(cfg.Providers.OpenRouter.APIKey, cfg.Providers.OpenRouter.BaseURL)
-	models, err := client.FetchModels(ctx)
-	if err != nil {
-		if len(s.modelsList) == 0 || s.modelsSource != "builtin" {
-			logx.Warn("model catalog unavailable, using built-in list", "error", err)
+	if entry, ok := s.modelsCache[cacheKey]; ok {
+		ttl := modelsTTL
+		if entry.source == "builtin" {
+			ttl = 2 * time.Minute
 		}
-		s.modelsList = llm.BuiltinModels()
-		s.modelsSource = "builtin"
-		s.modelsWarn = err.Error()
-	} else {
-		logx.Debug("model catalog refreshed", "models", len(models))
-		s.modelsList = models
-		s.modelsSource = "openrouter"
-		s.modelsWarn = ""
+		if !refresh && time.Since(entry.fetchedAt) < ttl {
+			return entry.models, entry.source, entry.warning, profile.ID
+		}
 	}
-	s.modelsAt = time.Now()
-	return s.modelsList, s.modelsSource, s.modelsWarn
+
+	client, err := s.providerClient(profile)
+	if err != nil {
+		entry := modelCacheEntry{
+			models:    fallbackModels(profile),
+			source:    "builtin",
+			warning:   err.Error(),
+			fetchedAt: time.Now(),
+		}
+		s.modelsCache[cacheKey] = entry
+		return entry.models, entry.source, entry.warning, profile.ID
+	}
+	models, fetchErr := client.FetchModels(ctx)
+	if fetchErr != nil {
+		if existing, ok := s.modelsCache[cacheKey]; !ok || existing.source != "builtin" {
+			logx.Warn("model catalog unavailable, using fallback list",
+				"provider", profile.ID, "base_url", profile.BaseURL, "error", fetchErr)
+		}
+		entry := modelCacheEntry{
+			models:    fallbackModels(profile),
+			source:    "builtin",
+			warning:   fetchErr.Error(),
+			fetchedAt: time.Now(),
+		}
+		s.modelsCache[cacheKey] = entry
+		return entry.models, entry.source, entry.warning, profile.ID
+	}
+	logx.Debug("model catalog refreshed", "provider", profile.ID, "models", len(models))
+	entry := modelCacheEntry{models: models, source: profile.ID, fetchedAt: time.Now()}
+	if entry.source == "" {
+		entry.source = "provider"
+	}
+	s.modelsCache[cacheKey] = entry
+	return entry.models, entry.source, entry.warning, profile.ID
+}
+
+// fallbackModels keeps local providers usable when /models is unavailable.
+// OpenRouter keeps the shipped built-in list; other providers expose their
+// configured default model (the model input remains free-text).
+func fallbackModels(p store.ProviderProfile) []llm.ModelInfo {
+	if strings.EqualFold(p.ID, "openrouter") || strings.Contains(strings.ToLower(p.BaseURL), "openrouter.ai") {
+		return llm.BuiltinModels()
+	}
+	if model := strings.TrimSpace(p.DefaultModel); model != "" {
+		return []llm.ModelInfo{{ID: model, Name: model}}
+	}
+	return []llm.ModelInfo{}
+}
+
+func (s *Server) providerByID(id string) (store.ProviderProfile, error) {
+	if strings.TrimSpace(id) != "" {
+		p, err := s.store.GetProvider(strings.TrimSpace(id))
+		if err == nil {
+			return p, nil
+		}
+		return s.activeProvider()
+	}
+	return s.activeProvider()
+}
+
+// modelContextLength uses the cached catalog for the active provider when
+// available, then falls back to the built-in OpenRouter-style table.
+func (s *Server) modelContextLength(providerID, model string) int {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return 0
+	}
+	if providerID != "" {
+		s.modelsMu.Lock()
+		entry, ok := s.modelsCache[providerID]
+		s.modelsMu.Unlock()
+		if ok {
+			for _, m := range entry.models {
+				if strings.EqualFold(m.ID, model) {
+					return m.ContextLength
+				}
+			}
+		}
+	}
+	return llm.BuiltinContextLength(model)
+}
+
+func (s *Server) invalidateModels() {
+	s.modelsMu.Lock()
+	s.modelsCache = map[string]modelCacheEntry{}
+	s.modelsMu.Unlock()
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -329,10 +436,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	logx.ApplyLLM(next.Server.DebugLLM)
 	if current.Providers.OpenRouter.BaseURL != next.Providers.OpenRouter.BaseURL ||
 		current.Providers.OpenRouter.APIKey != next.Providers.OpenRouter.APIKey {
-		s.modelsMu.Lock()
-		s.modelsList = nil
-		s.modelsAt = time.Time{}
-		s.modelsMu.Unlock()
+		s.invalidateModels()
 	}
 	logx.Info("configuration updated", "debug", logx.DebugEnabled(), "model", next.Defaults.Model)
 	writeJSON(w, http.StatusOK, s.publicConfig())
@@ -603,9 +707,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Title string `json:"title"`
-		Model string `json:"model"`
-		Mode  string `json:"mode"`
+		Title      string `json:"title"`
+		Model      string `json:"model"`
+		Mode       string `json:"mode"`
+		ProviderID string `json:"provider_id"`
 	}
 	if r.ContentLength != 0 {
 		if err := decodeJSON(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
@@ -613,7 +718,26 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	body.ProviderID = strings.TrimSpace(body.ProviderID)
+	var provider store.ProviderProfile
+	var providerErr error
+	if body.ProviderID != "" {
+		provider, providerErr = s.store.GetProvider(body.ProviderID)
+		if errors.Is(providerErr, store.ErrNotFound) {
+			apiError(w, http.StatusBadRequest, "provider not found")
+			return
+		}
+	} else {
+		provider, providerErr = s.activeProvider()
+	}
+	if providerErr != nil {
+		apiError(w, http.StatusBadRequest, providerErr.Error())
+		return
+	}
 	cfg := s.cfg.Get()
+	if strings.TrimSpace(body.Model) == "" {
+		body.Model = s.defaultModelFor(provider)
+	}
 	if strings.TrimSpace(body.Model) == "" {
 		body.Model = cfg.Defaults.Model
 	}
@@ -624,6 +748,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if body.ProviderID != "" {
+		if pinned, err := s.store.SetSessionProvider(session.ID, body.ProviderID); err == nil {
+			session = pinned
+		} else {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	_ = s.store.TouchProject(project.ID)
 	writeJSON(w, http.StatusCreated, map[string]any{"session": session})
@@ -707,14 +839,28 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Title  *string `json:"title"`
-		Model  *string `json:"model"`
-		Mode   *string `json:"mode"`
-		IsOpen *bool   `json:"is_open"`
+		Title      *string `json:"title"`
+		Model      *string `json:"model"`
+		Mode       *string `json:"mode"`
+		IsOpen     *bool   `json:"is_open"`
+		ProviderID *string `json:"provider_id"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		apiError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if body.ProviderID != nil {
+		id := strings.TrimSpace(*body.ProviderID)
+		body.ProviderID = &id
+		if id != "" {
+			if _, err := s.store.GetProvider(id); errors.Is(err, store.ErrNotFound) {
+				apiError(w, http.StatusBadRequest, "provider not found")
+				return
+			} else if err != nil {
+				apiError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 	}
 	if body.Title != nil && strings.TrimSpace(*body.Title) == "" {
 		apiError(w, http.StatusBadRequest, "title cannot be empty")
@@ -747,6 +893,17 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		apiError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if body.ProviderID != nil {
+		if updated, err := s.store.SetSessionProvider(id, *body.ProviderID); err == nil {
+			session = updated
+		} else if errors.Is(err, store.ErrNotFound) {
+			apiError(w, http.StatusBadRequest, "provider not found")
+			return
+		} else {
+			apiError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session": session})
 }

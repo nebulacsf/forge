@@ -1,13 +1,16 @@
 # Forge
 
 Forge is a local, single-binary AI coding agent harness. It serves an embedded
-web UI, keeps all state in local SQLite, and talks to OpenRouter over SSE. No
-CGO, no Node build step, no external runtime dependencies.
+web UI, keeps all state in local SQLite, and talks to any OpenAI-compatible
+provider over SSE — OpenRouter, Ollama, LM Studio, vLLM, Groq, DeepSeek,
+OpenCode Go, or a custom gateway. No CGO, no Node build step, no external
+runtime dependencies.
 
 ## Requirements
 
 - Go 1.23+ to build
-- An OpenRouter API key
+- An API key for a hosted provider, or a local OpenAI-compatible endpoint
+  (Ollama and LM Studio usually need no key)
 
 ## Build & run
 
@@ -33,7 +36,7 @@ Configured host/port are used when the flags are omitted.
 | Path | Purpose |
 | --- | --- |
 | `${FORGE_HOME:-~/.forge}/config.json` | Configuration (created on first run) |
-| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists, clarifying questions, repo outline, symbol index) |
+| `${FORGE_HOME:-~/.forge}/forge.db` | SQLite database (projects, sessions, messages, checklists, clarifying questions, repo outline, symbol index, provider profiles) |
 | `${FORGE_HOME:-~/.forge}/forge.log` | Application log (rotated to `forge.log.1` at 10 MB) |
 
 Both the directory (0700) and the files are created automatically. `FORGE_HOME`
@@ -45,9 +48,15 @@ An existing `forge.db` from an incompatible schema is moved aside to
 ## First steps
 
 1. Start Forge and open the UI.
-2. Click the gear (bottom of the project rail) and paste your OpenRouter API key.
-3. Click **+** to register a local project directory.
-4. Pick **PLAN** or **BUILD** and start chatting.
+2. Click the gear (bottom of the project rail) → **LLM providers**.
+3. Pick a preset (**OpenRouter**, **Ollama Local**, **LM Studio**, or **Custom**),
+   fill in the base URL/key if needed, and click **Test connection**.
+4. Click **+** to register a local project directory.
+5. Pick **PLAN** or **BUILD** and start chatting.
+
+The active provider is global; each chat can also pin its own provider from the
+header selector. Model names can be overridden per chat too. Both take effect on
+the next turn without restarting Forge.
 
 Sessions are stored per project; open tabs are restored after a reload.
 
@@ -240,9 +249,41 @@ system shortcuts.
 }
 ```
 
-`base_url` can point at any OpenAI-compatible streaming endpoint, which is how
-the test suite and local mocks are wired up. `log_file` defaults to
-`<forge home>/forge.log`; set it to an absolute path to move the log.
+`log_file` defaults to `<forge home>/forge.log`; set it to an absolute path to
+move the log.
+
+The `providers.openrouter` block is kept for backwards compatibility. On first
+startup with an empty database, Forge seeds it as the active `openrouter`
+provider profile (`OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` environment
+variables win when present). After that, provider profiles live in SQLite and
+are managed from **Settings → LLM providers**; the legacy config block is only a
+fallback when no profile exists.
+
+## LLM providers
+
+Forge ships one generic driver, `openai_compatible`, so any endpoint that speaks
+the OpenAI chat-completions protocol works without a provider-specific
+connector. A profile stores:
+
+| Field | Meaning |
+| --- | --- |
+| `id` / `name` | Stable slug and display name |
+| `driver` | `openai_compatible` (the only shipped driver) |
+| `base_url` | Endpoint prefix, e.g. `https://openrouter.ai/api/v1` or `http://localhost:11434/v1` |
+| `api_key` | Optional; `Authorization` is omitted when empty |
+| `default_model` | Model used for new chats on that provider |
+| `extra_headers` | Optional per-provider headers, e.g. OpenRouter `HTTP-Referer` / `X-Title` |
+| `is_active` | The global default provider |
+
+Base URLs are normalised: trailing slashes and a trailing `/chat/completions` or
+`/models` are accepted. Chat requests use SSE with native `tools`, `tool_choice`
+and streaming `tool_calls`; token `usage` is parsed when present and treated as
+zero when a local endpoint omits it. If an endpoint rejects
+`stream_options.include_usage`, Forge retries once without it automatically.
+
+Providers are stored in SQLite (plain text, alongside `forge.db`, which is
+created with mode `0600`). API keys are never returned by the API; the UI only
+sees a masked hint and `__KEEP__` preserves the stored secret on update.
 
 ## Logging
 
@@ -290,17 +331,20 @@ win over the config file like `--debug` does.
 
 ## Model context windows
 
-`GET /api/models` proxies the provider's model catalog and caches it for six
-hours. The UI uses the real `context_length` for the context-window gauge and
-the model picker labels, so switching models updates the denominator
-immediately. If the provider catalog is unreachable, Forge falls back to a
-built-in table and a heuristic (and keeps working offline).
+`GET /api/models?provider_id=…` proxies the selected provider's model catalog
+and caches it per provider for six hours. The UI uses the real `context_length`
+for the context-window gauge and the model picker labels, so switching providers
+or models updates the denominator immediately. If the catalog is unreachable,
+OpenRouter falls back to the built-in table; other providers fall back to their
+configured default model. The model field stays free-text so local models that
+are not listed can still be used.
 
 ## Billing and prompt cache
 
-The final charge is whatever OpenRouter reports in `usage.cost` for each
-request; Forge accumulates it into **session cost** and **project cost**. The
-token counters are informational:
+The final charge is whatever the provider reports in `usage.cost` for each
+request (OpenRouter does; most local providers omit it, so the cost stays zero).
+Forge accumulates it into **session cost** and **project cost**. The token
+counters are informational:
 
 - **input (session)** is the sum of `prompt_tokens` over every request. Each
   tool round re-sends the whole conversation, so this total grows quickly.
@@ -323,12 +367,15 @@ can reduce the hit rate.
 | Method & path | Purpose |
 | --- | --- |
 | `GET /api/health` | Liveness probe |
-| `GET/PUT /api/config` | Read/update config (API key is masked on read) |
-| `GET /api/models` | Provider model catalog with real context lengths (`?refresh=1` bypasses the cache) |
+| `GET/PUT /api/config` | Read/update config (legacy API key is masked on read) |
+| `GET /api/models` | Model catalog for the active or `?provider_id=` provider (`?refresh=1` bypasses the cache) |
+| `GET/POST /api/providers` | List (keys masked)/create provider profiles |
+| `PUT/DELETE /api/providers/{id}` | Update/delete a profile; `is_active` switches the global default |
+| `POST /api/providers/test` | Validate connectivity and list `/models` when supported |
 | `GET/POST /api/projects` | List/register projects |
 | `PATCH/DELETE /api/projects/{id}` | Rename/recolor/move a project, or delete it with its chats |
 | `GET/POST /api/projects/{id}/sessions` | List (`?all=1` includes closed)/create sessions |
-| `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/close; includes `question_batches` |
+| `GET/PATCH/DELETE /api/sessions/{id}` | Session detail/rename/mode/model/provider/close; includes `question_batches` |
 | `POST /api/sessions/{id}/compact` | Summarize the transcript and keep the last exchange |
 | `GET /api/sessions/{id}/questions` | List question batches and their answers |
 | `POST /api/sessions/{id}/questions/{qid}/answers` | Answer a question batch; returns the batch and the canonical user summary |
@@ -339,7 +386,9 @@ can reduce the hit rate.
 
 Forge has no authentication and can read and write the registered project
 directories. It binds to `127.0.0.1` by default and prints a warning if you bind
-it to a non-loopback address; only do that on a trusted network.
+it to a non-loopback address; only do that on a trusted network. Provider API
+keys are stored in plain text in `forge.db` (mode `0600`) and are never included
+in logs or API responses.
 
 ## Tests
 
@@ -347,5 +396,5 @@ it to a non-loopback address; only do that on a trusted network.
 make test
 ```
 
-Tests run against `FORGE_HOME` temp directories and a mock SSE server, so they
-never touch your real `~/.forge` or call OpenRouter.
+Tests run against `FORGE_HOME` temp directories and mock SSE servers, so they
+never touch your real `~/.forge` or call a live provider.

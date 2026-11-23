@@ -32,11 +32,14 @@ type Project struct {
 }
 
 type Session struct {
-	ID           int64   `json:"id"`
-	ProjectID    int64   `json:"project_id"`
-	Title        string  `json:"title"`
-	Model        string  `json:"model"`
-	Mode         string  `json:"mode"`
+	ID        int64  `json:"id"`
+	ProjectID int64  `json:"project_id"`
+	Title     string `json:"title"`
+	Model     string `json:"model"`
+	Mode      string `json:"mode"`
+	// ProviderID pins a session to one configured provider. Empty means the
+	// session follows the globally active provider.
+	ProviderID   string  `json:"provider_id"`
 	TokensIn     int64   `json:"tokens_in"`
 	TokensOut    int64   `json:"tokens_out"`
 	CachedTokens int64   `json:"cached_tokens"`
@@ -368,6 +371,18 @@ CREATE TABLE IF NOT EXISTS project_symbol_files (
 	PRIMARY KEY (project_id, file_path)
 );
 
+CREATE TABLE IF NOT EXISTS llm_providers (
+	id                 TEXT PRIMARY KEY,
+	name               TEXT NOT NULL,
+	driver             TEXT NOT NULL DEFAULT 'openai_compatible',
+	base_url           TEXT NOT NULL,
+	api_key            TEXT NOT NULL DEFAULT '',
+	default_model      TEXT NOT NULL DEFAULT '',
+	extra_headers_json TEXT NOT NULL DEFAULT '{}',
+	is_active          INTEGER NOT NULL DEFAULT 0,
+	created_at         TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS project_symbols (
 	project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
 	file_path      TEXT NOT NULL,
@@ -388,6 +403,7 @@ CREATE INDEX IF NOT EXISTS idx_questions_batch ON questions(batch_id, position, 
 CREATE INDEX IF NOT EXISTS idx_question_options_question ON question_options(question_id, position, id);
 CREATE INDEX IF NOT EXISTS idx_project_symbols_name ON project_symbols(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_project_symbols_kind ON project_symbols(project_id, kind, name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_providers_active ON llm_providers(is_active) WHERE is_active = 1;
 `
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("initialize schema: %w", err)
@@ -401,6 +417,11 @@ CREATE INDEX IF NOT EXISTS idx_project_symbols_kind ON project_symbols(project_i
 		return err
 	}
 	if err := ensureColumn(db, "messages", "duration_ms", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Provider selection is additive: existing sessions follow the active
+	// provider until the user pins one.
+	if err := ensureColumn(db, "sessions", "provider_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil
@@ -622,7 +643,7 @@ func (s *Store) CreateSession(projectID int64, title, model, mode string) (Sessi
 }
 
 func (s *Store) ListSessions(projectID int64, openOnly bool) ([]Session, error) {
-	query := `SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
+	query := `SELECT id, project_id, title, model, mode, provider_id, tokens_in, tokens_out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
 		FROM sessions WHERE project_id = ?`
 	if openOnly {
 		query += ` AND is_open = 1`
@@ -645,7 +666,7 @@ func (s *Store) ListSessions(projectID int64, openOnly bool) ([]Session, error) 
 }
 
 func (s *Store) GetSession(id int64) (Session, error) {
-	row := s.db.QueryRow(`SELECT id, project_id, title, model, mode, tokens_in, tokens_out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
+	row := s.db.QueryRow(`SELECT id, project_id, title, model, mode, provider_id, tokens_in, tokens_out, cached_tokens, cost_usd, duration_ms, is_open, updated_at
 		FROM sessions WHERE id = ?`, id)
 	sess, err := scanSession(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -663,7 +684,7 @@ func scanSession(r rowScanner) (Session, error) {
 		sess   Session
 		isOpen int
 	)
-	if err := r.Scan(&sess.ID, &sess.ProjectID, &sess.Title, &sess.Model, &sess.Mode,
+	if err := r.Scan(&sess.ID, &sess.ProjectID, &sess.Title, &sess.Model, &sess.Mode, &sess.ProviderID,
 		&sess.TokensIn, &sess.TokensOut, &sess.CachedTokens, &sess.CostUSD, &sess.DurationMS, &isOpen, &sess.UpdatedAt); err != nil {
 		return Session{}, err
 	}
@@ -706,6 +727,26 @@ func (s *Store) UpdateSession(id int64, title, model, mode *string, isOpen *bool
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		return Session{}, ErrNotFound
+	}
+	return s.GetSession(id)
+}
+
+// SetSessionProvider pins a session to a provider. An empty id clears the
+// override so the session follows the globally active provider again.
+func (s *Store) SetSessionProvider(id int64, providerID string) (Session, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID != "" {
+		if _, err := s.GetProvider(providerID); err != nil {
+			return Session{}, err
+		}
+	}
+	res, err := s.db.Exec(`UPDATE sessions SET provider_id = ?, updated_at = ? WHERE id = ?`,
+		providerID, now(), id)
+	if err != nil {
+		return Session{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
 		return Session{}, ErrNotFound
 	}
 	return s.GetSession(id)
