@@ -153,7 +153,8 @@ func Specs(mode string) []llm.Tool {
 				Name: "read_file",
 				Description: "Read a bounded window of a UTF-8 text file inside the project. " +
 					"start_line and end_line are REQUIRED and at most 200 lines are returned. " +
-					"Before reading, locate the target with the repository outline or grep_search; never read blindly. " +
+					"Before reading, locate the target with symbol_lookup when you know the declaration name, " +
+					"otherwise the repository outline or grep_search; never read blindly. " +
 					"Every returned line is prefixed with its real 1-based line number.",
 				Parameters: objectSchema(map[string]any{
 					"path":       stringProp("Path relative to the project root."),

@@ -735,6 +735,11 @@ func TestCompactSession(t *testing.T) {
 			Role    string `json:"role"`
 			Content string `json:"content"`
 		} `json:"messages"`
+		Compactions []struct {
+			StartMessageID int64  `json:"start_message_id"`
+			Summary        string `json:"summary"`
+			Removed        int    `json:"removed"`
+		} `json:"compactions"`
 		Removed int    `json:"removed"`
 		Summary string `json:"summary"`
 	}
@@ -744,17 +749,41 @@ func TestCompactSession(t *testing.T) {
 	if payload.Removed != 4 {
 		t.Errorf("removed = %d, want 4", payload.Removed)
 	}
-	if len(payload.Messages) != 3 {
-		t.Fatalf("messages = %d, want 3 (summary + kept pair)", len(payload.Messages))
+	// The transcript is never rewritten: the UI keeps every message.
+	if len(payload.Messages) != 6 {
+		t.Fatalf("messages = %d, want the full transcript of 6", len(payload.Messages))
 	}
-	if payload.Messages[0].Role != "assistant" || !strings.HasPrefix(payload.Messages[0].Content, "Conversation summary") {
-		t.Errorf("first message is not the summary: %+v", payload.Messages[0])
+	if payload.Messages[0].Content != "First question" || payload.Messages[5].Content != "Latest answer" {
+		t.Errorf("history was modified: %+v", payload.Messages)
 	}
-	if payload.Messages[1].Content != "Latest question" || payload.Messages[2].Content != "Latest answer" {
-		t.Errorf("kept exchange wrong: %+v", payload.Messages[1:])
+	if len(payload.Compactions) != 1 {
+		t.Fatalf("compactions = %d, want 1", len(payload.Compactions))
+	}
+	if payload.Compactions[0].Removed != 4 {
+		t.Errorf("compaction removed = %d, want 4", payload.Compactions[0].Removed)
+	}
+	if !strings.Contains(payload.Compactions[0].Summary, "health endpoint") {
+		t.Errorf("compaction summary missing: %q", payload.Compactions[0].Summary)
 	}
 	if !strings.Contains(payload.Summary, "health endpoint") {
 		t.Errorf("summary content missing: %q", payload.Summary)
+	}
+	// Only the context sent to the model shrinks: summary + kept pair.
+	context, err := st.ContextMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(context) != 3 {
+		t.Fatalf("context messages = %d, want 3 (summary + kept pair)", len(context))
+	}
+	if !strings.HasPrefix(context[0].Content, "Conversation summary") {
+		t.Errorf("context does not start with the summary: %+v", context[0])
+	}
+	if context[1].Content != "Latest question" || context[2].Content != "Latest answer" {
+		t.Errorf("kept exchange wrong: %+v", context[1:])
+	}
+	if payload.Compactions[0].StartMessageID != context[1].ID {
+		t.Errorf("start_message_id = %d, want %d", payload.Compactions[0].StartMessageID, context[1].ID)
 	}
 	final, err := st.GetSession(session.ID)
 	if err != nil {
@@ -763,11 +792,92 @@ func TestCompactSession(t *testing.T) {
 	if final.TokensIn != 500 || final.TokensOut != 60 {
 		t.Errorf("compact usage not recorded: %+v", final)
 	}
-	if saw, _ := st.ListMessages(session.ID); len(saw) != 3 {
-		t.Errorf("stored messages = %d, want 3", len(saw))
+	if saw, _ := st.ListMessages(session.ID); len(saw) != 6 {
+		t.Errorf("stored messages = %d, want 6 (compaction must not delete)", len(saw))
 	}
 	if mock.sawTools.Load() {
 		t.Error("compaction request should not expose tools")
+	}
+}
+
+// TestCompactSessionKeepsHistoryAcrossCompactions checks that compacting twice
+// moves the context boundary forward while the transcript keeps growing and both
+// summaries stay recorded.
+func TestCompactSessionKeepsHistoryAcrossCompactions(t *testing.T) {
+	cfg, st, _ := modelsFixture(t)
+	upstream := httptest.NewServer(&summaryMock{})
+	defer upstream.Close()
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = upstream.URL
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	project, err := st.CreateProject("CompactTwice", t.TempDir(), "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", "BUILD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(pairs ...[2]string) {
+		for _, p := range pairs {
+			if _, err := st.AddMessage(session.ID, p[0], "", p[1], ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	add([2]string{"user", "First question"}, [2]string{"assistant", "First answer"},
+		[2]string{"user", "Second question"}, [2]string{"assistant", "Second answer"})
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+	url := app.URL + "/api/sessions/" + strconv.FormatInt(session.ID, 10) + "/compact"
+
+	post := func() {
+		resp, err := http.Post(url, "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status %d: %s", resp.StatusCode, body)
+		}
+	}
+	post()
+	add([2]string{"user", "Third question"}, [2]string{"assistant", "Third answer"})
+	post()
+
+	stored, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 6 {
+		t.Fatalf("stored messages = %d, want 6 untouched", len(stored))
+	}
+	compactions, err := st.ListCompactions(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compactions) != 2 {
+		t.Fatalf("compactions = %d, want 2", len(compactions))
+	}
+	context, err := st.ContextMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(context) != 3 {
+		t.Fatalf("context messages = %d, want 3", len(context))
+	}
+	if context[1].Content != "Third question" || context[2].Content != "Third answer" {
+		t.Errorf("context tail wrong: %+v", context[1:])
+	}
+	if compactions[1].StartMessageID != context[1].ID {
+		t.Errorf("second boundary = %d, want %d", compactions[1].StartMessageID, context[1].ID)
+	}
+	if compactions[1].StartMessageID <= compactions[0].StartMessageID {
+		t.Errorf("boundary did not move forward: %+v", compactions)
 	}
 }
 
@@ -1326,6 +1436,7 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 	for _, want := range []string{
 		"## Diagnosis & Approach",
 		"## Key Decisions",
+		"## Assumptions (optional)",
 		"## Implementation Plan",
 		"Ready to implement — switch to BUILD to apply this plan.",
 		"ask_user",
@@ -1341,7 +1452,7 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 			t.Errorf("PLAN system prompt missing %q", want)
 		}
 	}
-	for _, unwanted := range []string{"## Open Questions", "at most 7 one-line items", "BUILD final message", "## Decisions & assumptions", "## Findings"} {
+	for _, unwanted := range []string{"## Open Questions", "at most 7 one-line items", "BUILD final message", "## Decisions & assumptions", "## Findings", "Definition of done (BUILD)"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Errorf("PLAN system prompt still contains %q", unwanted)
 		}
@@ -1365,9 +1476,64 @@ func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
 	if !strings.Contains(prompt, "blockers, partial progress, or next steps") {
 		t.Error("BUILD system prompt missing 'next steps' guidance")
 	}
-	for _, unwanted := range []string{"## Diagnosis & Approach", "## Key Decisions", "## Implementation Plan", "## Open Questions"} {
+	for _, want := range []string{
+		"Definition of done (BUILD)",
+		"git_diff",
+		"Scope discipline (BUILD)",
+		"Exploration budget in BUILD",
+		"Safety rails (both modes)",
+		"Failure protocol (both modes)",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("BUILD system prompt missing %q", want)
+		}
+	}
+	if strings.Contains(prompt, "Never perform more than 2 consecutive read/search rounds") {
+		t.Error("BUILD system prompt still carries the absolute anti-loop rule")
+	}
+	for _, unwanted := range []string{"## Diagnosis & Approach", "## Key Decisions", "## Implementation Plan", "## Assumptions (optional)", "## Open Questions"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Errorf("BUILD system prompt must not require the detailed PLAN section %q", unwanted)
+		}
+	}
+}
+
+// TestBuildSystemPromptSharedRulesMatchBothModes pins the rules that must never
+// drift between modes: the language contract, the answer channel, the safety
+// rails and the failure protocol are transversal, so a rewrite of one branch
+// cannot silently drop them from the other.
+func TestBuildSystemPromptSharedRulesMatchBothModes(t *testing.T) {
+	project := store.Project{Name: "demo", Path: "/tmp/demo"}
+	build := func(mode string) string {
+		return buildSystemPrompt(promptOptions{
+			project: project, session: store.Session{Mode: mode},
+			segmentSize: 12, turnLimit: 96, planRounds: 8, planToolCalls: 24,
+		})
+	}
+	shared := []string{
+		"- LANGUAGE: respond in the language the user is speaking",
+		"- CHANNEL: the user only sees your final message",
+		"Safety rails (both modes)",
+		"Failure protocol (both modes)",
+		"git push --force",
+		"Never print or persist secrets",
+	}
+	for _, mode := range []string{"PLAN", "BUILD"} {
+		prompt := build(mode)
+		for _, want := range shared {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("%s system prompt missing shared rule %q", mode, want)
+			}
+		}
+	}
+	// The channel rule must be stated exactly once per prompt: duplicating it in
+	// the mode branch is how the previous drift started.
+	for _, mode := range []string{"PLAN", "BUILD"} {
+		if n := strings.Count(build(mode), "- CHANNEL:"); n != 1 {
+			t.Errorf("%s system prompt states the channel rule %d times, want 1", mode, n)
+		}
+		if n := strings.Count(build(mode), "respond in the language the user is speaking"); n != 1 {
+			t.Errorf("%s system prompt states the language rule %d times, want 1", mode, n)
 		}
 	}
 }
@@ -1381,6 +1547,7 @@ func TestBuildFinalPlanNoteRequestsDetailedPlan(t *testing.T) {
 		"FINAL ANSWER REQUIRED",
 		"## Diagnosis & Approach",
 		"## Key Decisions",
+		"## Assumptions",
 		"## Implementation Plan",
 		"Ready to implement — switch to BUILD to apply this plan.",
 		"Do not add an \"Open Questions\" section",

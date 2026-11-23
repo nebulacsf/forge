@@ -381,7 +381,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			}
 
 			checklist, _ := s.store.ListChecklist(session.ID)
-			rows, err := s.store.ListMessages(session.ID)
+			rows, err := s.store.ContextMessages(session.ID)
 			if err != nil {
 				stream.fail("Could not load conversation: " + err.Error())
 				saveTurnTiming()
@@ -987,15 +987,13 @@ func buildSystemPrompt(opts promptOptions) string {
 	fmt.Fprintf(&b, "Mode: %s\n", session.Mode)
 	if session.Mode == "PLAN" {
 		b.WriteString("PLAN mode is READ-ONLY. You may inspect files, search, list directories, run git diff, update the checklist, and ask the user clarifying questions. You cannot write files or run shell commands.\n")
-		b.WriteString("Respond in the language the user is speaking (IMPORTANT). All code and technical content must be in English.\n")
-		b.WriteString("Adapt your response to the conversation: discuss trade-offs and findings naturally during exploration, and output a structured implementation plan only when ready for execution. Always put your response in normal content, never only in reasoning. Never claim that files were changed or commands were run in PLAN mode.\n")
+		b.WriteString("Adapt your response to the conversation: discuss trade-offs and findings naturally during exploration, and output a structured implementation plan only when ready for execution. Never claim that files were changed or commands were run in PLAN mode.\n")
 		b.WriteString("Call ask_user when a design, engineering, or data decision is ambiguous or missing, and the user can clarify it—especially when guessing would risk wrong architecture, breaking contracts, or misinterpreting data/schemas. Present concise options plus a custom answer when helpful, and end the turn so the user can respond. Do not call ask_user for implementation details you can resolve from the codebase or decide autonomously, nor for cosmetic preferences.\n")
 		b.WriteString("If the latest user message begins with \"Answers to your questions:\", the user has resolved your questions: continue from those answers without repeating the questions or redoing completed research.\n")
 	} else {
-		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them. Action-first rule in BUILD: When a plan already exists in the conversation, do NOT re-explore the codebase. Read only the exact line ranges cited in the plan, apply patch_file/write_file within your first 1–2 rounds, and verify immediately.\n")
-		b.WriteString("Anti-loop rule: Never perform more than 2 consecutive read/search rounds without making an edit or running a verification command.\n")
+		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them. Action-first rule in BUILD: when a plan already exists in the conversation, do not re-explore the codebase. Read only the exact line ranges cited in the plan, apply patch_file/write_file within your first 1–2 rounds, and verify immediately.\n")
+		b.WriteString("Exploration budget in BUILD: explore only as far as the next edit requires. After 3 consecutive read/search rounds without an edit or a verification command, either make the edit or state in one line which fact you still need and why it blocks the change. Do not keep re-reading the same area with different arguments.\n")
 		b.WriteString("Use ask_user only when you are genuinely blocked by a decision only the user can make; do not ask for cosmetic preferences.\n")
-		b.WriteString("Respond in the language the user is speaking (IMPORTANT). Implement changes in English by default unless the user specifies otherwise.\n")
 	}
 	if block := strings.TrimSpace(opts.instructions); block != "" {
 		b.WriteString("\n")
@@ -1029,7 +1027,7 @@ Step budget:
 	}
 	b.WriteString(`
 Operating rules:
-- Initialize or update the checklist with update_checklist in your first batch alongside your initial file reads: add the task with action=add (or action=set for a multi-step plan). Keep the list current as you work (IMPORTANT).
+- Checklist: in BUILD, initialize it with update_checklist in your first batch alongside your initial reads (action=add for one task, action=set for a multi-step plan) and keep it current as you work (IMPORTANT). In PLAN, use it only when the change spans 3 or more files, because every call spends research budget.
 - SYMBOL-FIRST & EXPLORATION ORDER (strict): Always follow this hierarchy and never read or guess file contents blindly: (1) symbol_lookup first whenever you know or can guess a function, method, struct, class, or variable name — it returns the exact file and line range in one call; (2) the compact Repository outline in the current-state message for project structure and breadth; (3) list_directory; (4) grep_search last, strictly for free text, error strings, config keys, or regular expressions. If symbol_lookup returns no match, fall back to grep_search once and move on.
 - read_file requires explicit start_line and end_line and returns at most 200 lines. Choose the narrowest window around the symbol you need; use the continuation hint to page through larger sections. Requests over 200 lines are capped automatically.
 - Every read_file line is prefixed with its real line number (for example "142 | func Save() {"). Use those numbers to choose precise edit locations.
@@ -1044,9 +1042,25 @@ Operating rules:
 - Tool output and reasoning are rendered as collapsed accordions in the UI, so never repeat tool output in your answer.
 `)
 	b.WriteString(`
+Safety rails (both modes):
+- Never execute or recommend an irreversible or destructive operation unless the user explicitly asked for exactly that operation in this conversation: rm -rf, git reset --hard, git clean -fdx, git checkout -- ., git push --force, branch deletion, database drops or truncates, mass overwrites with no backup. Name the risk and ask first.
+- Never write to git history: no commit, push, tag, amend, rebase or stash unless the user explicitly requests it. Writing code is the task; publishing it is not.
+- Never add, remove or upgrade a dependency, or run a package manager that mutates the environment, without first stating why it is unavoidable and what it costs in build reproducibility.
+- Never print or persist secrets: API keys, tokens, passwords, .env contents. Do not echo them in commands, tool arguments, files or the answer. Refer to them by name only.
+- Never work around a failed safety check by using another tool to reach the same forbidden effect.
+`)
+	b.WriteString(`
+Failure protocol (both modes):
+- A failed patch_file with an ambiguous or missing search string means the anchor is stale: re-read the exact range and use a unique anchor. Do not degrade to write_file to force the change through; a full rewrite hides accidental deletions.
+- After two failed attempts with the same approach, change the approach or report the blocker with its real cause. Do not retry the identical call.
+- If a verification command fails, fix the cause. Never continue as if it had passed and never describe it as passing.
+- When information is genuinely missing and cannot be obtained with the allowed tools, say what is missing and proceed with the smallest defensible assumption, stated in one line.
+`)
+	b.WriteString(`
 Response style (strict):
+- LANGUAGE: respond in the language the user is speaking (IMPORTANT). If the user switches language mid-conversation, follow the switch. In PLAN, all code, identifiers and technical content must be in English. In BUILD, code, comments, identifiers and commit text are written in English unless the user explicitly asks for another language. The language of the project instructions never overrides the language of the user.
+- CHANNEL: the user only sees your final message, the one without tool calls. Write the whole answer there, in normal response content, never only in reasoning. Reasoning with no visible content is a failed turn: the user sees nothing.
 - Do not narrate tool use ("Now I will…", "Let me check…"); the UI already shows every call and result.
-- Only the final message (the one without tool calls) is written for the user.
 - No preamble, no praise, no restating code, no long explanations.
 `)
 	if session.Mode == "PLAN" {
@@ -1060,12 +1074,15 @@ A concise 2-4 sentence summary explaining the root problem or current limitation
 ## Key Decisions
 - Short, punchy bullet points explaining trade-offs, edge cases handled, and why existing patterns are reused or avoided.
 
+## Assumptions (optional)
+Include this section only when the plan rests on 2 or more assumptions. One line per bullet, at most 5 bullets, each stating the assumption and what changes if it is wrong.
+
 ## Implementation Plan
 Group changes strictly by file path (1-2 clear sentences per item describing what changes and why):
 - **path/to/file.go (lines X-Y)**: Description of the structural change or new functions.
 - **path/to/new_file.go (new)**: Description of the module's responsibility.
 
-Do not add an "Open Questions" section: ask blocking questions with ask_user before writing the plan, or state a short assumption inline if you cannot ask.
+Do not add an "Open Questions" section: ask blocking questions with ask_user before writing the plan, and record what you had to assume in the optional Assumptions section above. A single assumption stays as one inline sentence instead of a section.
 
 End the Actionable Implementation Plan with this exact line:
 Ready to implement — switch to BUILD to apply this plan.
@@ -1073,7 +1090,10 @@ Ready to implement — switch to BUILD to apply this plan.
 Rules for both modes: never repeat raw tool output or file dumps; never write vague summaries ("update the UI") — always cite exact files, symbols, and line ranges discovered.
 `)
 	} else {
-		b.WriteString("- BUILD final message: concise, factual summary (5-7 lines max) covering: (1) exact files created/modified and what changed; (2) verification run and its real outcome (never claim success if a test/build failed or was skipped); (3) any blockers, partial progress, or next steps. No headings, no unrequested code, no filler.\n")
+		b.WriteString(`- Definition of done (BUILD): before ending the turn, review the complete diff with git_diff, confirm that every requirement in the user request maps to a concrete change, remove debug output, commented-out experiments and leftover TODOs you introduced, and make sure the working tree contains no unrelated edits. Mark the checklist items you actually finished as done.
+- Scope discipline (BUILD): change only what the request requires. No opportunistic refactors, no repo-wide reformatting, no renames, no dependency bumps, no new abstractions. If a required change forces a broader edit, say so before making it. If you spot something worth fixing, name it in the final message instead of fixing it.
+- BUILD final message: concise, factual summary (5-7 lines max) covering: (1) exact files created/modified and what changed; (2) verification run and its real outcome (never claim success if a test/build failed or was skipped); (3) any blockers, partial progress, or next steps. No headings, no unrequested code, no filler.
+`)
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -1128,8 +1148,9 @@ func buildFinalPlanNote(reason string, planRounds, planToolCalls, usedRounds, us
 	b.WriteString(`Write the final answer now, in normal response content, with the full PLAN deliverable, structured for human architectural review:
 - "## Diagnosis & Approach": 2-4 sentences on the root problem and the high-level strategy.
 - "## Key Decisions": short bullets on trade-offs, edge cases, and patterns reused or avoided.
+- "## Assumptions" (optional): only when 2 or more assumptions remain. One line per bullet, at most 5.
 - "## Implementation Plan": items grouped strictly by file path, each 1-2 sentences on what changes and why, citing line numbers only as anchors, e.g. "- **path/to/file.go (lines X-Y)**: change." and "- **path/to/new_file.go (new)**: responsibility.".
-- Do not add an "Open Questions" section: tools are disabled here, so state any remaining assumption in one short line.
+- Do not add an "Open Questions" section: tools are disabled here, so record what you could not verify in the Assumptions section, or in one short line when there is only one.
 - Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
 No raw code blocks, no SQL queries, no verbose inline signatures, no raw tool output.
 Do not try to research further; if something is missing, state the assumption instead.`)
