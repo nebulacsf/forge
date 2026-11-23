@@ -78,6 +78,7 @@ function makeView(sessionId, projectId = 0) {
     turnSegment: 1,
     turnSegmentSize: 0,
     messageIndex: -1,
+    answerIndex: -1,
     sessionTimeBase: 0,
     turnBaseTime: 0,
     turnStartedAt: 0,
@@ -222,6 +223,7 @@ const VIEW_DEFAULTS = {
   checklist: () => [],
   questionBatches: () => [],
   messageIndex: -1,
+  answerIndex: -1,
   turnSegment: 1,
   turnTimerEl: null,
   abort: null,
@@ -232,6 +234,7 @@ for (const field of [
   'streaming', 'stopRequested', 'attached', 'finishedUnseen', 'abort', 'currentRound',
   'toolCards', 'sawCancelled', 'turnHadContent', 'turnHadError', 'turnReasoningOnly',
   'turnRound', 'turnLimit', 'turnSegment', 'turnSegmentSize', 'messageIndex',
+  'answerIndex',
   'sessionTimeBase', 'turnBaseTime', 'turnStartedAt', 'turnElapsedMs', 'turnClock',
   'turnTimerEl', 'checklist', 'files', 'questionBatches',
 ]) {
@@ -958,6 +961,7 @@ function renderSession(messages) {
   state.currentRound = null;
   state.toolCards = new Map();
   state.messageIndex = -1;
+  state.answerIndex = -1;
   if (view) view.renderedQuestions = new Set();
   container.innerHTML = '';
   let hasContent = false;
@@ -1411,6 +1415,8 @@ function makeRoundElement() {
     footer: el.querySelector('.round-footer'),
     reasoning: null,
     contentEl: null,
+    copyBtn: null,
+    jumpBtn: null,
     rawContent: '',
     thinking: null,
     timer: null,
@@ -1465,6 +1471,7 @@ async function runTurn({ content = '', isContinue = false, userText = content, a
     appendUserMessage(userText, attachments);
     if (viewIsActive(view)) hideEmpty();
     view.messageIndex = -1;
+    view.answerIndex = -1;
     maybeScroll(true);
   });
 
@@ -1662,6 +1669,7 @@ async function compactConversation() {
     state.currentRound = null;
     state.toolCards = new Map();
     state.messageIndex = -1;
+    state.answerIndex = -1;
     const view = currentView();
     if (view) view.compactions = Array.isArray(data.compactions) ? data.compactions : [];
     // The transcript is re-rendered in full: compaction only shrinks the
@@ -2059,19 +2067,31 @@ function ensureContentEl(round) {
     const anchor = round.questions || round.footer;
     if (anchor) round.main.insertBefore(round.contentEl, anchor);
     else round.main.appendChild(round.contentEl);
-    addRoundCopyButton(round);
+    addRoundFooterActions(round);
   }
   return round.contentEl;
 }
 
-// Assistant responses get a copy button in the round footer. The handler reads
+// Assistant responses get their footer actions once the markdown block exists:
+// copy plus a jump back to the top of the answer. A long turn can leave the
+// reader hundreds of lines below the final text, and that text is the point of
+// the answer, so both live next to the elapsed time. The copy handler reads
 // round.rawContent at click time so it always copies the latest text.
-function addRoundCopyButton(round) {
+function addRoundFooterActions(round) {
   if (!round || round.copyBtn || !round.contentEl) return;
-  const btn = makeCopyButton('round-copy', 'Copy response', (b) => copyToClipboard(round.rawContent, b));
-  if (round.footer) round.footer.insertBefore(btn, round.footer.firstChild);
-  else round.main.appendChild(btn);
-  round.copyBtn = btn;
+  const copyBtn = makeCopyButton('round-copy', 'Copy response', (b) => copyToClipboard(round.rawContent, b));
+  const jumpBtn = makeFooterAction('round-jump', 'Go to the start of this answer', 'bi-arrow-up-circle', () => {
+    scrollToAnswerStart(round.contentEl);
+  });
+  if (round.footer) {
+    round.footer.insertBefore(jumpBtn, round.footer.firstChild);
+    round.footer.insertBefore(copyBtn, round.footer.firstChild);
+  } else {
+    round.main.appendChild(copyBtn);
+    round.main.appendChild(jumpBtn);
+  }
+  round.copyBtn = copyBtn;
+  round.jumpBtn = jumpBtn;
 }
 
 function renderContent(round, final) {
@@ -2949,6 +2969,37 @@ function updateSendState() {
   $('sendBtn').disabled = activeStreaming() || !state.session || !hasBody;
 }
 
+// scrollToAnswerStart parks the top of an assistant markdown block at the top of
+// the transcript viewport. It is the single target of the round footer button and
+// of Ctrl+Shift+↑/↓: a long turn can end hundreds of lines below the paragraph
+// that answers the question, and scrolling by hand is the part users lose.
+function scrollToAnswerStart(el) {
+  if (!el || !viewIsActive(currentView())) return;
+  const scroller = $('chatScroll');
+  if (!scroller) return;
+  const offset = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+  scroller.scrollTo({ top: Math.max(0, offset - 16), behavior: 'smooth' });
+}
+
+// navigateAnswerStart walks the assistant answers of the mounted transcript.
+// Like navigateUserMessage it clamps instead of wrapping, and the cold start
+// lands on the newest answer (the one that just finished) when going up.
+function navigateAnswerStart(dir) {
+  const rounds = [...messagesEl().querySelectorAll('.assistant-round')];
+  const answers = rounds.filter((el) => el.querySelector('.md'));
+  if (!answers.length) return;
+  rounds.forEach((el) => el.classList.remove('msg-focus'));
+  let idx = state.answerIndex;
+  if (idx < 0 || idx >= answers.length) idx = dir > 0 ? -1 : answers.length;
+  idx += dir;
+  if (idx < 0) idx = 0;
+  if (idx >= answers.length) idx = answers.length - 1;
+  state.answerIndex = idx;
+  const round = answers[idx];
+  round.classList.add('msg-focus');
+  scrollToAnswerStart(round.querySelector('.md'));
+}
+
 function maybeScroll(force = false) {
   // Only the mounted view owns the scroll position: a background agent must not
   // yank the chat the user is reading.
@@ -3503,13 +3554,20 @@ function flashCopied(btn) {
 }
 
 function makeCopyButton(className, title, onCopy) {
+  return makeFooterAction(className, title, 'bi-clipboard', onCopy);
+}
+
+// makeFooterAction builds one of the small hover controls that live in a round
+// footer (copy, jump to the answer). They share geometry, so only the icon and
+// the handler differ.
+function makeFooterAction(className, title, iconClass, action) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = className;
   btn.title = title;
   btn.setAttribute('aria-label', title);
-  btn.innerHTML = '<i class="bi bi-clipboard"></i>';
-  btn.addEventListener('click', () => onCopy(btn));
+  btn.innerHTML = `<i class="bi ${iconClass}"></i>`;
+  btn.addEventListener('click', () => action(btn));
   return btn;
 }
 
@@ -5002,10 +5060,24 @@ function handleShortcut(e) {
   if (key === 'arrowup') {
     if (modalOpen) return;
     e.preventDefault();
-    navigateUserMessage(-1);
+    navigateAnswerStart(-1);
     return;
   }
   if (key === 'arrowdown') {
+    if (modalOpen) return;
+    e.preventDefault();
+    navigateAnswerStart(1);
+    return;
+  }
+  // The arrows belong to the answers the agent produced; the user's own messages
+  // keep a Vim-style pair so both axes stay reachable without a modifier storm.
+  if (code === 'KeyK' || key === 'k') {
+    if (modalOpen) return;
+    e.preventDefault();
+    navigateUserMessage(-1);
+    return;
+  }
+  if (code === 'KeyJ' || key === 'j') {
     if (modalOpen) return;
     e.preventDefault();
     navigateUserMessage(1);

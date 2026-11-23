@@ -663,8 +663,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   user-select: none;
 }
 .round-time i { font-size: 10px; }
-.round-copy {
-  margin-right: auto;
+/* Footer actions: copy and jump-to-answer stay glued to the left, the elapsed
+   time keeps the right edge. */
+.round-copy,
+.round-jump {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -678,10 +680,16 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   opacity: 0;
   transition: opacity .12s ease, color .12s ease, background .12s ease;
 }
+.round-copy { margin-right: 2px; }
+.round-jump { margin-right: auto; }
 .assistant-round:hover .round-copy,
-.round-copy:focus-visible { opacity: 1; }
-.round-copy:hover { color: var(--text); background: var(--surface-2); border-color: var(--border); }
+.assistant-round:hover .round-jump,
+.round-copy:focus-visible,
+.round-jump:focus-visible { opacity: 1; }
+.round-copy:hover,
+.round-jump:hover { color: var(--text); background: var(--surface-2); border-color: var(--border); }
 .round-copy.is-copied { color: var(--accent); opacity: 1; }
+.round-jump i { font-size: 11px; }
 .assistant-round.is-working .round-time { color: var(--muted); }
 
 /* Collapsed event accordions */
