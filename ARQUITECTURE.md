@@ -62,8 +62,9 @@ POST /api/chat/stream (session_id, content)
 │ 2. Save user message                                   │
 │ 3. Create tools.Manager (project root, mode)           │
 │ 4. Ensure local repo outline (AST/regex scan, cached)  │
-│ 5. Build system prompt (outline + checklist + rules)   │
-│ 6. Load history from DB                                │
+│ 5. Capture project instructions once per session       │
+│ 6. Build system prompt once (rules + instructions)     │
+│ 7. Load history from DB                                │
 └────────────────────────────────────────────────────────┘
          │
          ▼
@@ -169,6 +170,35 @@ with one row per declaration and exact start/end lines for `symbol_lookup`:
 - The outline and checklist are **not** part of the system prompt. They are
   injected in a trailing ephemeral user message (see 3.2) so the system prompt
   stays byte-stable and cacheable.
+
+### Project Instructions (`tools/instructions.go`, `server/instructions.go`)
+Repositories ship their agent conventions as `AGENTS.md` and equivalents, and
+Forge injects them without the user attaching anything:
+
+- Candidates are stat'ed directly in the project root, in priority order:
+  `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`.
+  All existing agent files are captured; duplicates (a `CLAUDE.md` symlinked to
+  `AGENTS.md`) are dropped by normalized content. `README.md` is used only when
+  no agent file exists, and is labeled as background documentation.
+- They are read through `ReadAttachment`, so the symlink/root escape checks and
+  binary rejection are shared with the `@` picker. The candidate list is *not*
+  routed through `ProjectFiles`, whose walk skips dotfiles by design.
+- Budgets: 24,000 runes for agent files, 8,000 for the README fallback, 30,000
+  total. Truncation is flagged in the block, which tells the model to `read_file`
+  for the rest.
+- The snapshot is captured **once per session** and persisted in
+  `sessions.project_instructions`, which is nullable on purpose: `NULL` means
+  "not captured yet" while `''` means "captured, nothing to inject", so a bare
+  project is not re-scanned on every turn. The column is deliberately not part
+  of the `Session` struct, so listing chats never returns instruction text.
+- The block lives in the **stable system prompt** (after the identity/mode
+  block, before the allowed-tools list) because it does not change during a
+  chat. It carries its source paths, declares itself repository content rather
+  than a user request, gives the harness rules precedence on conflict, and warns
+  that it is a snapshot: editing `AGENTS.md` affects new chats only.
+- Consequences: `buildSystemPrompt` takes a `promptOptions` struct and is built
+  once per turn instead of once per round, which keeps the prefix identical
+  across every request of a chat.
 
 ### 3.2 History Pruning (`server/history.go`)
 Every provider round rebuilds the request from persisted rows. Before sending,

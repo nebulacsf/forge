@@ -1299,8 +1299,9 @@ func TestBuildSystemPromptIsStableAndStateFree(t *testing.T) {
 	session := store.Session{Mode: "PLAN"}
 	outline := "FILE internal/volatile.go"
 
-	first := buildSystemPrompt(project, session, 12, 96, 8, 24)
-	second := buildSystemPrompt(project, session, 12, 96, 8, 24)
+	opts := promptOptions{project: project, session: session, segmentSize: 12, turnLimit: 96, planRounds: 8, planToolCalls: 24}
+	first := buildSystemPrompt(opts)
+	second := buildSystemPrompt(opts)
 	if first != second {
 		t.Fatal("buildSystemPrompt is not deterministic")
 	}
@@ -1320,7 +1321,7 @@ func TestBuildSystemPromptIsStableAndStateFree(t *testing.T) {
 // blocking questions are asked with ask_user before the plan.
 func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 	project := store.Project{Name: "demo", Path: "/tmp/demo"}
-	prompt := buildSystemPrompt(project, store.Session{Mode: "PLAN"}, 12, 96, 8, 24)
+	prompt := buildSystemPrompt(promptOptions{project: project, session: store.Session{Mode: "PLAN"}, segmentSize: 12, turnLimit: 96, planRounds: 8, planToolCalls: 24})
 	lower := strings.ToLower(prompt)
 	for _, want := range []string{
 		"## Diagnosis & Approach",
@@ -1351,7 +1352,7 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 // upgrade is PLAN-only.
 func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
 	project := store.Project{Name: "demo", Path: "/tmp/demo"}
-	prompt := buildSystemPrompt(project, store.Session{Mode: "BUILD"}, 12, 96, 8, 24)
+	prompt := buildSystemPrompt(promptOptions{project: project, session: store.Session{Mode: "BUILD"}, segmentSize: 12, turnLimit: 96, planRounds: 8, planToolCalls: 24})
 	if !strings.Contains(prompt, "concise, factual summary") {
 		t.Error("BUILD system prompt is missing the expanded final-message rule")
 	}

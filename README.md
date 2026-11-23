@@ -94,10 +94,32 @@ checkpoint/auto-continue behavior.
   (`142 | func Save() {`) so the agent can pick precise edit locations.
 - **Local repo map.** Forge scans the project with Go's AST (and fast regex
   scanners for other languages), caches symbols and line numbers in SQLite, and
-  injects a compact outline (~300–500 tokens) into the system prompt. No LLM
-  calls are used to build it. The same scan feeds a queryable `project_symbols`
-  table with exact start/end ranges for `symbol_lookup`. The cache refreshes
-  when files change and when a project is opened.
+  injects a compact outline into every request as the trailing ephemeral state
+  message. No LLM calls are used to build it. The same scan feeds a queryable
+  `project_symbols` table with exact start/end ranges for `symbol_lookup`. The
+  cache refreshes when files change and when a project is opened.
+- **Project instructions, read once per chat.** The repository conventions every
+  coding agent expects are picked up automatically, with no `@` attachment and
+  no configuration:
+
+  | Priority | Artifact |
+  | --- | --- |
+  | 1 | `AGENTS.md` |
+  | 2 | `CLAUDE.md` |
+  | 3 | `.cursorrules` |
+  | 4 | `.github/copilot-instructions.md` |
+  | fallback | `README.md`, only when none of the above exists |
+
+  All matching agent files are captured (duplicates such as a `CLAUDE.md`
+  symlink to `AGENTS.md` are dropped by content). Agent files share a 24,000
+  character budget; the `README.md` fallback is capped at 8,000 and labeled as
+  background documentation, because a README describes the product rather than
+  prescribing how to work. The block is injected into the system prompt with its
+  source paths, states that the harness rules (mode, allowed tools, response
+  language) win on any conflict, and reminds the model to `read_file` when a
+  file was truncated. The snapshot is captured on the **first turn of a chat and
+  reused verbatim afterwards**, so it keeps the prompt prefix cacheable: edits to
+  `AGENTS.md` apply to new chats, not to the current one.
 
 In PLAN mode a completed turn ends with a **Plan ready — Switch to BUILD** card
 so it is always clear that files cannot change until you switch modes. The plan

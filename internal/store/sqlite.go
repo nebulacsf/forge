@@ -424,6 +424,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_providers_active ON llm_providers(is_a
 	if err := ensureColumn(db, "sessions", "provider_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	// Project instructions (AGENTS.md and friends) are captured once per session
+	// and reused verbatim. The column is nullable on purpose: NULL means "not
+	// captured yet" while an empty string means "captured, nothing to inject",
+	// so a project without instructions is not rescanned on every turn.
+	if err := ensureColumn(db, "sessions", "project_instructions", "TEXT"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -750,6 +757,38 @@ func (s *Store) SetSessionProvider(id int64, providerID string) (Session, error)
 		return Session{}, ErrNotFound
 	}
 	return s.GetSession(id)
+}
+
+// GetSessionInstructions returns the project instruction snapshot captured for a
+// session. captured is false when the session never captured one, which lets the
+// caller distinguish "not read yet" from "read, nothing to inject" without
+// stat'ing the project again on every turn.
+func (s *Store) GetSessionInstructions(id int64) (text string, captured bool, err error) {
+	var snapshot sql.NullString
+	err = s.db.QueryRow(`SELECT project_instructions FROM sessions WHERE id = ?`, id).Scan(&snapshot)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, ErrNotFound
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if !snapshot.Valid {
+		return "", false, nil
+	}
+	return snapshot.String, true, nil
+}
+
+// SetSessionInstructions persists the captured snapshot. An empty text still
+// marks the session as captured, so projects without artifacts are read once.
+func (s *Store) SetSessionInstructions(id int64, text string) error {
+	res, err := s.db.Exec(`UPDATE sessions SET project_instructions = ? WHERE id = ?`, text, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) AddUsage(sessionID, tokensIn, tokensOut, cachedTokens int64, cost float64) error {

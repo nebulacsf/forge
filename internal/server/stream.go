@@ -271,6 +271,11 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			"chars", utf8.RuneCountInString(outline))
 	}
 
+	// Project instruction artifacts (AGENTS.md and its well-known equivalents)
+	// are captured once per session and reused verbatim, so the system prompt
+	// stays byte-identical for the whole chat and the provider can cache it.
+	instructions := s.sessionInstructions(session, project)
+
 	client, err := s.providerClient(provider)
 	if err != nil {
 		stream.fail("Provider configuration error: " + err.Error())
@@ -311,6 +316,18 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 		segmentSize = turnLimit
 		autoContinue = false
 	}
+
+	// The stable instruction prefix depends only on values fixed for the turn,
+	// so build it once instead of re-assembling it on every round.
+	system := buildSystemPrompt(promptOptions{
+		project:       project,
+		session:       session,
+		segmentSize:   segmentSize,
+		turnLimit:     turnLimit,
+		planRounds:    planRounds,
+		planToolCalls: planToolCalls,
+		instructions:  instructions,
+	})
 
 	totalRounds := 0
 	segment := 1
@@ -364,7 +381,6 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			}
 
 			checklist, _ := s.store.ListChecklist(session.ID)
-			system := buildSystemPrompt(project, session, segmentSize, turnLimit, planRounds, planToolCalls)
 			rows, err := s.store.ListMessages(session.ID)
 			if err != nil {
 				stream.fail("Could not load conversation: " + err.Error())
@@ -940,11 +956,31 @@ func effectiveHistoryResultLimit(mode string, configured int) int {
 	return configured
 }
 
+// promptOptions carries everything buildSystemPrompt needs. A struct keeps the
+// call sites readable now that the budget knobs and the project instruction
+// snapshot travel together, and it avoids swapping two positional ints.
+type promptOptions struct {
+	project       store.Project
+	session       store.Session
+	segmentSize   int
+	turnLimit     int
+	planRounds    int
+	planToolCalls int
+	// instructions is the session instruction snapshot built by
+	// buildInstructionBlock. Empty means the project ships no artifacts.
+	instructions string
+}
+
 // buildSystemPrompt assembles the stable instruction prefix. It intentionally
 // excludes volatile state (checklist, repository outline) so the provider's
 // prompt cache can reuse this prefix across rounds. Volatile state is injected
-// as a trailing ephemeral message by buildStateMessage.
-func buildSystemPrompt(project store.Project, session store.Session, segmentSize, turnLimit, planRounds, planToolCalls int) string {
+// as a trailing ephemeral message by buildStateMessage. The project instruction
+// snapshot is stable for the whole session, so it belongs to this prefix rather
+// than to the ephemeral tail.
+func buildSystemPrompt(opts promptOptions) string {
+	project, session := opts.project, opts.session
+	segmentSize, turnLimit := opts.segmentSize, opts.turnLimit
+	planRounds, planToolCalls := opts.planRounds, opts.planToolCalls
 	var b strings.Builder
 	b.WriteString("You are Forge, an expert autonomous coding agent operating on a local project through a web UI.\n\n")
 	fmt.Fprintf(&b, "Project: %s\nWorking directory: %s\n", project.Name, project.Path)
@@ -960,6 +996,11 @@ func buildSystemPrompt(project store.Project, session store.Session, segmentSize
 		b.WriteString("Anti-loop rule: Never perform more than 2 consecutive read/search rounds without making an edit or running a verification command.\n")
 		b.WriteString("Use ask_user only when you are genuinely blocked by a decision only the user can make; do not ask for cosmetic preferences.\n")
 		b.WriteString("Respond in the language the user is speaking (IMPORTANT). Implement changes in English by default unless the user specifies otherwise.\n")
+	}
+	if block := strings.TrimSpace(opts.instructions); block != "" {
+		b.WriteString("\n")
+		b.WriteString(block)
+		b.WriteString("\n")
 	}
 	allowed := make([]string, 0, 10)
 	for _, spec := range tools.Specs(session.Mode) {
