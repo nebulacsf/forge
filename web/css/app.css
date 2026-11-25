@@ -340,18 +340,125 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   color: var(--accent-2);
 }
 
-.project-path-label {
+/* ── Workspace bar ────────────────────────────────────────────────── */
+/* The active project and its git branch. It owns a full row above the tabs so
+   the path never has to shrink against them, and it is the first thing the eye
+   finds when the user wonders which directory the agent is editing. */
+.workspace-bar {
+  display: flex;
+  height: 34px;
+  gap: 9px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-2);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.workspace-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--pc, var(--accent));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--pc, var(--accent)) 18%, transparent);
+}
+
+.workspace-name {
   max-width: 220px;
-  margin-left: 6px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11.5px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.01em;
   color: var(--text);
-  text-align: left;
 }
+
+.workspace-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.workspace-path:hover {
+  border-color: var(--border-soft);
+  background: var(--surface);
+  color: var(--text-soft);
+}
+.workspace-path:disabled { cursor: default; opacity: .6; }
+.workspace-path-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-path-icon { flex: 0 0 auto; font-size: 10.5px; opacity: 0; }
+.workspace-path:hover .workspace-path-icon,
+.workspace-path.is-copied .workspace-path-icon { opacity: .85; }
+
+.workspace-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 240px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border-soft));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.workspace-branch > i { font-size: 10.5px; }
+.workspace-branch span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A detached HEAD has no branch to name, and a plain directory has no repo at
+   all: both keep the chip visible but muted instead of showing an error. */
+.workspace-branch.detached {
+  border-color: color-mix(in srgb, var(--amber) 38%, var(--border-soft));
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  color: var(--amber);
+}
+.workspace-branch.no-git {
+  border-color: var(--border-soft);
+  background: transparent;
+  color: var(--muted-2);
+  font-weight: 500;
+}
+
+.workspace-refresh {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-2);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.workspace-refresh:hover { border-color: var(--border-soft); background: var(--surface); color: var(--accent-2); }
+.workspace-refresh:disabled { cursor: default; opacity: .5; }
+.workspace-refresh.spinning i { animation: workspace-spin .85s linear infinite; }
+@keyframes workspace-spin { to { transform: rotate(360deg); } }
 
 /* ── Layout ───────────────────────────────────────────────────────── */
 .main-col { background: transparent; }
@@ -2066,14 +2173,18 @@ kbd {
 
 /* Responsive */
 @media (max-width: 1400px) {
-  .project-path-label { max-width: 180px; }
+  .workspace-name { max-width: 180px; }
   .context-panel { width: 300px; }
 }
 @media (max-width: 1199.98px) {
   .panel-reopen { display: none !important; }
 }
 @media (max-width: 900px) {
-  .project-path-label { display: none; }
+  /* The path keeps ellipsis and its tooltip instead of disappearing: it is the
+     one thing the bar exists for. */
+  .workspace-bar { gap: 7px; padding: 0 10px; }
+  .workspace-name { max-width: 130px; }
+  .workspace-branch { max-width: 150px; }
   .model-control { max-width: 220px; }
   .model-input { width: 150px; }
   .messages { padding: 18px 14px 8px; }

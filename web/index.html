@@ -53,6 +53,25 @@
   <!-- ── Main column ──────────────────────────────────────────────── -->
   <div class="main-col d-flex flex-column flex-grow-1 min-w-0">
 
+    <!-- Workspace identity: which project and git branch this window is scoped
+         to. It sits above the tabs so it never competes with them for width. -->
+    <div id="workspaceBar" class="workspace-bar d-none align-items-center flex-shrink-0">
+      <span id="workspaceDot" class="workspace-dot flex-shrink-0" aria-hidden="true"></span>
+      <span id="workspaceName" class="workspace-name flex-shrink-0"></span>
+      <button id="workspacePath" class="workspace-path min-w-0" type="button">
+        <span id="workspacePathText" class="workspace-path-text"></span>
+        <i class="bi bi-clipboard workspace-path-icon"></i>
+      </button>
+      <span id="workspaceBranch" class="workspace-branch flex-shrink-0 d-none">
+        <i class="bi bi-git"></i>
+        <span id="workspaceBranchText"></span>
+      </span>
+      <button id="workspaceRefreshBtn" class="workspace-refresh flex-shrink-0" type="button"
+              title="Refresh git branch" aria-label="Refresh git branch">
+        <i class="bi bi-arrow-clockwise"></i>
+      </button>
+    </div>
+
     <!-- Session tabs -->
     <header class="session-bar d-flex align-items-center flex-shrink-0">
       <div id="sessionTabs" class="session-tabs d-flex align-items-center flex-grow-1 min-w-0"></div>
@@ -67,7 +86,6 @@
         <i class="bi bi-activity"></i>
         <span id="agentsBadge" class="agents-badge d-none">0</span>
       </button>
-      <div id="projectPathLabel" class="project-path-label flex-shrink-0" title=""></div>
       <button id="showPanelBtn" class="panel-reopen d-none flex-shrink-0" type="button" title="Show inspector panel">
         <i class="bi bi-layout-sidebar-inset"></i>
       </button>

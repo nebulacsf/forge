@@ -105,6 +105,59 @@ func TestPatchAndDeleteProject(t *testing.T) {
 	}
 }
 
+// TestProjectGitEndpoint covers the workspace bar contract: a missing project is
+// a 404 and a plain directory answers is_repo=false instead of an error, because
+// "not a repository" is a normal state and not something the user can fix.
+func TestProjectGitEndpoint(t *testing.T) {
+	cfg, st, _ := modelsFixture(t)
+	project, err := st.CreateProject("Plain", t.TempDir(), "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+
+	get := func(id string) (*http.Response, gitPayload) {
+		t.Helper()
+		resp, err := http.Get(app.URL + "/api/projects/" + id + "/git")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var payload gitPayload
+		_ = json.NewDecoder(resp.Body).Decode(&payload)
+		return resp, payload
+	}
+
+	resp, payload := get(itoa(project.ID))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d payload = %+v", resp.StatusCode, payload)
+	}
+	if payload.ProjectID != project.ID || payload.Root != project.Path {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if payload.IsRepo || payload.Branch != "" {
+		t.Fatalf("a bare temp dir must not report a branch: %+v", payload)
+	}
+
+	if resp, _ := get("999999"); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing project status = %d", resp.StatusCode)
+	}
+	if resp, _ := get("abc"); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad id status = %d", resp.StatusCode)
+	}
+}
+
+type gitPayload struct {
+	ProjectID int64  `json:"project_id"`
+	Root      string `json:"root"`
+	IsRepo    bool   `json:"is_repo"`
+	Branch    string `json:"branch"`
+	Detached  bool   `json:"detached"`
+	Commit    string `json:"commit"`
+}
+
 func itoa(v int64) string {
 	raw, _ := json.Marshal(v)
 	return string(raw)

@@ -18,6 +18,10 @@ const state = {
   projects: [],
   activeProjectId: null,
   activeProject: null,
+  // Git state of the active project, shown in the workspace bar. `checked`
+  // separates "not probed yet" from "probed, plain directory"; `seq` discards
+  // probes that land after the user switched project.
+  git: { projectId: null, checked: false, isRepo: false, branch: '', detached: false, commit: '', seq: 0 },
   sessions: [],
   allSessions: [],
   activeSessionId: null,
@@ -482,14 +486,108 @@ function projectLabel(project) {
   return parts.length ? parts[parts.length - 1] : path;
 }
 
-function setProjectPathLabel(project) {
-  const el = $('projectPathLabel');
-  if (!el) return;
-  const path = project && project.path ? String(project.path) : '';
-  el.textContent = projectLabel(project);
-  el.title = path;
-  if (path) el.setAttribute('aria-label', `${projectLabel(project)} — ${path}`);
-  else el.removeAttribute('aria-label');
+// renderWorkspaceBar paints the workspace row above the tabs: which project is
+// active, its full path (click to copy) and its git branch. The branch chip is
+// filled by refreshGitInfo, which is the only part that needs the server.
+function renderWorkspaceBar(project) {
+  const bar = $('workspaceBar');
+  if (!bar) return;
+  if (!project) {
+    bar.classList.add('d-none');
+    return;
+  }
+  bar.classList.remove('d-none');
+  bar.style.setProperty('--pc', project.icon_color || '#6c8cff');
+
+  const name = projectLabel(project);
+  const path = project.path ? String(project.path) : '';
+  $('workspaceName').textContent = name || 'project';
+  $('workspaceName').title = name || '';
+
+  const pathBtn = $('workspacePath');
+  $('workspacePathText').textContent = path;
+  pathBtn.title = path ? `${path}\nClick to copy` : '';
+  pathBtn.disabled = !path;
+  if (path) pathBtn.setAttribute('aria-label', `Project path ${path} (click to copy)`);
+  else pathBtn.removeAttribute('aria-label');
+
+  // Drop the branch of the previous project instead of showing it for a frame.
+  if (state.git.projectId !== project.id) {
+    state.git = { projectId: project.id, checked: false, isRepo: false, branch: '', detached: false, commit: '', seq: state.git.seq };
+  }
+  renderGitChip();
+}
+
+// renderGitChip draws the branch pill from state.git. The three states are a
+// named branch, a detached HEAD (the short sha is the only label left) and a
+// plain directory, which is muted rather than reported as an error.
+function renderGitChip() {
+  const chip = $('workspaceBranch');
+  if (!chip) return;
+  const git = state.git;
+  const text = $('workspaceBranchText');
+  chip.classList.remove('detached', 'no-git');
+  if (!git.projectId || !git.checked) {
+    chip.classList.add('d-none');
+    return;
+  }
+  chip.classList.remove('d-none');
+  if (!git.isRepo) {
+    chip.classList.add('no-git');
+    chip.title = 'This project is not a git repository';
+    text.textContent = 'no git';
+    return;
+  }
+  if (git.detached) {
+    chip.classList.add('detached');
+    text.textContent = git.commit || 'detached';
+    chip.title = `Detached HEAD${git.commit ? ` at ${git.commit}` : ''}`;
+    return;
+  }
+  text.textContent = git.branch || 'detached';
+  chip.title = git.branch ? `On branch ${git.branch}` : '';
+}
+
+// refreshGitInfo re-reads the branch of a project. The server runs one bounded
+// git probe, so this is cheap enough to call on every project switch and after
+// each turn; a late response for another project is dropped.
+async function refreshGitInfo(projectId) {
+  if (!projectId || projectId !== state.activeProjectId) return;
+  const seq = ++state.git.seq;
+  const btn = $('workspaceRefreshBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add('spinning');
+  }
+  try {
+    const data = await api(`/api/projects/${projectId}/git`);
+    if (seq !== state.git.seq || projectId !== state.activeProjectId) return;
+    state.git = {
+      projectId,
+      checked: true,
+      isRepo: !!data.is_repo,
+      branch: data.branch || '',
+      detached: !!data.detached,
+      commit: data.commit || '',
+      seq,
+    };
+    renderGitChip();
+  } catch {
+    // A project on an unmounted volume or without git must not break the bar:
+    // keep the last known chip and let the user retry.
+  } finally {
+    if (seq === state.git.seq && btn) {
+      btn.disabled = false;
+      btn.classList.remove('spinning');
+    }
+  }
+}
+
+// refreshActiveGit is the turn hook: only a turn that ran in the visible
+// project can have moved its branch.
+function refreshActiveGit(view) {
+  if (view && view.projectId && view.projectId !== state.activeProjectId) return;
+  refreshGitInfo(state.activeProjectId);
 }
 
 function randomPaletteColor() {
@@ -592,7 +690,8 @@ async function openProject(id) {
   state.activeProject = project;
   try { localStorage.setItem('forge.project', String(id)); } catch { /* ignore */ }
   renderProjects();
-  setProjectPathLabel(project);
+  renderWorkspaceBar(project);
+  refreshGitInfo(id);
 
   try {
     const data = await api(`/api/projects/${id}/sessions`);
@@ -1841,6 +1940,9 @@ function handleEvent(ev) {
       if (ev.session) syncSession(ev.session);
       state.turnReasoningOnly = !!ev.reasoning_only;
       stopTurnClock(true);
+      // A turn may have created commits, branches or a new repository in the
+      // visible project, so the workspace bar re-reads it once it settles.
+      refreshActiveGit(currentView());
       if (state.currentRound) removeThinking(state.currentRound);
       if (ev.reasoning_only) {
         const round = state.currentRound;
@@ -1866,6 +1968,7 @@ function handleEvent(ev) {
       state.sawCancelled = true;
       stopTurnClock(true);
       addNotice('Stopped', 'stopped');
+      refreshActiveGit(currentView());
       break;
     case 'error':
       state.turnHadError = true;
@@ -4248,7 +4351,10 @@ async function saveProject(e) {
       renderProjects();
       if (data.project.id === state.activeProjectId) {
         state.activeProject = data.project;
-        setProjectPathLabel(data.project);
+        // The path or the color may have changed, and a moved directory can be
+        // a different repository, so repaint and re-probe.
+        renderWorkspaceBar(data.project);
+        refreshGitInfo(data.project.id);
       }
       if (projectModal) projectModal.hide();
       toast(`Updated ${data.project.name}`, 'success');
@@ -4290,7 +4396,8 @@ async function deleteProject() {
       state.activeProject = null;
       state.sessions = [];
       clearSession();
-      setProjectPathLabel(null);
+      state.git = { projectId: null, checked: false, isRepo: false, branch: '', detached: false, commit: '', seq: state.git.seq };
+      renderWorkspaceBar(null);
       const next = state.projects[0];
       if (next) await selectProject(next.id, { autoCreate: true });
       else {
@@ -4881,6 +4988,11 @@ function bindEvents() {
     openProjectModal();
   });
   $('newSessionBtn').addEventListener('click', () => createSession());
+  $('workspacePath').addEventListener('click', () => {
+    const path = state.activeProject && state.activeProject.path;
+    if (path) copyToClipboard(path, $('workspacePath'));
+  });
+  $('workspaceRefreshBtn').addEventListener('click', () => refreshGitInfo(state.activeProjectId));
   $('manageSessionsBtn').addEventListener('click', openSessionsModal);
   $('agentsBtn').addEventListener('click', openAgentsModal);
   // The run summary is a shortcut to the same list of live agents.
