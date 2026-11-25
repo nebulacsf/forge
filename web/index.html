@@ -276,10 +276,14 @@
           <div id="fileList" class="file-list"></div>
         </details>
 
-        <section class="side-card checklist-card d-flex flex-column">
+        <section id="checklistCard" class="side-card checklist-card d-flex flex-column" data-state="empty">
           <div class="side-card-head">
             <span>Checklist</span>
             <span class="head-meta"><span id="checklistCount" class="count-pill">0/0</span></span>
+          </div>
+          <div class="checklist-status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="checklistStatusText" class="status-text" aria-live="polite">No tasks yet</span>
           </div>
           <div class="progress checklist-progress">
             <div id="checklistBar" class="progress-bar"></div>

@@ -1708,9 +1708,122 @@ kbd {
 .file-badge.modified { color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent); }
 
 /* Checklist */
-.checklist-card { flex: 1 1 220px; min-height: 220px; }
-.checklist-progress { height: 3px; margin-bottom: 7px; }
-.checklist-progress .progress-bar { background: var(--green); }
+/* The card is the progress surface for a turn: the state attribute set by
+   applyChecklistState (empty | running-empty | running | idle | done) drives
+   every visual below, so the sidebar answers "when does this finish?" without
+   the agent having to say anything extra. */
+.checklist-card {
+  flex: 1 1 220px;
+  min-height: 220px;
+  transition: border-color .2s ease;
+}
+.checklist-card[data-state="running"],
+.checklist-card[data-state="running-empty"] { border-color: color-mix(in srgb, var(--accent) 28%, var(--border-soft)); }
+.checklist-card[data-state="done"] { border-color: color-mix(in srgb, var(--green) 28%, var(--border-soft)); }
+
+.checklist-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 14px;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: .01em;
+}
+.checklist-status .status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.checklist-status .status-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted-2);
+  transition: background .25s ease;
+}
+.checklist-card[data-state="running"] .checklist-status .status-text,
+.checklist-card[data-state="running-empty"] .checklist-status .status-text { color: var(--text-soft); }
+.checklist-card[data-state="running"] .status-dot,
+.checklist-card[data-state="running-empty"] .status-dot {
+  background: var(--accent);
+  animation: pulse 1.6s infinite;
+}
+.checklist-card[data-state="idle"] .status-dot { background: var(--amber); }
+.checklist-card[data-state="done"] .status-dot { background: var(--green); }
+.checklist-card[data-state="done"] .checklist-status .status-text { color: var(--green); }
+
+/* Height, track colour and rounding come from the shared .progress base. */
+.checklist-progress { margin-bottom: 8px; }
+.checklist-progress .progress-bar {
+  position: relative;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--accent);
+  transition: width .45s cubic-bezier(.4, 0, .2, 1), background-color .3s ease;
+}
+/* Pending work with nothing running is not failure, just waiting. */
+.checklist-card[data-state="idle"] .checklist-progress .progress-bar {
+  background: color-mix(in srgb, var(--accent) 55%, var(--muted-2));
+}
+/* No task list yet: a sliding segment says "alive" without faking progress. */
+.checklist-card[data-state="running-empty"] .checklist-progress .progress-bar {
+  width: 34%;
+  animation: checklist-sweep 1.6s cubic-bezier(.4, 0, .2, 1) infinite;
+}
+.checklist-card[data-state="running-empty"] .checklist-progress .progress-bar::after,
+.checklist-card[data-state="running"] .checklist-progress .progress-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--text) 34%, transparent), transparent);
+  animation: checklist-shimmer 1.6s ease-in-out infinite;
+}
+@keyframes checklist-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(294%); }
+}
+@keyframes checklist-shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.checklist-card[data-state="done"] .checklist-progress .progress-bar { background: var(--green); }
+/* One bloom when the last task lands; the selector only matches on entering
+   the done state, so no one-shot class or animationend listener is needed. */
+.checklist-card[data-state="done"] .checklist-progress {
+  animation: checklist-bloom .9s ease-out;
+}
+@keyframes checklist-bloom {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 50%, transparent); }
+  100% { box-shadow: 0 0 0 6px transparent; }
+}
+
+/* While the agent runs, the first pending task is the one in progress. Done
+   rows live inside <details>, so they never match this selector. */
+.checklist-card[data-state="running"] .checklist-items > .check-item:first-child {
+  position: relative;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text);
+}
+.checklist-card[data-state="running"] .checklist-items > .check-item:first-child::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 5px;
+  bottom: 5px;
+  width: 2px;
+  border-radius: 99px;
+  background: var(--accent);
+  animation: checklist-current 1.6s ease-in-out infinite;
+}
+@keyframes checklist-current {
+  0%, 100% { opacity: .4; }
+  50% { opacity: 1; }
+}
+
 .checklist-items {
   flex: 1 1 auto;
   min-height: 90px;

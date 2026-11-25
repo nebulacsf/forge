@@ -2535,6 +2535,9 @@ function renderInspector() {
   paintSessionTime(view);
   paintFiles(view);
   paintChecklist(view);
+  // The card state depends on the run lifecycle as well as on the counters, so
+  // it is repainted from here and from the chrome.
+  applyChecklistState(view);
 }
 
 function paintUsage(view) {
@@ -2834,20 +2837,77 @@ function renderChecklist() {
   scheduleInspector(currentView());
 }
 
+// checklistBusy is true while this view has a live agent. The run index counts
+// too: a run lives on the server, so a chat can be busy before its stream
+// re-attaches (reload, tab switch).
+function checklistBusy(view) {
+  if (!view) return false;
+  return !!view.streaming || runIndex.has(view.sessionId);
+}
+
+// checklistState collapses the task counters and the run lifecycle into the
+// single state the card advertises, so the sidebar always answers the one
+// question a harness usually leaves open: when does this finish?
+function checklistState(total, done, busy) {
+  if (!total) return busy ? 'running-empty' : 'empty';
+  if (done >= total) return busy ? 'running' : 'done';
+  return busy ? 'running' : 'idle';
+}
+
+function checklistStatusLabel(status, total, done) {
+  switch (status) {
+    case 'running-empty': return 'Working — no task list';
+    // Every task is ticked but the turn is still open: say so instead of
+    // claiming the run is done.
+    case 'running': return done >= total ? `Wrapping up · ${done} of ${total}` : `Working · ${done} of ${total}`;
+    case 'idle': return `Waiting · ${done} of ${total}`;
+    case 'done': return `Complete · ${done} of ${total}`;
+    case 'empty': return 'No tasks yet';
+    default: return '';
+  }
+}
+
+// applyChecklistState is the only writer of the card state, the progress bar and
+// the status line. renderChrome calls it too, so starting, resuming and finishing
+// a run repaint the card even when no checklist event arrives.
+function applyChecklistState(view) {
+  const card = $('checklistCard');
+  if (!card) return;
+  const checklist = view && Array.isArray(view.checklist) ? view.checklist : [];
+  const total = checklist.length;
+  const done = checklist.filter((i) => i.is_done).length;
+  const status = checklistState(total, done, checklistBusy(view));
+  card.dataset.state = status;
+  $('checklistCount').textContent = `${done}/${total}`;
+
+  const bar = $('checklistBar');
+  if (status === 'running-empty') {
+    // Indeterminate: the width belongs to the sweep animation, not to progress.
+    bar.style.width = '';
+  } else {
+    bar.style.width = total ? `${(done / total) * 100}%` : '0%';
+  }
+
+  const text = $('checklistStatusText');
+  const label = checklistStatusLabel(status, total, done);
+  // Only touch the node when the text really changed: the element is a polite
+  // live region and a no-op write would re-announce on every repaint.
+  if (text && text.textContent !== label) text.textContent = label;
+}
+
 function paintChecklist(view) {
   const list = $('checklistItems');
   if (!list) return;
   const checklist = view && Array.isArray(view.checklist) ? view.checklist : [];
   list.innerHTML = '';
   const total = checklist.length;
-  const done = checklist.filter((i) => i.is_done).length;
-  $('checklistCount').textContent = `${done}/${total}`;
-  $('checklistBar').style.width = total ? `${(done / total) * 100}%` : '0%';
 
   if (!total) {
     const empty = document.createElement('div');
     empty.className = 'checklist-empty';
-    empty.textContent = 'No tasks yet. Add one, or ask Forge to plan multi-step work.';
+    empty.textContent = checklistBusy(view)
+      ? 'Forge is working on this turn. Tasks show up here when it plans multi-step work.'
+      : 'No tasks yet. Add one, or ask Forge to plan multi-step work.';
     list.appendChild(empty);
     return;
   }
@@ -3056,6 +3116,9 @@ function renderChrome() {
   }
   updateSendState();
   updateRunSummary();
+  // The checklist card advertises whether the agent is still working, so the
+  // card follows the run lifecycle even when no checklist event arrives.
+  applyChecklistState(view);
 }
 
 // setStreamingUI is the run-lifecycle entry point. The chrome is a projection,
