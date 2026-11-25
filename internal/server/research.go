@@ -133,16 +133,19 @@ func (l *researchLedger) addRead(path string, start, end int) {
 }
 
 // render produces a compact, token-bounded ledger. It always includes the
-// remaining budget so the model can see when it must stop researching.
+// remaining budget so the model can see when it must stop researching; a limit
+// configured as 0 is reported as absent instead of as a share of zero.
 func (l *researchLedger) render(planRounds, planToolCalls int) string {
 	if l == nil {
 		return ""
 	}
 	var b strings.Builder
-	remaining := planRounds - l.rounds
-	fmt.Fprintf(&b, "Research budget: %d/%d tool rounds, %d/%d tool calls used.",
-		l.rounds, planRounds, l.calls, planToolCalls)
-	if remaining <= 2 {
+	b.WriteString("Research budget: ")
+	b.WriteString(formatLedgerUse(l.rounds, planRounds, "tool round"))
+	b.WriteString(", ")
+	b.WriteString(formatLedgerUse(l.calls, planToolCalls, "tool call"))
+	b.WriteString(" used.")
+	if remaining := planRounds - l.rounds; planRounds > 0 && remaining <= 2 {
 		b.WriteString(" Tools will be disabled at the budget; start writing the final plan now.")
 	}
 	if len(l.reads) == 0 && len(l.greps) == 0 && len(l.symbols) == 0 {
@@ -205,6 +208,19 @@ func (l *researchLedger) render(planRounds, planToolCalls int) string {
 		}
 	}
 	return clipRunes(strings.TrimSpace(b.String()), 900)
+}
+
+// formatLedgerUse renders "N/limit unit(s)" for a bounded budget and "N unit(s)"
+// when the limit is 0, which is how the ledger reports an absent ceiling.
+func formatLedgerUse(used, limit int, unit string) string {
+	label := unit
+	if used != 1 {
+		label = unit + "s"
+	}
+	if limit <= 0 {
+		return fmt.Sprintf("%d %s (no limit)", used, label)
+	}
+	return fmt.Sprintf("%d/%d %s", used, limit, label)
 }
 
 func cleanLedgerPath(path string) string {

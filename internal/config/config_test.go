@@ -4,38 +4,110 @@ import "testing"
 
 func boolValue(v bool) *bool { return &v }
 
-func TestNormalizeRoundBudgetDefaults(t *testing.T) {
-	got := normalize(Config{})
-	if got.Defaults.MaxToolRounds != 16 {
-		t.Errorf("max_tool_rounds = %d, want 16", got.Defaults.MaxToolRounds)
+func TestDefaultShipsFiniteLimits(t *testing.T) {
+	// The shipped configuration stays bounded: an unbounded turn is something
+	// the developer opts into by writing 0, never the out-of-the-box behavior.
+	d := Default().Defaults
+	if d.MaxToolRounds != 16 || d.MaxTurnRounds != 64 {
+		t.Errorf("round budgets = %d/%d, want 16/64", d.MaxToolRounds, d.MaxTurnRounds)
 	}
-	if got.Defaults.MaxTurnRounds != 64 {
-		t.Errorf("max_turn_rounds = %d, want 64", got.Defaults.MaxTurnRounds)
+	if d.PlanRounds != 16 || d.PlanToolCalls != 32 {
+		t.Errorf("plan budget = %d/%d, want 16/32", d.PlanRounds, d.PlanToolCalls)
 	}
-	if got.Defaults.AutoContinue == nil || !*got.Defaults.AutoContinue {
+	if d.MaxFileReadChars != 25000 || d.BashTimeoutSec != 30 {
+		t.Errorf("tool limits = %d/%d, want 25000/30", d.MaxFileReadChars, d.BashTimeoutSec)
+	}
+	if d.AutoContinue == nil || !*d.AutoContinue {
 		t.Error("auto_continue should default to true")
 	}
-	if got.Defaults.MaxTurnCostUSD != 0 {
-		t.Errorf("max_turn_cost_usd = %v, want 0 (disabled)", got.Defaults.MaxTurnCostUSD)
-	}
-	if got.Defaults.PlanRounds != 16 {
-		t.Errorf("plan_rounds = %d, want 16", got.Defaults.PlanRounds)
-	}
-	if got.Defaults.PlanToolCalls != 32 {
-		t.Errorf("plan_tool_calls = %d, want 32", got.Defaults.PlanToolCalls)
+	if d.MaxTurnCostUSD != 0 {
+		t.Errorf("max_turn_cost_usd = %v, want 0 (no limit)", d.MaxTurnCostUSD)
 	}
 }
 
-func TestNormalizeClampsPlanBudget(t *testing.T) {
-	c := Default()
-	c.Defaults.PlanRounds = 99
-	c.Defaults.PlanToolCalls = 999
+func TestNormalizeKeepsZeroLimitsAsUnlimited(t *testing.T) {
+	// A config file where every limit was explicitly cleared must survive with
+	// its zeros intact: normalize is not allowed to reintroduce a ceiling.
+	var c Config
+	c.Defaults.Model = DefaultModel
 	got := normalize(c)
-	if got.Defaults.PlanRounds != 24 {
-		t.Errorf("plan_rounds = %d, want 24", got.Defaults.PlanRounds)
+	for _, knob := range limitKnobs() {
+		if v := knob.get(got.Defaults); v != 0 {
+			t.Errorf("%s = %d, want 0 (no limit) preserved from an explicit zero", knob.name, v)
+		}
 	}
-	if got.Defaults.PlanToolCalls != 200 {
-		t.Errorf("plan_tool_calls = %d, want 200", got.Defaults.PlanToolCalls)
+	if got.Defaults.AutoContinue == nil || !*got.Defaults.AutoContinue {
+		t.Error("auto_continue should still fall back to true")
+	}
+}
+
+// limitKnob describes one numeric default so the contract can be checked
+// uniformly across every limit: an explicit 0 survives as "no limit", a huge
+// value is never clamped, and a negative value means "not configured".
+type limitKnob struct {
+	name  string
+	set   func(*DefaultsConfig, int)
+	get   func(DefaultsConfig) int
+	fallb int
+}
+
+func limitKnobs() []limitKnob {
+	d := Default().Defaults
+	return []limitKnob{
+		{"max_file_read_chars", func(c *DefaultsConfig, v int) { c.MaxFileReadChars = v },
+			func(c DefaultsConfig) int { return c.MaxFileReadChars }, d.MaxFileReadChars},
+		{"bash_timeout_sec", func(c *DefaultsConfig, v int) { c.BashTimeoutSec = v },
+			func(c DefaultsConfig) int { return c.BashTimeoutSec }, d.BashTimeoutSec},
+		{"max_tool_rounds", func(c *DefaultsConfig, v int) { c.MaxToolRounds = v },
+			func(c DefaultsConfig) int { return c.MaxToolRounds }, d.MaxToolRounds},
+		{"max_turn_rounds", func(c *DefaultsConfig, v int) { c.MaxTurnRounds = v },
+			func(c DefaultsConfig) int { return c.MaxTurnRounds }, d.MaxTurnRounds},
+		{"plan_rounds", func(c *DefaultsConfig, v int) { c.PlanRounds = v },
+			func(c DefaultsConfig) int { return c.PlanRounds }, d.PlanRounds},
+		{"plan_tool_calls", func(c *DefaultsConfig, v int) { c.PlanToolCalls = v },
+			func(c DefaultsConfig) int { return c.PlanToolCalls }, d.PlanToolCalls},
+		{"history_prune_max_tokens", func(c *DefaultsConfig, v int) { c.HistoryPruneMaxTokens = v },
+			func(c DefaultsConfig) int { return c.HistoryPruneMaxTokens }, d.HistoryPruneMaxTokens},
+		{"history_max_result_chars", func(c *DefaultsConfig, v int) { c.HistoryMaxResult = v },
+			func(c DefaultsConfig) int { return c.HistoryMaxResult }, d.HistoryMaxResult},
+		{"history_max_arg_chars", func(c *DefaultsConfig, v int) { c.HistoryMaxArg = v },
+			func(c DefaultsConfig) int { return c.HistoryMaxArg }, d.HistoryMaxArg},
+	}
+}
+
+func TestNormalizeLimitContract(t *testing.T) {
+	// Every knob is tested with a value far above the ceilings this code used
+	// to enforce, so a reintroduced clamp fails here.
+	const huge = 9_000_000
+	for _, knob := range limitKnobs() {
+		t.Run(knob.name, func(t *testing.T) {
+			c := Default()
+			knob.set(&c.Defaults, 0)
+			if got := knob.get(normalize(c).Defaults); got != 0 {
+				t.Errorf("0 should mean no limit, got %d", got)
+			}
+			c = Default()
+			knob.set(&c.Defaults, huge)
+			if got := knob.get(normalize(c).Defaults); got != huge {
+				t.Errorf("%d should be preserved verbatim, got %d", huge, got)
+			}
+			c = Default()
+			knob.set(&c.Defaults, -5)
+			if got := knob.get(normalize(c).Defaults); got != knob.fallb {
+				t.Errorf("negative should fall back to %d, got %d", knob.fallb, got)
+			}
+		})
+	}
+}
+
+func TestNormalizePlanBudgetContract(t *testing.T) {
+	c := Default()
+	c.Defaults.PlanRounds = 0
+	c.Defaults.PlanToolCalls = 0
+	got := normalize(c)
+	if got.Defaults.PlanRounds != 0 || got.Defaults.PlanToolCalls != 0 {
+		t.Errorf("zero plan budget should stay unlimited, got rounds=%d calls=%d",
+			got.Defaults.PlanRounds, got.Defaults.PlanToolCalls)
 	}
 
 	c = Default()
@@ -48,16 +120,14 @@ func TestNormalizeClampsPlanBudget(t *testing.T) {
 	}
 }
 
-func TestNormalizeClampsRoundBudgets(t *testing.T) {
+func TestNormalizeRoundBudgetsWithoutCeilings(t *testing.T) {
 	c := Default()
 	c.Defaults.MaxToolRounds = 500
-	c.Defaults.MaxTurnRounds = 10
+	c.Defaults.MaxTurnRounds = 500
 	got := normalize(c)
-	if got.Defaults.MaxToolRounds != 200 {
-		t.Errorf("max_tool_rounds = %d, want 200", got.Defaults.MaxToolRounds)
-	}
-	if got.Defaults.MaxTurnRounds != 200 {
-		t.Errorf("max_turn_rounds = %d, want 200 (raised to the segment size)", got.Defaults.MaxTurnRounds)
+	if got.Defaults.MaxToolRounds != 500 || got.Defaults.MaxTurnRounds != 500 {
+		t.Errorf("round budgets should not be clamped, got segment=%d turn=%d",
+			got.Defaults.MaxToolRounds, got.Defaults.MaxTurnRounds)
 	}
 }
 
@@ -112,24 +182,37 @@ func TestNormalizeHistoryPruningDefaults(t *testing.T) {
 	}
 }
 
-func TestNormalizeClampsHistoryPruning(t *testing.T) {
+func TestNormalizeHistoryPruningWithoutCeilings(t *testing.T) {
 	c := Default()
 	c.Defaults.HistoryKeepRecent = 150
 	c.Defaults.HistoryMaxResult = 10
-	c.Defaults.HistoryMaxArg = -5
+	c.Defaults.HistoryMaxArg = 40
 	c.Defaults.HistoryPruneChunk = 150
 	got := normalize(c)
-	if got.Defaults.HistoryKeepRecent != 100 {
-		t.Errorf("history_keep_recent_rounds = %d, want 100", got.Defaults.HistoryKeepRecent)
+	if got.Defaults.HistoryKeepRecent != 150 {
+		t.Errorf("history_keep_recent_rounds = %d, want 150 (no ceiling)", got.Defaults.HistoryKeepRecent)
 	}
-	if got.Defaults.HistoryMaxResult != 500 {
-		t.Errorf("history_max_result_chars = %d, want 500", got.Defaults.HistoryMaxResult)
+	if got.Defaults.HistoryMaxResult != 10 {
+		t.Errorf("history_max_result_chars = %d, want 10 (no floor)", got.Defaults.HistoryMaxResult)
+	}
+	if got.Defaults.HistoryMaxArg != 40 {
+		t.Errorf("history_max_arg_chars = %d, want 40 (no floor)", got.Defaults.HistoryMaxArg)
+	}
+	if got.Defaults.HistoryPruneChunk != 150 {
+		t.Errorf("history_prune_chunk_rounds = %d, want 150 (no ceiling)", got.Defaults.HistoryPruneChunk)
+	}
+}
+
+func TestNormalizeHistoryNegativesFallBack(t *testing.T) {
+	c := Default()
+	c.Defaults.HistoryKeepRecent = -1
+	c.Defaults.HistoryMaxArg = -5
+	got := normalize(c)
+	if got.Defaults.HistoryKeepRecent != 0 {
+		t.Errorf("history_keep_recent_rounds = %d, want 0 (keep everything)", got.Defaults.HistoryKeepRecent)
 	}
 	if got.Defaults.HistoryMaxArg != 4000 {
 		t.Errorf("history_max_arg_chars = %d, want default 4000 for negative input", got.Defaults.HistoryMaxArg)
-	}
-	if got.Defaults.HistoryPruneChunk != 100 {
-		t.Errorf("history_prune_chunk_rounds = %d, want 100", got.Defaults.HistoryPruneChunk)
 	}
 }
 
@@ -137,24 +220,24 @@ func TestNormalizeHistoryLegacyChunkStaysDisabled(t *testing.T) {
 	c := Default()
 	c.Defaults.HistoryPruneChunk = 0
 	if got := normalize(c); got.Defaults.HistoryPruneChunk != 0 {
-		t.Errorf("history_prune_chunk_rounds = %d, want 0 (disabled) for zero input", got.Defaults.HistoryPruneChunk)
+		t.Errorf("history_prune_chunk_rounds = %d, want 0 (default granularity) for zero input", got.Defaults.HistoryPruneChunk)
 	}
 	c.Defaults.HistoryPruneChunk = -3
 	if got := normalize(c); got.Defaults.HistoryPruneChunk != 0 {
-		t.Errorf("history_prune_chunk_rounds = %d, want 0 (disabled) for negative input", got.Defaults.HistoryPruneChunk)
+		t.Errorf("history_prune_chunk_rounds = %d, want 0 (default granularity) for negative input", got.Defaults.HistoryPruneChunk)
 	}
 }
 
-func TestNormalizePruneBudgetBounds(t *testing.T) {
+func TestNormalizePruneBudgetWithoutCeilings(t *testing.T) {
 	c := Default()
 	c.Defaults.HistoryPrunePercent = 500
 	c.Defaults.HistoryPruneMaxTokens = 9_000_000
 	got := normalize(c)
-	if got.Defaults.HistoryPrunePercent != 100 {
-		t.Errorf("history_prune_percent = %d, want 100", got.Defaults.HistoryPrunePercent)
+	if got.Defaults.HistoryPrunePercent != 500 {
+		t.Errorf("history_prune_percent = %d, want 500 (no ceiling)", got.Defaults.HistoryPrunePercent)
 	}
-	if got.Defaults.HistoryPruneMaxTokens != 2_000_000 {
-		t.Errorf("history_prune_max_tokens = %d, want 2000000", got.Defaults.HistoryPruneMaxTokens)
+	if got.Defaults.HistoryPruneMaxTokens != 9_000_000 {
+		t.Errorf("history_prune_max_tokens = %d, want 9000000 (no ceiling)", got.Defaults.HistoryPruneMaxTokens)
 	}
 
 	c = Default()

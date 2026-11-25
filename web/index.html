@@ -522,18 +522,18 @@
                   <label for="maxToolRounds" class="form-label">Rounds per checkpoint</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About rounds per checkpoint"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Rounds a turn runs before Forge pauses, reports progress and asks to continue. Smaller values keep you in control on long refactors; default 16."></i>
+                     title="Rounds a turn runs before Forge pauses, reports progress and asks to continue. Smaller values keep you in control on long refactors. 0 means no checkpoints: the turn runs in one segment. Default 16."></i>
                 </div>
-                <input id="maxToolRounds" type="number" min="1" max="200" class="form-control">
+                <input id="maxToolRounds" type="number" min="0" class="form-control">
               </div>
               <div class="col-md-4">
                 <div class="setting-label">
                   <label for="maxTurnRounds" class="form-label">Rounds per turn</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About rounds per turn"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Hard ceiling of rounds in a single turn, checkpoint pauses included. Values below the checkpoint size are raised to match it; default 64."></i>
+                     title="Hard ceiling of rounds in a single turn, checkpoint pauses included. Values below the checkpoint size are raised to match it. 0 means no ceiling: the turn ends when the model stops calling tools or you stop it. Default 64."></i>
                 </div>
-                <input id="maxTurnRounds" type="number" min="1" max="1000" class="form-control">
+                <input id="maxTurnRounds" type="number" min="0" class="form-control">
               </div>
               <div class="col-md-4">
                 <div class="setting-label">
@@ -567,18 +567,18 @@
                   <label for="planRounds" class="form-label">Research rounds</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About PLAN research rounds"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Rounds PLAN may spend reading and reasoning. When the budget runs out, tools are disabled and Forge requires the final plan in up to three attempts, rejecting empty answers. Default 16, maximum 24."></i>
+                     title="Rounds PLAN may spend reading and reasoning. When the budget runs out, tools are disabled and Forge requires the final plan in up to three attempts, rejecting empty answers. 0 removes the round side of the budget, so no final plan is forced on that account. Default 16."></i>
                 </div>
-                <input id="planRounds" type="number" min="1" max="24" class="form-control">
+                <input id="planRounds" type="number" min="0" class="form-control">
               </div>
               <div class="col-md-6">
                 <div class="setting-label">
                   <label for="planToolCalls" class="form-label">Tool-call cap</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the PLAN tool-call cap"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Total tool calls allowed during PLAN research. Whichever limit is hit first, rounds or calls, ends the research phase. Default 32, maximum 200."></i>
+                     title="Total tool calls allowed during PLAN research. Whichever limit is hit first, rounds or calls, ends the research phase. 0 removes the call side of the budget; set both to 0 to research without any budget. Default 32."></i>
                 </div>
-                <input id="planToolCalls" type="number" min="1" max="200" class="form-control">
+                <input id="planToolCalls" type="number" min="0" class="form-control">
               </div>
             </div>
           </section>
@@ -594,18 +594,18 @@
                   <label for="maxRead" class="form-label">Max file read (chars)</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the read limit"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Characters read_file returns per call. Bigger files are truncated with a hint to narrow the line range, so prefer reading windows over raising this. Default 25000."></i>
+                     title="Characters read_file returns per call. Bigger files are truncated with a hint to narrow the line range, so prefer reading windows over raising this. 0 means no character cap; the 200-line window per call still applies. Default 25000."></i>
                 </div>
-                <input id="maxRead" type="number" min="1000" max="2000000" class="form-control">
+                <input id="maxRead" type="number" min="0" class="form-control">
               </div>
               <div class="col-md-6">
                 <div class="setting-label">
                   <label for="bashTimeout" class="form-label">Bash timeout (seconds)</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the bash timeout"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Seconds a shell command may run before it is killed. Applies to every bash call, so raise it for slow builds and test suites. Default 30, maximum 600."></i>
+                     title="Seconds a shell command may run before it is killed. Applies to every bash call, so raise it for slow builds and test suites. 0 means no timeout: the command runs until it finishes or you press Stop. Default 30."></i>
                 </div>
-                <input id="bashTimeout" type="number" min="1" max="600" class="form-control">
+                <input id="bashTimeout" type="number" min="0" class="form-control">
               </div>
             </div>
           </section>
@@ -633,7 +633,7 @@
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
                      title="Absolute token ceiling per request, so huge-context models do not get enormous prompts. Set to 0 to disable the token budget. Default 120000."></i>
                 </div>
-                <input id="historyPruneMaxTokens" type="number" min="0" max="2000000" step="1000" class="form-control">
+                <input id="historyPruneMaxTokens" type="number" min="0" step="1000" class="form-control">
               </div>
               <div class="col-12">
                 <div id="effectiveBudget" class="settings-hint"></div>
@@ -643,18 +643,18 @@
                   <label for="historyKeepRecent" class="form-label">Keep recent tool rounds</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About recent rounds"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Legacy round-based window: how many of the newest tool rounds stay verbatim. Only used when the token budget is disabled by setting either budget value to 0. Default 0."></i>
+                     title="Legacy round-based window: how many of the newest tool rounds stay verbatim. Only used when the token budget is disabled by setting either budget value to 0. 0 keeps every round, so nothing is stubbed. Default 0."></i>
                 </div>
-                <input id="historyKeepRecent" type="number" min="0" max="100" class="form-control">
+                <input id="historyKeepRecent" type="number" min="0" class="form-control">
               </div>
               <div class="col-md-4">
                 <div class="setting-label">
                   <label for="historyPruneChunk" class="form-label">Prune every N rounds</label>
                   <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About prune chunks"
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
-                     title="Legacy round-based window: prune in chunks of N rounds instead of on every request. Only used when the token budget is disabled. Default 0."></i>
+                     title="Legacy round-based window: prune in chunks of N rounds instead of on every request, which keeps the prompt prefix stable for the provider cache. Only used when the token budget is disabled. 0 selects the default granularity of 4. Default 0."></i>
                 </div>
-                <input id="historyPruneChunk" type="number" min="0" max="100" class="form-control">
+                <input id="historyPruneChunk" type="number" min="0" class="form-control">
               </div>
               <div class="col-md-4">
                 <div class="setting-label">
@@ -663,7 +663,7 @@
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
                      title="Older tool results are stubbed down to this many characters. 0 keeps them intact and lets the token budget do all the work. Default 16000."></i>
                 </div>
-                <input id="historyMaxResult" type="number" min="0" max="25000" step="500" class="form-control">
+                <input id="historyMaxResult" type="number" min="0" step="500" class="form-control">
               </div>
               <div class="col-md-4">
                 <div class="setting-label">
@@ -672,7 +672,7 @@
                      data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
                      title="Older tool arguments are stubbed down to this many characters. 0 keeps them intact. Default 4000."></i>
                 </div>
-                <input id="historyMaxArg" type="number" min="0" max="25000" step="500" class="form-control">
+                <input id="historyMaxArg" type="number" min="0" step="500" class="form-control">
               </div>
             </div>
           </section>

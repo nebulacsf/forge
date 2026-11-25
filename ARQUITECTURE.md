@@ -98,14 +98,21 @@ POST /api/chat/stream (session_id, content)
 └────────────────────────────────────────────────────────┘
 ```
 
-A **round** is one model call; it may contain several tool calls. The 24-round
-limit is therefore the **checkpoint/segment size**, not the total work a turn can
-do. `max_turn_rounds` (default 96) bounds the whole turn, and `auto_continue`
-crosses segment boundaries automatically while the model is still working.
+A **round** is one model call; it may contain several tool calls.
+`max_tool_rounds` (default 16) is therefore the **checkpoint/segment size**, not
+the total work a turn can do. `max_turn_rounds` (default 64) bounds the whole
+turn, and `auto_continue` crosses segment boundaries automatically while the
+model is still working. Either value can be `0`, which removes the ceiling: with
+`max_tool_rounds = 0` the turn is a single segment and no checkpoint is ever
+reached, and with `max_turn_rounds = 0` only the model finishing or the user
+cancelling ends the turn. The loops iterate against an internal sentinel
+(`noRoundLimit`) while the SSE events keep reporting `limit: 0`, which is what
+the UI reads to hide the denominator.
 
 PLAN is special-cased: it is one bounded research turn with its own
-`plan_rounds` (default 16, max 24) and `plan_tool_calls` (default 64, max 200)
-budget. When either limit is reached, the next request keeps the tool
+`plan_rounds` (default 16) and `plan_tool_calls` (default 32) budget, neither of
+which has an upper bound and both of which can be `0`. When either limit is
+reached, the next request keeps the tool
 definitions for cache stability but sets `tool_choice=none` and appends a
 final-answer instruction. Tool calls emitted in that round are ignored. The
 finalization phase allows three attempts; empty answers, reasoning-only replies,
@@ -218,8 +225,9 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
   summary (`history_max_arg_chars`, default 4,000). A large `write_file` payload
   is therefore never re-sent.
 - Setting either budget knob to `0` disables the budget and re-enables the
-  legacy round-based window `history_keep_recent_rounds` (default 0, max 100).
-  Both legacy knobs ship at `0` (disabled) because the budget replaces them.
+  legacy round-based window `history_keep_recent_rounds` (default 0). With
+  `history_keep_recent_rounds = 0` and the budget off, nothing is stubbed:
+  every round travels verbatim.
 - Older rounds are **stubbed in place**: the assistant tool call remains at its
   original position with compacted arguments, and its tool result becomes a
   one-line `[pruned] tool target → outcome` digest. Nothing is removed,
@@ -257,7 +265,7 @@ Forge prunes tool traffic so a long turn does not re-inject every prior result:
 - Validation + normalization on every `Update()`
 - `defaults.history_*` control history pruning (see 3.2)
 - `defaults.plan_rounds` / `defaults.plan_tool_calls` bound PLAN research
-  (defaults 16 / 64; clamped to 24 / 200)
+  (defaults 16 / 32; no upper bound; `0` removes that side of the budget)
 - Hot-reload: invalidates the model cache when legacy config changes; provider
   profiles are read from SQLite on every turn, so provider changes need no restart
 

@@ -63,12 +63,11 @@ type historyStats struct {
 }
 
 func normalizeHistoryOptions(o historyOptions) historyOptions {
-	if o.KeepRecent <= 0 {
+	// A negative value means "not configured" and falls back to the shipped
+	// default. An explicit 0 is honored: KeepRecent 0 keeps every round verbatim
+	// and the Max* 0 caps disable the clipping, as documented in the settings.
+	if o.KeepRecent < 0 {
 		o.KeepRecent = defaultHistoryKeepRecent
-	}
-	// PLAN raises KeepRecent to plan_rounds+2, and plan_rounds can be 24.
-	if o.KeepRecent > 100 {
-		o.KeepRecent = 100
 	}
 	if o.MaxResultChars < 0 {
 		o.MaxResultChars = defaultHistoryMaxResult
@@ -76,11 +75,10 @@ func normalizeHistoryOptions(o historyOptions) historyOptions {
 	if o.MaxArgChars < 0 {
 		o.MaxArgChars = defaultHistoryMaxArg
 	}
+	// ChunkRounds is not a ceiling but the granularity of the pruning boundary,
+	// so 0 selects the default chunk instead of meaning "no limit".
 	if o.ChunkRounds <= 0 {
 		o.ChunkRounds = defaultHistoryChunk
-	}
-	if o.ChunkRounds > 100 {
-		o.ChunkRounds = 100
 	}
 	return o
 }
@@ -234,11 +232,17 @@ func buildHistory(rows []store.Message, system string, opts historyOptions) ([]l
 		}
 	}
 	var collapseBefore int
-	if opts.TokenBudget > 0 {
+	switch {
+	case opts.TokenBudget > 0:
 		// Budget-driven pruning: keep as many recent rounds verbatim as the
 		// token ceiling allows, so large-context models actually get used.
 		collapseBefore = budgetBoundary(rows, system, opts)
-	} else {
+	case opts.KeepRecent <= 0:
+		// With the budget off and no round window there is nothing to trim:
+		// every round travels verbatim, which is what history_keep_recent_rounds
+		// = 0 asks for.
+		collapseBefore = 0
+	default:
 		collapseBefore = pruneBoundary(toolRounds, opts.KeepRecent, opts.ChunkRounds)
 	}
 	// PLAN keeps its whole research turn verbatim even if one huge read blows

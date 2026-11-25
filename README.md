@@ -71,7 +71,7 @@ At the start of a new task the agent records it in the checklist before reading
 files or running any other tool, and keeps the list updated as it works.
 
 PLAN is a bounded research turn. It has its own budget (`plan_rounds` and
-`plan_tool_calls`, default 16 rounds / 64 calls, max 24 / 200) and never
+`plan_tool_calls`, default 16 rounds / 32 calls, no upper bound) and never
 auto-continues. When the budget is reached, Forge requires the final plan. It
 gives the model up to three final attempts, rejects empty answers and
 tool calls written as text (`<tool_call>`, XML or JSON), and removes the tool
@@ -141,7 +141,8 @@ question batch is still pending. If a model returns only reasoning and no final
 answer, Forge expands the reasoning card and warns you instead of leaving an
 apparently empty turn.
 
-`bash` runs in the project root with a timeout (default 30 s, capped at 600 s)
+`bash` runs in the project root with a timeout (default 30 s, no upper bound;
+set it to 0 for no timeout at all)
 and is killed as a process group on timeout or cancellation. Each call is a
 fresh shell, so `cd` does not persist; when a command needs another directory,
 use one absolute, quoted literal path in the same call (`cd "/abs/path" && …`).
@@ -191,8 +192,8 @@ already arrived.
 ### Long turns and checkpoints
 
 A **round** is one model call and may run several tools. BUILD checkpoints every
-`max_tool_rounds` rounds (default **24**) and keeps going automatically until
-`max_turn_rounds` (default **96**) when **auto-continue** is enabled. A
+`max_tool_rounds` rounds (default **16**) and keeps going automatically until
+`max_turn_rounds` (default **64**) when **auto-continue** is enabled. A
 checkpoint never loses work: every tool result is already persisted, and a
 paused turn shows a **Continue** action.
 
@@ -279,6 +280,13 @@ system shortcuts.
 
 `log_file` defaults to `<forge home>/forge.log`; set it to an absolute path to
 move the log.
+
+Every limit in `defaults` follows one contract: **`0` means no limit** and is
+applied exactly as written, while a negative value means "not configured" and
+falls back to the shipped default. There is no upper bound, so how far a turn,
+a read or a command may go is the developer's decision. The one exception is
+`history_prune_chunk_rounds`, which is the granularity of the pruning boundary
+rather than a ceiling: `0` selects the default chunk of 4.
 
 The `providers.openrouter` block is kept for backwards compatibility. On first
 startup with an empty database, Forge seeds it as the active `openrouter`

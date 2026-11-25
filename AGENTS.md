@@ -63,8 +63,11 @@ touched (`go test ./internal/tools/ -run TestName`), and report the real outcome
   Shared state in a manager is guarded by a mutex (`config.Manager`).
 - Config and DB writes are atomic: temp file → `chmod 0600` → rename
   (`Manager.writeLocked`, `internal/config/config.go:224`).
-- Normalize/validate user input in `Update()`/handlers; clamp to the documented
-  bounds (0 usually means "unlimited" or "use default", negative means fallback).
+- Normalize/validate user input in `Update()`/handlers. Every limit shares one
+  contract: an explicit `0` means "no limit" and is preserved verbatim, a
+  negative value falls back to the shipped default, and nothing is clamped to a
+  ceiling. The only exception is `history_prune_chunk_rounds`, where `0` selects
+  the default pruning granularity because it is not a ceiling.
 - Prefer stdlib and small focused files over new abstractions. No speculative
   interfaces and no options struct with one caller.
 - Match the existing naming: `handleX` for HTTP handlers, `Manager.x` for tools,
@@ -103,9 +106,11 @@ startup by design. Persisted columns that should not appear in list responses ar
 left out of the struct on purpose (`sessions.project_instructions`).
 
 **Add a configuration knob.** Field in `DefaultsConfig` + a value in `Default()` +
-range normalization in `Update()` + the Settings form field with an inline
-tooltip explaining unit, default and effect. Provider state lives in SQLite, not
-in `config.json`.
+normalization in `Update()` + the Settings form field with an inline tooltip
+explaining unit, default, the `0 = no limit` meaning and the effect of disabling
+it. The form input carries `min="0"` and no `max`; read it with `??` and save it
+through `numOr` so a typed 0 survives. Provider state lives in SQLite, not in
+`config.json`.
 
 **Touch the prompt.** Only stable content may enter the system prompt. The
 checklist, repository outline, research ledger, guard note and forced-final

@@ -2321,6 +2321,9 @@ function updateStreamLabel() {
       text += ` · segment ${segment}/${segments}`;
     }
     label.textContent = text;
+  } else if (round > 0) {
+    // No configured ceiling: report progress without an invented denominator.
+    label.textContent = `round ${round} · unlimited`;
   } else {
     label.textContent = 'working';
   }
@@ -4004,10 +4007,12 @@ function openSettings() {
   renderSessionProviderOptions();
   $('defaultModel').value = cfg.defaults.model || '';
   $('defaultMode').value = cfg.defaults.mode || 'PLAN';
-  $('maxRead').value = cfg.defaults.max_file_read_chars || 25000;
-  $('bashTimeout').value = cfg.defaults.bash_timeout_sec || 30;
-  $('maxToolRounds').value = cfg.defaults.max_tool_rounds || 16;
-  $('maxTurnRounds').value = cfg.defaults.max_turn_rounds || 64;
+  // A stored 0 means "no limit" and must be shown as 0, so every field is read
+  // with ?? instead of ||: the latter would silently turn 0 into a default.
+  $('maxRead').value = cfg.defaults.max_file_read_chars ?? 25000;
+  $('bashTimeout').value = cfg.defaults.bash_timeout_sec ?? 30;
+  $('maxToolRounds').value = cfg.defaults.max_tool_rounds ?? 16;
+  $('maxTurnRounds').value = cfg.defaults.max_turn_rounds ?? 64;
   $('maxTurnCost').value = cfg.defaults.max_turn_cost_usd ?? 0;
   $('planRounds').value = cfg.defaults.plan_rounds ?? 16;
   $('planToolCalls').value = cfg.defaults.plan_tool_calls ?? 32;
@@ -4065,19 +4070,21 @@ async function saveSettings(e) {
   // OpenRouter section stays untouched so older config files keep working.
   cfg.defaults.model = $('defaultModel').value.trim();
   cfg.defaults.mode = $('defaultMode').value;
-  cfg.defaults.max_file_read_chars = Number($('maxRead').value) || 25000;
-  cfg.defaults.bash_timeout_sec = Number($('bashTimeout').value) || 30;
-  cfg.defaults.max_tool_rounds = Number($('maxToolRounds').value) || 24;
-  cfg.defaults.max_turn_rounds = Number($('maxTurnRounds').value) || 96;
-  cfg.defaults.max_turn_cost_usd = Number($('maxTurnCost').value) || 0;
-  cfg.defaults.plan_rounds = Number($('planRounds').value) || 16;
-  cfg.defaults.plan_tool_calls = Number($('planToolCalls').value) || 64;
+  // Only an empty or non-numeric field falls back to a default: a typed 0 is a
+  // real choice ("no limit") and must reach the server unchanged.
   const numOr = (id, fallback) => {
     const raw = $(id).value.trim();
     if (raw === '') return fallback;
     const n = Number(raw);
     return Number.isFinite(n) ? n : fallback;
   };
+  cfg.defaults.max_file_read_chars = numOr('maxRead', 25000);
+  cfg.defaults.bash_timeout_sec = numOr('bashTimeout', 30);
+  cfg.defaults.max_tool_rounds = numOr('maxToolRounds', 16);
+  cfg.defaults.max_turn_rounds = numOr('maxTurnRounds', 64);
+  cfg.defaults.max_turn_cost_usd = numOr('maxTurnCost', 0);
+  cfg.defaults.plan_rounds = numOr('planRounds', 16);
+  cfg.defaults.plan_tool_calls = numOr('planToolCalls', 32);
   cfg.defaults.history_prune_percent = numOr('historyPrunePercent', 70);
   cfg.defaults.history_prune_max_tokens = numOr('historyPruneMaxTokens', 120000);
   cfg.defaults.history_keep_recent_rounds = numOr('historyKeepRecent', 0);

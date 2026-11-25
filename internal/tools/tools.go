@@ -95,10 +95,12 @@ func NewManager(root string, maxRead int, bashTimeout time.Duration, st *store.S
 	if !info.IsDir() {
 		return nil, fmt.Errorf("%s is not a directory", abs)
 	}
-	if maxRead <= 0 {
+	// Both limits treat 0 as "no limit" and only a negative value as "not
+	// configured": the caller decides, these fallbacks are for legacy callers.
+	if maxRead < 0 {
 		maxRead = readOutputLimit
 	}
-	if bashTimeout <= 0 {
+	if bashTimeout < 0 {
 		bashTimeout = 30 * time.Second
 	}
 	return &Manager{Root: abs, MaxRead: maxRead, BashTimeout: bashTimeout, Store: st, SessionID: sessionID}, nil
@@ -311,7 +313,7 @@ func Specs(mode string) []llm.Tool {
 					Description: "Run a shell command with bash. Each call starts in the project root in a fresh shell, so `cd` does not persist. Use absolute, quoted literal paths; when a command needs another directory, combine it in the same call as `cd \"/abs/path\" && ...`. Output is truncated and commands are killed on timeout.",
 					Parameters: objectSchema(map[string]any{
 						"command":     stringProp("Shell command to execute."),
-						"timeout_sec": integerProp("Optional timeout in seconds (capped at 600)."),
+						"timeout_sec": integerProp("Optional timeout in seconds. Omit it to use the configured default; a configured 0 means no timeout at all."),
 					}, "command"),
 				},
 			},
@@ -563,10 +565,11 @@ func (m *Manager) readFile(rel string, startLine, endLine int) Result {
 		endLine = total
 	}
 
+	// A non-positive MaxRead is the developer asking for no character cap, so
+	// the whole requested window is returned. The line window and the per-line
+	// width stay, because they are the shape of the tool, not a setting.
 	limit := m.MaxRead
-	if limit < 1 {
-		limit = readOutputLimit
-	}
+	cappedChars := limit > 0
 	width := len(strconv.Itoa(endLine))
 
 	var body strings.Builder
@@ -579,15 +582,17 @@ func (m *Manager) readFile(rel string, startLine, endLine int) Result {
 		}
 		rendered := fmt.Sprintf("%*d | %s\n", width, n, text)
 		need := utf8.RuneCountInString(rendered)
-		remaining := limit - used
-		if need > remaining {
-			if remaining > 0 {
-				body.WriteString(truncateRunes(rendered, remaining))
-				used += remaining
-				returned++
+		if cappedChars {
+			remaining := limit - used
+			if need > remaining {
+				if remaining > 0 {
+					body.WriteString(truncateRunes(rendered, remaining))
+					used += remaining
+					returned++
+				}
+				charTruncated = true
+				break
 			}
-			charTruncated = true
-			break
 		}
 		body.WriteString(rendered)
 		used += need
@@ -1156,21 +1161,31 @@ func (m *Manager) refreshOutline(rel string) {
 // ---------------------------------------------------------------------------
 // bash
 
+// resolveBashTimeout picks the deadline for one shell call. A per-call
+// timeout_sec wins over the configured default, and a non-positive result means
+// "no deadline at all": the command then only stops when it exits or the turn is
+// cancelled, which is what an explicit 0 in the settings asks for.
+func resolveBashTimeout(configured time.Duration, timeoutSec int) time.Duration {
+	timeout := configured
+	if timeoutSec > 0 {
+		timeout = time.Duration(timeoutSec) * time.Second
+	}
+	if timeout > 0 && timeout < time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
 func (m *Manager) bash(parent context.Context, command string, timeoutSec int) Result {
 	if strings.TrimSpace(command) == "" {
 		return fail("bash: command is required")
 	}
-	timeout := m.BashTimeout
-	if timeoutSec > 0 {
-		timeout = time.Duration(timeoutSec) * time.Second
+	timeout := resolveBashTimeout(m.BashTimeout, timeoutSec)
+	ctx := parent
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
 	}
-	if timeout > 600*time.Second {
-		timeout = 600 * time.Second
-	}
-	if timeout < time.Second {
-		timeout = time.Second
-	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	logx.Debug("bash exec", "session", m.SessionID, "timeout", timeout.String(),

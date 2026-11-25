@@ -44,16 +44,29 @@ type OpenRouterConfig struct {
 	BaseURL string `json:"base_url"`
 }
 
+// DefaultsConfig holds the per-turn limits. They all share one contract: an
+// explicit 0 means "no limit" and is honored as written, while a negative value
+// means "not configured" and falls back to the shipped default. There is no
+// upper bound: how far a turn may go is the developer's decision alone.
 type DefaultsConfig struct {
-	Model            string `json:"model"`
-	Mode             string `json:"mode"`
-	MaxFileReadChars int    `json:"max_file_read_chars"`
-	BashTimeoutSec   int    `json:"bash_timeout_sec"`
-	MaxToolRounds    int    `json:"max_tool_rounds"`
-	MaxTurnRounds    int    `json:"max_turn_rounds"`
+	Model  string `json:"model"`
+	Mode   string `json:"mode"`
+	// MaxFileReadChars caps the characters read_file returns per call.
+	// 0 returns every requested line.
+	MaxFileReadChars int `json:"max_file_read_chars"`
+	// BashTimeoutSec caps a shell command. 0 means no timeout at all: the
+	// command runs until it finishes or the turn is cancelled.
+	BashTimeoutSec int `json:"bash_timeout_sec"`
+	// MaxToolRounds is the checkpoint size of a BUILD turn. 0 runs the whole
+	// turn as a single segment, so no checkpoint is ever reached.
+	MaxToolRounds int `json:"max_tool_rounds"`
+	// MaxTurnRounds bounds a whole turn, checkpoints included. 0 means the turn
+	// only ends when the model stops calling tools or the user cancels.
+	MaxTurnRounds int `json:"max_turn_rounds"`
 	// PLAN mode has its own research budget. When either limit is reached the
 	// harness disables tools and requires the final plan, so a tool-hungry model
-	// cannot loop indefinitely while researching.
+	// cannot loop indefinitely while researching. Setting both to 0 removes the
+	// budget: research is then bounded by the turn ceiling and the loop guard.
 	PlanRounds     int     `json:"plan_rounds"`
 	PlanToolCalls  int     `json:"plan_tool_calls"`
 	AutoContinue   *bool   `json:"auto_continue"`
@@ -273,44 +286,33 @@ func normalize(c Config) Config {
 	if c.Defaults.Mode != "BUILD" {
 		c.Defaults.Mode = "PLAN"
 	}
-	if c.Defaults.MaxFileReadChars <= 0 {
+	// Every limit shares one contract: a negative value means "not configured"
+	// and falls back to the shipped default, while an explicit 0 means "no
+	// limit" and is preserved verbatim. Nothing is clamped to a ceiling any
+	// more, so how far a turn may go is the developer's decision alone.
+	if c.Defaults.MaxFileReadChars < 0 {
 		c.Defaults.MaxFileReadChars = d.Defaults.MaxFileReadChars
 	}
-	if c.Defaults.MaxFileReadChars > 2_000_000 {
-		c.Defaults.MaxFileReadChars = 2_000_000
-	}
-	if c.Defaults.BashTimeoutSec <= 0 {
+	if c.Defaults.BashTimeoutSec < 0 {
 		c.Defaults.BashTimeoutSec = d.Defaults.BashTimeoutSec
 	}
-	if c.Defaults.BashTimeoutSec > 600 {
-		c.Defaults.BashTimeoutSec = 600
-	}
-	if c.Defaults.MaxToolRounds <= 0 {
+	if c.Defaults.MaxToolRounds < 0 {
 		c.Defaults.MaxToolRounds = d.Defaults.MaxToolRounds
 	}
-	if c.Defaults.MaxToolRounds > 200 {
-		c.Defaults.MaxToolRounds = 200
-	}
-	if c.Defaults.MaxTurnRounds <= 0 {
+	if c.Defaults.MaxTurnRounds < 0 {
 		c.Defaults.MaxTurnRounds = d.Defaults.MaxTurnRounds
 	}
-	if c.Defaults.MaxTurnRounds > 1000 {
-		c.Defaults.MaxTurnRounds = 1000
-	}
-	if c.Defaults.MaxTurnRounds < c.Defaults.MaxToolRounds {
+	// A checkpoint wider than the turn itself could never be reached, so the
+	// turn is widened to it. Both sides must be bounded for that to matter.
+	if c.Defaults.MaxToolRounds > 0 && c.Defaults.MaxTurnRounds > 0 &&
+		c.Defaults.MaxTurnRounds < c.Defaults.MaxToolRounds {
 		c.Defaults.MaxTurnRounds = c.Defaults.MaxToolRounds
 	}
-	if c.Defaults.PlanRounds <= 0 {
+	if c.Defaults.PlanRounds < 0 {
 		c.Defaults.PlanRounds = d.Defaults.PlanRounds
 	}
-	if c.Defaults.PlanRounds > 24 {
-		c.Defaults.PlanRounds = 24
-	}
-	if c.Defaults.PlanToolCalls <= 0 {
+	if c.Defaults.PlanToolCalls < 0 {
 		c.Defaults.PlanToolCalls = d.Defaults.PlanToolCalls
-	}
-	if c.Defaults.PlanToolCalls > 200 {
-		c.Defaults.PlanToolCalls = 200
 	}
 	if c.Defaults.AutoContinue == nil {
 		c.Defaults.AutoContinue = d.Defaults.AutoContinue
@@ -321,55 +323,29 @@ func normalize(c Config) Config {
 	if c.Defaults.MaxConcurrentRuns < 0 {
 		c.Defaults.MaxConcurrentRuns = 0
 	}
-	if c.Defaults.MaxConcurrentRuns > 64 {
-		c.Defaults.MaxConcurrentRuns = 64
-	}
 	// Token-budget pruning: 0 disables the budget and re-enables the legacy
 	// round-based knobs. Negative values fall back to the shipped default.
 	if c.Defaults.HistoryPrunePercent < 0 {
 		c.Defaults.HistoryPrunePercent = d.Defaults.HistoryPrunePercent
 	}
-	if c.Defaults.HistoryPrunePercent > 100 {
-		c.Defaults.HistoryPrunePercent = 100
-	}
 	if c.Defaults.HistoryPruneMaxTokens < 0 {
 		c.Defaults.HistoryPruneMaxTokens = d.Defaults.HistoryPruneMaxTokens
 	}
-	if c.Defaults.HistoryPruneMaxTokens > 2_000_000 {
-		c.Defaults.HistoryPruneMaxTokens = 2_000_000
-	}
-	// Legacy round-based knobs: 0 keeps them disabled, which is the shipped
-	// state now that the token budget drives pruning.
+	// 0 keeps every round verbatim, which turns round-based pruning off and
+	// leaves the token budget as the only thing that trims the request.
 	if c.Defaults.HistoryKeepRecent < 0 {
 		c.Defaults.HistoryKeepRecent = 0
 	}
-	if c.Defaults.HistoryKeepRecent > 100 {
-		c.Defaults.HistoryKeepRecent = 100
-	}
-	// 0 disables the cap; negative values fall back to the shipped default.
 	if c.Defaults.HistoryMaxResult < 0 {
 		c.Defaults.HistoryMaxResult = d.Defaults.HistoryMaxResult
-	}
-	if c.Defaults.HistoryMaxResult > 0 && c.Defaults.HistoryMaxResult < 500 {
-		c.Defaults.HistoryMaxResult = 500
-	}
-	if c.Defaults.HistoryMaxResult > 25000 {
-		c.Defaults.HistoryMaxResult = 25000
 	}
 	if c.Defaults.HistoryMaxArg < 0 {
 		c.Defaults.HistoryMaxArg = d.Defaults.HistoryMaxArg
 	}
-	if c.Defaults.HistoryMaxArg > 0 && c.Defaults.HistoryMaxArg < 200 {
-		c.Defaults.HistoryMaxArg = 200
-	}
-	if c.Defaults.HistoryMaxArg > 25000 {
-		c.Defaults.HistoryMaxArg = 25000
-	}
+	// 0 is not "no limit" here: it selects the default granularity of the
+	// pruning boundary, which is what keeps the provider prompt cache warm.
 	if c.Defaults.HistoryPruneChunk < 0 {
 		c.Defaults.HistoryPruneChunk = 0
-	}
-	if c.Defaults.HistoryPruneChunk > 100 {
-		c.Defaults.HistoryPruneChunk = 100
 	}
 	return c
 }

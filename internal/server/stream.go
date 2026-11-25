@@ -19,10 +19,10 @@ import (
 )
 
 const (
-	defaultSegmentRounds = 24
-	defaultTurnRounds    = 96
-	defaultPlanRounds    = 16
-	defaultPlanToolCalls = 64
+	// noRoundLimit stands in for an absent ceiling while iterating. Every limit
+	// is off when the developer configures 0, so the loops need a finite bound
+	// that is never reached instead of branching on "no limit" everywhere.
+	noRoundLimit         = 1 << 30
 	planFinalGraceRounds = 4
 	planFinalRetries     = 2
 	planMinResultChars   = 8000
@@ -283,38 +283,41 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 	}
 	specs := tools.Specs(session.Mode)
 
+	// A configured 0 means the developer asked for no limit, so it is honored as
+	// written instead of falling back to a default: it is never turned into a
+	// ceiling. The *Rounds values below are the effective iteration bounds and
+	// stay above their limit only because the loops need a finite number.
 	segmentSize := cfg.Defaults.MaxToolRounds
+	segmentRounds := segmentSize
 	if segmentSize <= 0 {
-		segmentSize = defaultSegmentRounds
+		segmentRounds = noRoundLimit
 	}
 	turnLimit := cfg.Defaults.MaxTurnRounds
+	turnRounds := turnLimit
 	if turnLimit <= 0 {
-		turnLimit = defaultTurnRounds
+		turnRounds = noRoundLimit
 	}
-	if turnLimit < segmentSize {
-		turnLimit = segmentSize
+	if turnLimit > 0 && turnLimit < segmentSize {
+		turnLimit, turnRounds = segmentSize, segmentSize
 	}
 	planRounds := cfg.Defaults.PlanRounds
-	if planRounds <= 0 {
-		planRounds = defaultPlanRounds
-	}
 	planToolCalls := cfg.Defaults.PlanToolCalls
-	if planToolCalls <= 0 {
-		planToolCalls = defaultPlanToolCalls
-	}
 	autoContinue := cfg.Defaults.AutoContinue == nil || *cfg.Defaults.AutoContinue
 	turnCostLimit := cfg.Defaults.MaxTurnCostUSD
 
 	// PLAN is a single bounded research turn. It never auto-continues: when the
 	// research budget is spent, tools are disabled and the model must answer.
 	// The extra grace rounds cover the forced final answer and its retries.
+	// Without a research budget there is nothing to finalize for, so the turn
+	// falls back to the configured turn ceiling.
 	if session.Mode == "PLAN" {
-		if planRounds < 1 {
-			planRounds = 1
-		}
-		turnLimit = planRounds + planFinalGraceRounds
-		segmentSize = turnLimit
 		autoContinue = false
+		if planRounds > 0 || planToolCalls > 0 {
+			turnLimit = planRounds + planFinalGraceRounds
+			turnRounds, segmentSize, segmentRounds = turnLimit, turnLimit, turnLimit
+		} else {
+			segmentSize, segmentRounds = turnLimit, turnRounds
+		}
 	}
 
 	// The stable instruction prefix depends only on values fixed for the turn,
@@ -343,7 +346,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 
 	for {
 		var abortReason, abortMessage string
-		for segRound := 1; segRound <= segmentSize && totalRounds < turnLimit; segRound++ {
+		for segRound := 1; segRound <= segmentRounds && totalRounds < turnRounds; segRound++ {
 			totalRounds++
 			if ctx.Err() != nil {
 				cancelTurn("", "")
@@ -366,9 +369,12 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			// The PLAN research budget is a hard stop. Once it is spent the next
 			// round is the final answer: tools stay in the request for prompt
 			// cache stability, but tool_choice=none and the server ignores any
-			// tool call the provider still emits.
+			// tool call the provider still emits. A configured 0 disables that
+			// side of the budget entirely, so the turn has nothing to finalize
+			// for and the model decides when the plan is ready.
 			if session.Mode == "PLAN" && !finalizing &&
-				(toolRounds >= planRounds || toolCalls >= planToolCalls) {
+				((planRounds > 0 && toolRounds >= planRounds) ||
+					(planToolCalls > 0 && toolCalls >= planToolCalls)) {
 				finalizing = true
 				finalAttempts = 0
 				finalReason = "research budget exhausted"
@@ -392,8 +398,10 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			// round of this turn verbatim so pruning cannot erase the findings
 			// that the model needs for the final plan. Older turns are pruned
 			// normally; the budget guarantees the current turn stays small.
+			// Without a research budget there is no such guarantee, so the token
+			// budget or history_keep_recent_rounds decides alone.
 			planFloor := 0
-			if session.Mode == "PLAN" {
+			if session.Mode == "PLAN" && planRounds > 0 {
 				planFloor = planRounds + 2
 				if planFloor > keepRecent {
 					keepRecent = planFloor
@@ -636,7 +644,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 					// reaches the forced finalization instead of consuming grace rounds.
 					toolRounds++
 					toolCalls++
-					if totalRounds < turnLimit {
+					if totalRounds < turnRounds {
 						guardNote = "Invalid response: tool calls must use the native tool interface. " +
 							"Do not write <tool_call>, <function=...>, XML, or JSON tool calls in the response text. " +
 							"Use the native tools, or write the final plan if the budget is exhausted."
@@ -816,7 +824,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 				// In PLAN, a pathological loop should still produce a plan instead
 				// of ending with no answer. Disable tools and force the final
 				// response on the next round. BUILD keeps the existing pause.
-				if session.Mode == "PLAN" && !finalizing && totalRounds < turnLimit {
+				if session.Mode == "PLAN" && !finalizing && totalRounds < turnRounds {
 					logx.Warn("plan guard forcing final answer", "session", session.ID,
 						"reason", abortReason, "round", totalRounds)
 					finalizing = true
@@ -856,7 +864,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			cancelTurn("", "")
 			return
 		}
-		if totalRounds >= turnLimit {
+		if totalRounds >= turnRounds {
 			break
 		}
 		if !autoContinue {
@@ -1009,21 +1017,37 @@ func buildSystemPrompt(opts promptOptions) string {
 	b.WriteString("Tool calls must use the native tool-calling interface. Never write <tool_call>, <function=...>, XML, or JSON tool calls in the response text; they are not executed.\n")
 	b.WriteString("Batch independent tool calls in the same response. One round can contain several reads or searches; use that to conserve the budget.\n")
 	if session.Mode == "PLAN" {
-		fmt.Fprintf(&b, `
-PLAN research budget:
-- This turn allows %d tool rounds and %d tool calls. The harness stops after the round that reaches either limit and requires the final plan.
-- Every response counts as one round even when it contains several tool calls. Batch independent reads and searches in the same response.
+		b.WriteString("\nPLAN research budget:\n")
+		switch {
+		case planRounds > 0 && planToolCalls > 0:
+			fmt.Fprintf(&b, "- This turn allows %d tool rounds and %d tool calls. The harness stops after the round that reaches either limit and requires the final plan.\n", planRounds, planToolCalls)
+		case planRounds > 0:
+			fmt.Fprintf(&b, "- This turn allows %d tool rounds. The harness stops after the round that reaches that limit and requires the final plan; the number of tool calls per round is not capped.\n", planRounds)
+		case planToolCalls > 0:
+			fmt.Fprintf(&b, "- This turn allows %d tool calls. The harness stops after the round that reaches that limit and requires the final plan; the number of rounds is not capped.\n", planToolCalls)
+		default:
+			b.WriteString("- This turn has no research budget: no round or tool-call ceiling is enforced, and no final plan is forced. Research until you can name the files, the symbols, and the exact changes, then write the plan.\n")
+		}
+		b.WriteString(`- Every response counts as one round even when it contains several tool calls. Batch independent reads and searches in the same response.
 - Stop as soon as you can name the files, the symbols, and the exact changes. Do not try to inspect every line of the project.
 - The research ledger in the current-state message lists what you already read and searched this turn.
 - If the budget is reached, answer with the best plan you can and state any remaining uncertainty in one short line.
-`, planRounds, planToolCalls)
+`)
 	} else {
-		fmt.Fprintf(&b, `
-Step budget:
-- This turn allows up to %d model rounds and is checkpointed every %d rounds; it continues automatically when needed.
-- Every response counts as one round even when it contains several tool calls. Batch independent reads, searches, and edits in the same response to conserve the budget.
+		b.WriteString("\nStep budget:\n")
+		switch {
+		case turnLimit > 0 && segmentSize > 0:
+			fmt.Fprintf(&b, "- This turn allows up to %d model rounds and is checkpointed every %d rounds; it continues automatically when needed.\n", turnLimit, segmentSize)
+		case turnLimit > 0:
+			fmt.Fprintf(&b, "- This turn allows up to %d model rounds and is never checkpointed: it runs straight through.\n", turnLimit)
+		case segmentSize > 0:
+			fmt.Fprintf(&b, "- This turn has no round ceiling and is checkpointed every %d rounds, continuing automatically when needed. Keep the checklist current so a checkpoint never leaves the work in an unclear state.\n", segmentSize)
+		default:
+			b.WriteString("- This turn has no round ceiling and no checkpoints: it runs until the task is finished or you cancel it.\n")
+		}
+		b.WriteString(`- Every response counts as one round even when it contains several tool calls. Batch independent reads, searches, and edits in the same response to conserve the budget.
 - Do not stop early just because a task is large. When a checkpoint approaches, update the checklist and leave a clear handoff.
-`, turnLimit, segmentSize)
+`)
 	}
 	b.WriteString(`
 Operating rules:
