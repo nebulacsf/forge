@@ -124,6 +124,14 @@
           </div>
 
           <div class="ms-auto d-flex align-items-center gap-2">
+            <!-- The turn's progress lives here rather than in the Inspector: this
+                 bar is visible at every width, and the card only exists above
+                 1200px. It measures the checklist, so it is hidden without tasks. -->
+            <span id="progressChip" class="progress-chip d-none" data-state="idle" role="button" tabindex="0"
+                  title="Checklist progress — click to open it">
+              <span class="progress-chip-track"><span id="progressChipFill" class="progress-chip-fill"></span></span>
+              <span id="progressChipCount" class="progress-chip-count">0/0</span>
+            </span>
             <span id="runSummary" class="run-summary d-none" role="button" tabindex="0"
                   title="Agents keep working when you switch chat or project — click to see them"></span>
             <span id="streamIndicator" class="stream-indicator d-none">
@@ -284,9 +292,6 @@
           <div class="checklist-status">
             <span class="status-dot" aria-hidden="true"></span>
             <span id="checklistStatusText" class="status-text" aria-live="polite">No tasks yet</span>
-          </div>
-          <div class="progress checklist-progress">
-            <div id="checklistBar" class="progress-bar"></div>
           </div>
           <div id="checklistItems" class="checklist-items"></div>
           <form id="checklistForm" class="checklist-form">

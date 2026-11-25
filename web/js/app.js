@@ -2856,20 +2856,36 @@ function checklistState(total, done, busy) {
 
 function checklistStatusLabel(status, total, done) {
   switch (status) {
+    // The count lives in the progress chip now, so the card's line stays
+    // qualitative and the two surfaces never repeat the same numbers.
     case 'running-empty': return 'Working — no task list';
     // Every task is ticked but the turn is still open: say so instead of
     // claiming the run is done.
-    case 'running': return done >= total ? `Wrapping up · ${done} of ${total}` : `Working · ${done} of ${total}`;
-    case 'idle': return `Waiting · ${done} of ${total}`;
-    case 'done': return `Complete · ${done} of ${total}`;
+    case 'running': return done >= total ? 'Wrapping up' : 'Working';
+    case 'idle': return 'Waiting';
+    case 'done': return 'Complete';
     case 'empty': return 'No tasks yet';
     default: return '';
   }
 }
 
-// applyChecklistState is the only writer of the card state, the progress bar and
-// the status line. renderChrome calls it too, so starting, resuming and finishing
-// a run repaint the card even when no checklist event arrives.
+// checklistChipVisible mirrors the interactive rule: measuring tasks is the
+// chip's only job, so a turn with no task list leaves the run indicator alone
+// instead of pulsing a second time next to it.
+function checklistChipVisible(total) {
+  return total > 0;
+}
+
+// checklistChipLive reports whether the checklist card can actually be opened:
+// the Inspector is display:none below 1200px, so the chip must not advertise a
+// click that would land on nothing.
+function checklistChipLive() {
+  return !!(window.matchMedia && window.matchMedia('(min-width: 1200px)').matches);
+}
+
+// applyChecklistState is the only writer of the card state, the progress chip
+// and the status line. renderChrome calls it too, so starting, resuming and
+// finishing a run repaint both surfaces even when no checklist event arrives.
 function applyChecklistState(view) {
   const card = $('checklistCard');
   if (!card) return;
@@ -2880,12 +2896,27 @@ function applyChecklistState(view) {
   card.dataset.state = status;
   $('checklistCount').textContent = `${done}/${total}`;
 
-  const bar = $('checklistBar');
-  if (status === 'running-empty') {
-    // Indeterminate: the width belongs to the sweep animation, not to progress.
-    bar.style.width = '';
-  } else {
-    bar.style.width = total ? `${(done / total) * 100}%` : '0%';
+  const chip = $('progressChip');
+  const visible = checklistChipVisible(total);
+  if (chip) {
+    chip.classList.toggle('d-none', !visible);
+    chip.dataset.state = status;
+    $('progressChipCount').textContent = `${done}/${total}`;
+    // total is never 0 while the chip is visible, but a NaN width would leak an
+    // invalid declaration into the stylesheet if it ever were.
+    $('progressChipFill').style.width = total ? `${(done / total) * 100}%` : '0%';
+    // A read-only chip under 1200px: no focus stop and no pointer cursor on a
+    // control that cannot do anything.
+    const live = checklistChipLive();
+    if (live) {
+      chip.setAttribute('role', 'button');
+      chip.setAttribute('tabindex', '0');
+      chip.title = 'Checklist progress — click to open it';
+    } else {
+      chip.removeAttribute('role');
+      chip.removeAttribute('tabindex');
+      chip.title = 'Checklist progress — widen the window to open it';
+    }
   }
 
   const text = $('checklistStatusText');
@@ -2893,6 +2924,28 @@ function applyChecklistState(view) {
   // Only touch the node when the text really changed: the element is a polite
   // live region and a no-op write would re-announce on every repaint.
   if (text && text.textContent !== label) text.textContent = label;
+}
+
+// focusChecklist turns a click on the progress chip into a jump to the task
+// list: open the Inspector if the user had closed it, scroll the card into view
+// and put the caret in the field, so the click leaves the user able to act.
+function focusChecklist() {
+  // Below 1200px the Inspector cannot be shown at all; the chip is inert there
+  // and applyChecklistState already stripped its button role.
+  if (!checklistChipLive()) return;
+  const card = $('checklistCard');
+  const panel = $('contextPanel');
+  if (!card || !panel) return;
+  setPanelHidden(false);
+  card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  // Restart the highlight even when it is already running: remove, force a
+  // reflow, re-add. Without it a second click would not flash again.
+  card.classList.remove('flash');
+  void card.offsetWidth;
+  card.classList.add('flash');
+  setTimeout(() => card.classList.remove('flash'), 900);
+  const input = $('checklistInput');
+  if (input && !input.disabled) input.focus();
 }
 
 function paintChecklist(view) {
@@ -5143,6 +5196,25 @@ function bindEvents() {
     input.value = '';
     addChecklist(text);
   });
+
+  // The progress chip is the checklist's shortcut. It is inert below 1200px,
+  // where applyChecklistState removes both attributes, so the handlers can stay
+  // unconditional.
+  const chip = $('progressChip');
+  chip.addEventListener('click', focusChecklist);
+  chip.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    focusChecklist();
+  });
+  // Crossing the 1200px breakpoint makes the chip interactive or inert again;
+  // repainting is all it takes because applyChecklistState owns the attributes.
+  const panelQuery = window.matchMedia ? window.matchMedia('(min-width: 1200px)') : null;
+  if (panelQuery) {
+    const onBreakpoint = () => scheduleChrome();
+    if (panelQuery.addEventListener) panelQuery.addEventListener('change', onBreakpoint);
+    else if (panelQuery.addListener) panelQuery.addListener(onBreakpoint);
+  }
 
   $('projectForm').addEventListener('submit', saveProject);
   $('settingsForm').addEventListener('submit', saveSettings);

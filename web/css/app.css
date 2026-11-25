@@ -585,6 +585,85 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   100% { box-shadow: 0 0 0 0 transparent; opacity: 1; }
 }
 
+/* Checklist progress in the topbar. It lives here because the Inspector card is
+   hidden below 1200px, and it measures tasks, so it is hidden without any. */
+.progress-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 8px 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color .12s ease, background .12s ease;
+}
+.progress-chip:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+.progress-chip:focus-visible {
+  outline: 0;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+/* Inert under 1200px: applyChecklistState drops role/tabindex there, and the
+   hover affordance goes with them. */
+.progress-chip:not([role="button"]) { cursor: default; }
+.progress-chip:not([role="button"]):hover {
+  border-color: var(--border);
+  background: var(--surface);
+}
+.progress-chip-track {
+  position: relative;
+  width: 44px;
+  height: 4px;
+  flex: 0 0 auto;
+  border-radius: 99px;
+  background: var(--progress-track);
+  overflow: hidden;
+}
+.progress-chip-fill {
+  position: relative;
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 99px;
+  background: var(--accent);
+  transition: width .45s cubic-bezier(.4, 0, .2, 1), background-color .3s ease;
+}
+.progress-chip-count {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.progress-chip[data-state="running"] .progress-chip-count { color: var(--text-soft); }
+/* Pending work with nothing running is not failure, just waiting. */
+.progress-chip[data-state="idle"] .progress-chip-fill {
+  background: color-mix(in srgb, var(--accent) 55%, var(--muted-2));
+}
+.progress-chip[data-state="running"] .progress-chip-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--text) 40%, transparent), transparent);
+  animation: checklist-shimmer 1.6s ease-in-out infinite;
+}
+@keyframes checklist-shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.progress-chip[data-state="done"] .progress-chip-fill { background: var(--green); }
+.progress-chip[data-state="done"] .progress-chip-count { color: var(--green); }
+/* One bloom on entering the done state: the selector only matches then, so no
+   one-shot class or animationend listener is needed. */
+.progress-chip[data-state="done"] { animation: checklist-bloom .9s ease-out; }
+@keyframes checklist-bloom {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 45%, transparent); }
+  100% { box-shadow: 0 0 0 6px transparent; }
+}
+
 .btn-stop {
   display: inline-flex;
   align-items: center;
@@ -1708,10 +1787,10 @@ kbd {
 .file-badge.modified { color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent); }
 
 /* Checklist */
-/* The card is the progress surface for a turn: the state attribute set by
+/* The card describes the turn's checklist: the state attribute set by
    applyChecklistState (empty | running-empty | running | idle | done) drives
-   every visual below, so the sidebar answers "when does this finish?" without
-   the agent having to say anything extra. */
+   every visual below. The measured progress bar lives in the topbar chip
+   instead, because the Inspector does not exist below 1200px. */
 .checklist-card {
   flex: 1 1 220px;
   min-height: 220px;
@@ -1756,49 +1835,15 @@ kbd {
 .checklist-card[data-state="done"] .status-dot { background: var(--green); }
 .checklist-card[data-state="done"] .checklist-status .status-text { color: var(--green); }
 
-/* Height, track colour and rounding come from the shared .progress base. */
-.checklist-progress { margin-bottom: 8px; }
-.checklist-progress .progress-bar {
-  position: relative;
-  overflow: hidden;
-  border-radius: 99px;
-  background: var(--accent);
-  transition: width .45s cubic-bezier(.4, 0, .2, 1), background-color .3s ease;
+/* A jump target for the progress chip: the ring is the only thing that says
+   "this card is what you just clicked", so it outlives the focus it sets. */
+.checklist-card.flash {
+  animation: checklist-flash .9s ease-out;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft));
 }
-/* Pending work with nothing running is not failure, just waiting. */
-.checklist-card[data-state="idle"] .checklist-progress .progress-bar {
-  background: color-mix(in srgb, var(--accent) 55%, var(--muted-2));
-}
-/* No task list yet: a sliding segment says "alive" without faking progress. */
-.checklist-card[data-state="running-empty"] .checklist-progress .progress-bar {
-  width: 34%;
-  animation: checklist-sweep 1.6s cubic-bezier(.4, 0, .2, 1) infinite;
-}
-.checklist-card[data-state="running-empty"] .checklist-progress .progress-bar::after,
-.checklist-card[data-state="running"] .checklist-progress .progress-bar::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--text) 34%, transparent), transparent);
-  animation: checklist-shimmer 1.6s ease-in-out infinite;
-}
-@keyframes checklist-sweep {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(294%); }
-}
-@keyframes checklist-shimmer {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(100%); }
-}
-.checklist-card[data-state="done"] .checklist-progress .progress-bar { background: var(--green); }
-/* One bloom when the last task lands; the selector only matches on entering
-   the done state, so no one-shot class or animationend listener is needed. */
-.checklist-card[data-state="done"] .checklist-progress {
-  animation: checklist-bloom .9s ease-out;
-}
-@keyframes checklist-bloom {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 50%, transparent); }
-  100% { box-shadow: 0 0 0 6px transparent; }
+@keyframes checklist-flash {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent); }
+  100% { box-shadow: 0 0 0 7px transparent; }
 }
 
 /* While the agent runs, the first pending task is the one in progress. Done
@@ -2310,6 +2355,11 @@ kbd {
   .model-control { max-width: 150px; }
   .model-input { width: 100px; }
   .mode-toggle button { padding: 5px 8px; }
+  /* The bar alone still says how far along the turn is; the count is what goes
+     first, because the topbar is already compressing its controls here. */
+  .progress-chip { gap: 6px; padding: 2px 6px; }
+  .progress-chip-count { display: none; }
+  .progress-chip-track { width: 34px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
