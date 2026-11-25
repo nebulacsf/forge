@@ -146,8 +146,21 @@ func (s *Server) handleSessionRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rn.status())
 }
 
-// handleListRuns lists every live run. The UI uses it on startup to know which
-// chats are still being worked on by a background agent.
+// handleDismissRun drops the finished entry of a chat from the agents modal.
+// The entry disappears once the developer opened that chat, which is the whole
+// point of the list: it survives until the result has been looked at.
+func (s *Server) handleDismissRun(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"dismissed": s.runs.dismiss(id)})
+}
+
+// handleListRuns lists the live runs followed by the finished ones the user has
+// not opened yet. The UI uses it to know which chats keep working and which
+// just produced a result worth reading.
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"runs": s.runs.statuses()})
 }

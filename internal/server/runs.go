@@ -24,6 +24,12 @@ const (
 	runRetention = 10 * time.Minute
 	// runKeepAlive is the idle interval of SSE keep-alive comments.
 	runKeepAlive = 15 * time.Second
+	// runDoneLimit bounds the finished-run list the agents modal shows. Entries
+	// are removed by opening their chat, so this only trims the tail of a long
+	// working session.
+	runDoneLimit = 30
+	// runTaskRunes caps the prompt snippet kept as the run's task label.
+	runTaskRunes = 160
 )
 
 // runConflict reports an admission rejection. It is surfaced as HTTP 409.
@@ -50,7 +56,10 @@ type run struct {
 	ProjectName string
 	SessionName string
 	Mode        string
-	StartedAt   time.Time
+	// Task is the short label of the prompt that started the run. It is frozen
+	// at admission so the finished list can say what an agent worked on.
+	Task      string
+	StartedAt time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -66,9 +75,11 @@ type run struct {
 	finished bool
 	reason   string
 	stopped  bool
+	failed   bool
+	endedAt  time.Time
 }
 
-func newRun(reg *runRegistry, session store.Session, project store.Project) *run {
+func newRun(reg *runRegistry, session store.Session, project store.Project, task string) *run {
 	ctx, cancel := context.WithCancel(context.Background())
 	title := session.Title
 	if strings.TrimSpace(title) == "" {
@@ -81,6 +92,7 @@ func newRun(reg *runRegistry, session store.Session, project store.Project) *run
 		ProjectName: project.Name,
 		SessionName: title,
 		Mode:        session.Mode,
+		Task:        task,
 		StartedAt:   time.Now(),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -133,6 +145,11 @@ func (r *run) publish(ev chatEvent) {
 	if ev.Type == "round_start" && ev.Round > 0 {
 		r.round = ev.Round
 	}
+	if ev.Type == "error" {
+		// An error event is the last thing a failing turn publishes, so the
+		// finished list can report the outcome instead of "done".
+		r.failed = true
+	}
 	if label := runActivity(ev.Type); label != "" {
 		r.activity = label
 	}
@@ -161,16 +178,20 @@ func (r *run) finish(reason string) {
 	}
 	r.finished = true
 	r.reason = reason
+	r.endedAt = time.Now()
 	signal := r.notify
 	r.notify = nil
 	rounds := r.round
+	snapshot := r.statusLocked()
 	r.mu.Unlock()
 	if signal != nil {
 		close(signal)
 	}
 	close(r.done)
 	r.cancel()
-	r.reg.release(r)
+	// The registry keeps a light snapshot of the run so the agents modal can
+	// still list what finished, long after the event log is gone.
+	r.reg.release(r, snapshot)
 	logx.Info("agent run finished", "session", r.SessionID, "project", r.ProjectID,
 		"mode", r.Mode, "reason", reason, "rounds", rounds,
 		"duration", time.Since(r.StartedAt).Round(time.Millisecond).String())
@@ -262,16 +283,31 @@ type runStatus struct {
 	State        string `json:"state"`
 	Activity     string `json:"activity"`
 	Round        int    `json:"round"`
-	StartedAt    string `json:"started_at"`
-	Seq          uint64 `json:"seq"`
+	// Task is the prompt that started the turn and FinishedAt is set only for a
+	// finished run, so the modal can group "still working" apart from "done".
+	Task       string `json:"task"`
+	Stopped    bool   `json:"stopped"`
+	Failed     bool   `json:"failed"`
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	Seq        uint64 `json:"seq"`
 }
 
 func (r *run) status() runStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.statusLocked()
+}
+
+// statusLocked builds the wire snapshot; the caller holds r.mu.
+func (r *run) statusLocked() runStatus {
 	state := "running"
+	finishedAt := ""
 	if r.finished {
 		state = "done"
+		if !r.endedAt.IsZero() {
+			finishedAt = r.endedAt.UTC().Format(time.RFC3339)
+		}
 	}
 	return runStatus{
 		SessionID:    r.SessionID,
@@ -282,7 +318,11 @@ func (r *run) status() runStatus {
 		State:        state,
 		Activity:     r.activity,
 		Round:        r.round,
+		Task:         r.Task,
+		Stopped:      r.stopped,
+		Failed:       r.failed,
 		StartedAt:    r.StartedAt.UTC().Format(time.RFC3339),
+		FinishedAt:   finishedAt,
 		Seq:          r.seq,
 	}
 }
@@ -301,8 +341,12 @@ type runRegistry struct {
 	live     map[int64]*run // by session id
 	building map[int64]*run // BUILD owner by project id
 	recent   map[int64]*run // finished runs kept for replay, by session id
-	active   int
-	retain   time.Duration
+	// done keeps a light snapshot per finished run, in finish order. Unlike
+	// recent, it holds no event buffers, so it can outlive the replay window and
+	// tell the developer what an agent finished without opening every chat.
+	done   []runStatus
+	active int
+	retain time.Duration
 }
 
 func newRunRegistry() *runRegistry {
@@ -310,13 +354,15 @@ func newRunRegistry() *runRegistry {
 		live:     make(map[int64]*run),
 		building: make(map[int64]*run),
 		recent:   make(map[int64]*run),
+		done:     make([]runStatus, 0, runDoneLimit),
 		retain:   runRetention,
 	}
 }
 
 // start admits a new run or explains why it cannot start. limit caps the total
-// number of concurrent runs across projects (0 disables the cap).
-func (reg *runRegistry) start(session store.Session, project store.Project, limit int) (*run, error) {
+// number of concurrent runs across projects (0 disables the cap). task is the
+// short prompt label the finished list shows.
+func (reg *runRegistry) start(session store.Session, project store.Project, limit int, task string) (*run, error) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 	if _, ok := reg.live[session.ID]; ok {
@@ -333,17 +379,21 @@ func (reg *runRegistry) start(session store.Session, project store.Project, limi
 	if limit > 0 && reg.active >= limit {
 		return nil, newRunConflict("%d agents are already running; wait for one to finish", reg.active)
 	}
-	rn := newRun(reg, session, project)
+	rn := newRun(reg, session, project, task)
 	reg.live[session.ID] = rn
 	if session.Mode == "BUILD" {
 		reg.building[project.ID] = rn
 	}
 	delete(reg.recent, session.ID)
+	reg.dropDoneLocked(session.ID)
 	reg.active++
 	return rn, nil
 }
 
-func (reg *runRegistry) release(r *run) {
+// release frees the admission slot and records what finished. The snapshot is
+// taken by the run before it lets go of its lock, so the entry is consistent
+// even when the registry is read immediately afterwards.
+func (reg *runRegistry) release(r *run, snapshot runStatus) {
 	reg.mu.Lock()
 	if reg.live[r.SessionID] == r {
 		delete(reg.live, r.SessionID)
@@ -356,6 +406,7 @@ func (reg *runRegistry) release(r *run) {
 		reg.active = 0
 	}
 	reg.recent[r.SessionID] = r
+	reg.addDoneLocked(snapshot)
 	reg.mu.Unlock()
 	time.AfterFunc(reg.retain, func() {
 		reg.mu.Lock()
@@ -364,6 +415,51 @@ func (reg *runRegistry) release(r *run) {
 		}
 		reg.mu.Unlock()
 	})
+}
+
+// addDoneLocked stores the snapshot of a finished run, keeping one entry per
+// session and the newest runDoneLimit of them.
+func (reg *runRegistry) addDoneLocked(snapshot runStatus) {
+	reg.dropDoneLocked(snapshot.SessionID)
+	reg.done = append(reg.done, snapshot)
+	if len(reg.done) > runDoneLimit {
+		reg.done = append(reg.done[:0], reg.done[len(reg.done)-runDoneLimit:]...)
+	}
+}
+
+// dropDoneLocked forgets the finished entry of one session: a newer run of the
+// same chat, or an entry the user opened and dismissed.
+func (reg *runRegistry) dropDoneLocked(sessionID int64) {
+	kept := reg.done[:0]
+	for _, entry := range reg.done {
+		if entry.SessionID != sessionID {
+			kept = append(kept, entry)
+		}
+	}
+	reg.done = kept
+}
+
+// dismiss removes the finished entry of a session and reports whether there was
+// one. Opening a chat is what makes its entry disappear from the agents modal.
+func (reg *runRegistry) dismiss(sessionID int64) bool {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	for _, entry := range reg.done {
+		if entry.SessionID == sessionID {
+			reg.dropDoneLocked(sessionID)
+			return true
+		}
+	}
+	return false
+}
+
+// forget drops everything the registry knows about a session, so a deleted chat
+// cannot leave a dangling entry behind.
+func (reg *runRegistry) forget(sessionID int64) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.dropDoneLocked(sessionID)
+	delete(reg.recent, sessionID)
 }
 
 // get returns the live run for a session, or a recently finished one so a
@@ -409,17 +505,22 @@ func (reg *runRegistry) stopAndWait(sessionID int64, timeout time.Duration) {
 	}
 }
 
+// statuses lists the live runs followed by the finished ones, so the agents
+// modal can show what is working and, next to it, what just finished without
+// the developer opening every chat to find out.
 func (reg *runRegistry) statuses() []runStatus {
 	reg.mu.Lock()
 	runs := make([]*run, 0, len(reg.live))
 	for _, rn := range reg.live {
 		runs = append(runs, rn)
 	}
+	done := append([]runStatus(nil), reg.done...)
 	reg.mu.Unlock()
-	out := make([]runStatus, 0, len(runs))
+	out := make([]runStatus, 0, len(runs)+len(done))
 	for _, rn := range runs {
 		out = append(out, rn.status())
 	}
+	out = append(out, done...)
 	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt < out[j].StartedAt })
 	return out
 }

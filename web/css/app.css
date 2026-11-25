@@ -310,12 +310,17 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .tabs-add:hover,
 .panel-reopen:hover { border-color: var(--accent); color: var(--accent-2); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 
-/* Running agents: the button carries a live counter of background agents and
-   the run summary in the composer opens the same list. */
+/* Agents: the button carries a live counter of background agents and turns green
+   when nothing is running but a result is still waiting to be opened. The run
+   summary in the composer opens the same list. */
 .agents-btn { position: relative; }
 .agents-btn.has-agents {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
   color: var(--accent-2);
+}
+.agents-btn.has-finished {
+  border-color: color-mix(in srgb, var(--green) 55%, var(--border));
+  color: var(--green);
 }
 .agents-badge {
   position: absolute;
@@ -334,6 +339,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   line-height: 1;
   pointer-events: none;
 }
+.agents-badge.finished { background: var(--green); }
 .run-summary[role="button"] { cursor: pointer; }
 .run-summary[role="button"]:hover {
   border-color: var(--accent);
@@ -2010,8 +2016,18 @@ kbd {
   overflow-y: auto;
   padding-right: 2px;
 }
-/* ── Running agents modal ──────────────────────────────────────────── */
+/* ── Agents modal: working now and already finished ────────────────── */
 .agents-list { max-height: 56vh; }
+.agents-section {
+  margin-top: 10px;
+  padding: 0 2px 2px;
+  color: var(--muted-2);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.agents-section:first-child { margin-top: 0; }
 .agents-project {
   margin-top: 4px;
   padding: 0 2px;
@@ -2026,6 +2042,24 @@ kbd {
 .agents-row .manage-row-name:hover { color: var(--accent-2); }
 .agents-pulse { margin-top: 1px; }
 .agents-meta { font-variant-numeric: tabular-nums; }
+/* A finished row keeps the task one line tall next to the chat name: it is the
+   answer to "who finished what" once the notification is gone. */
+.agents-row-done .manage-row-task {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+.agents-row-done { opacity: .92; }
+.manage-badge.done {
+  border-color: color-mix(in srgb, var(--green) 55%, var(--border));
+  color: var(--green);
+}
+.manage-badge.danger {
+  border-color: color-mix(in srgb, var(--red) 55%, var(--border));
+  color: var(--red);
+}
 
 .manage-row {
   display: flex;

@@ -55,6 +55,10 @@ let renderView = null;
 // Run status polled from the server: lets the tab bar show agents that keep
 // working after the user navigated away or closed the browser tab.
 const runIndex = new Map();
+// doneRuns keeps the finished runs the developer has not looked at yet, so the
+// agents modal can answer "who finished what" after the notification is gone.
+// An entry is dropped when its chat is opened.
+const doneRuns = new Map();
 let runWatchTimer = null;
 
 function makeView(sessionId, projectId = 0) {
@@ -69,6 +73,9 @@ function makeView(sessionId, projectId = 0) {
     stopRequested: false,
     attached: false,
     finishedUnseen: false,
+    // turnTask is the prompt this turn was started with, kept so the toast and
+    // the finished-agents list can name the work instead of only the chat.
+    turnTask: '',
     seq: 0,
     abort: null,
     currentRound: null,
@@ -206,11 +213,23 @@ async function refreshRunIndex() {
   try {
     const data = await api('/api/runs');
     runIndex.clear();
+    doneRuns.clear();
     for (const run of data.runs || []) {
       if (run.state === 'running') runIndex.set(run.session_id, run);
+      else doneRuns.set(run.session_id, run);
     }
     afterRunIndexChange();
   } catch { /* offline: the tab bar simply shows no spinners */ }
+}
+
+// dismissFinishedRun forgets the finished entry of a chat, locally and on the
+// server. Called when the developer opens the chat the agent just finished in.
+function dismissFinishedRun(sessionId) {
+  if (!doneRuns.has(sessionId)) return;
+  doneRuns.delete(sessionId);
+  afterRunIndexChange();
+  api(`/api/sessions/${sessionId}/run/dismiss`, { method: 'POST', body: JSON.stringify({}) })
+    .catch(() => { /* the next poll hides it again */ });
 }
 
 function startRunWatch() {
@@ -777,6 +796,9 @@ async function loadSession(id) {
     localStorage.setItem(`forge.session.${data.project.id}`, String(id));
     updateProjectTotals(data.project);
     renderTabs();
+    // Bringing a chat on screen is the "I saw the result" signal: its finished
+    // entry in the agents modal has served its purpose.
+    dismissFinishedRun(id);
     if (view.streaming) {
       // Re-attach: replay whatever the run produced while we were elsewhere.
       resumeSessionRun(id, view);
@@ -1585,6 +1607,7 @@ async function runTurn({ content = '', isContinue = false, userText = content, a
     state.turnLimit = 0;
     state.turnSegment = 1;
     state.turnSegmentSize = 0;
+    view.turnTask = isContinue ? '' : (content || '');
     setStreamingUI();
     startTurnClock();
     beginRound(0);
@@ -1669,6 +1692,10 @@ function finishTurnView(view, modeAtSend = '') {
   const onScreen = viewIsActive(view);
   const session = state.sessions.find((s) => s.id === view.sessionId);
   const title = session?.title || 'Background agent';
+  // Naming the task in the toast and in the notification is what lets a
+  // developer who was elsewhere know which agent ended, not only that one did.
+  const task = taskSnippet(view.turnTask);
+  const withTask = (text) => (task ? `${text} — ${task}` : text);
   // The system notification is driven by what the user can actually see, not by
   // which chat is mounted: a turn that ends in the chat on screen still deserves
   // a notification when the whole tab is in the background. notifyBrowser owns
@@ -1680,25 +1707,31 @@ function finishTurnView(view, modeAtSend = '') {
       // The transcript already shows the failure inline; no toast on top of it.
     }
   } else if (view.turnHadError) {
-    toast(`${title} failed — open the chat for details`, 'error');
+    toast(withTask(`${title} failed — open the chat for details`), 'error');
   } else if (!view.sawCancelled) {
     view.finishedUnseen = true;
     if (hasPendingQuestions(view)) {
-      toast(`${title} needs your answers`, 'success');
+      toast(withTask(`${title} needs your answers`), 'success');
     } else {
-      toast(`${title} finished`, 'success');
+      toast(withTask(`${title} finished`), 'success');
     }
   }
   if (view.turnHadError) {
-    notifyBrowser(title, 'failed — open the chat for details');
+    notifyBrowser(title, withTask('failed — open the chat for details'));
   } else if (view.sawCancelled) {
     // A stop requested by the user needs no alert.
   } else if (hasPendingQuestions(view)) {
-    notifyBrowser(title, 'needs your answers');
+    notifyBrowser(title, withTask('needs your answers'));
   } else {
-    notifyBrowser(title, 'finished');
+    notifyBrowser(title, withTask('finished'));
   }
   runIndex.delete(view.sessionId);
+  // The server keeps the finished run listed until its chat is opened, so the
+  // entry outlives the toast that just disappeared. A turn that ended in the
+  // chat on screen is already seen, so it is cleared right away.
+  refreshRunIndex().then(() => {
+    if (onScreen) dismissFinishedRun(view.sessionId);
+  });
   updateSessionTabCosts();
   renderTabs();
   // Always repaint the chrome, even for a background run: the chat on screen
@@ -3620,6 +3653,13 @@ function truncate(text, max) {
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
 
+// taskSnippet flattens a prompt into the one-line label shown next to a finished
+// agent, so the notice says what the agent did and not only which chat it was.
+function taskSnippet(text) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  return flat ? truncate(flat, 90) : '';
+}
+
 function updateProjectTotals(project) {
   const idx = state.projects.findIndex((p) => p.id === project.id);
   if (idx >= 0) state.projects[idx] = { ...state.projects[idx], ...project };
@@ -4802,40 +4842,82 @@ function stopAgentsWatch() {
   agentsTimer = null;
 }
 
-// updateAgentsBadge shows how many agents are working right now.
+// updateAgentsBadge counts the agents working right now, and falls back to the
+// finished runs nobody has opened yet so a result is never lost silently.
 function updateAgentsBadge() {
   const badge = $('agentsBadge');
   if (!badge) return;
-  const n = runIndex.size;
-  badge.textContent = n > 9 ? '9+' : String(n);
-  badge.classList.toggle('d-none', n === 0);
-  $('agentsBtn').classList.toggle('has-agents', n > 0);
-  $('agentsBtn').title = n
-    ? `${n} agent${n === 1 ? '' : 's'} running — click to see them (Ctrl+Shift+A)`
-    : 'Running agents (Ctrl+Shift+A)';
+  const running = runIndex.size;
+  const finished = doneRuns.size;
+  const shown = running || finished;
+  badge.textContent = shown > 9 ? '9+' : String(shown);
+  badge.classList.toggle('d-none', shown === 0);
+  badge.classList.toggle('finished', running === 0 && finished > 0);
+  $('agentsBtn').classList.toggle('has-agents', running > 0);
+  $('agentsBtn').classList.toggle('has-finished', running === 0 && finished > 0);
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  if (running) {
+    $('agentsBtn').title = plural(running, 'agent') + ' running'
+      + (finished ? `, ${finished} finished` : '') + ' — click to see them (Ctrl+Shift+A)';
+  } else if (finished) {
+    $('agentsBtn').title = `${plural(finished, 'agent')} finished — open one to see the result (Ctrl+Shift+A)`;
+  } else {
+    $('agentsBtn').title = 'Agents (Ctrl+Shift+A)';
+  }
 }
 
-// liveRuns returns the runs of the index, most recently started last.
+// liveRuns returns the running agents, most recently started last.
 function liveRuns() {
   return [...runIndex.values()].sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
+}
+
+// finishedRuns returns the finished agents nobody opened yet, newest first: the
+// developer looks for "what just ended", not for what ended first.
+function finishedRuns() {
+  return [...doneRuns.values()]
+    .sort((a, b) => String(b.finished_at || '').localeCompare(String(a.finished_at || '')));
 }
 
 function renderAgentsList() {
   const list = $('agentsList');
   if (!list) return;
   const runs = liveRuns();
-  $('agentsCount').textContent = runs.length
-    ? `${runs.length} agent${runs.length === 1 ? '' : 's'} running`
-    : '';
+  const finished = finishedRuns();
+  $('agentsCount').textContent = [
+    runs.length ? `${runs.length} running` : '',
+    finished.length ? `${finished.length} finished` : '',
+  ].filter(Boolean).join(' · ');
   list.innerHTML = '';
-  if (!runs.length) {
+  if (!runs.length && !finished.length) {
     const empty = document.createElement('div');
     empty.className = 'manage-empty';
-    empty.textContent = 'No agent is running right now.';
+    empty.textContent = 'No agent is running and nothing finished since you opened the chats.';
     list.appendChild(empty);
     return;
   }
 
+  if (runs.length) {
+    list.appendChild(agentsSectionHead('Working now'));
+    appendAgentRows(list, runs, agentsRow);
+  }
+  if (finished.length) {
+    // The finished section is what survives the notification: it names the task
+    // so a developer who was elsewhere still knows who finished what.
+    list.appendChild(agentsSectionHead('Finished — open one to clear it'));
+    appendAgentRows(list, finished, finishedAgentsRow);
+  }
+}
+
+function agentsSectionHead(label) {
+  const head = document.createElement('div');
+  head.className = 'agents-section';
+  head.textContent = label;
+  return head;
+}
+
+// appendAgentRows renders rows grouped by project, which is the only order that
+// makes sense when several projects run agents at the same time.
+function appendAgentRows(list, runs, makeRow) {
   let lastProject = null;
   for (const run of runs) {
     if (run.project_id !== lastProject) {
@@ -4845,7 +4927,7 @@ function renderAgentsList() {
       head.textContent = run.project_name || `Project #${run.project_id}`;
       list.appendChild(head);
     }
-    list.appendChild(agentsRow(run));
+    list.appendChild(makeRow(run));
   }
 }
 
@@ -4914,6 +4996,86 @@ function agentsRow(run) {
   return row;
 }
 
+// statusLabel turns the outcome flags of a finished run into the short badge
+// that tells the developer how it ended, not only that it ended.
+function finishedStatusLabel(run) {
+  if (run.failed) return { text: 'failed', cls: ' danger' };
+  if (run.stopped) return { text: 'stopped', cls: '' };
+  if (run.activity === 'waiting for your answers') return { text: 'needs answers', cls: '' };
+  return { text: 'finished', cls: ' done' };
+}
+
+// finishedAgentsRow renders a run that already ended and whose chat the developer
+// has not opened yet. It keeps the task visible so the notification is not the
+// only trace of what the agent did.
+function finishedAgentsRow(run) {
+  const mine = run.session_id === state.activeSessionId;
+  const row = document.createElement('div');
+  row.className = 'manage-row agents-row agents-row-done' + (mine ? ' active' : '');
+
+  const main = document.createElement('div');
+  main.className = 'manage-row-main';
+
+  const titleRow = document.createElement('div');
+  titleRow.className = 'manage-row-title';
+  const title = document.createElement('span');
+  title.className = 'manage-row-name';
+  title.textContent = run.session_title || `Chat #${run.session_id}`;
+  title.title = 'Open this chat';
+  title.addEventListener('click', () => openChatFromRun(run));
+  titleRow.appendChild(title);
+  const status = finishedStatusLabel(run);
+  const badge = document.createElement('span');
+  badge.className = 'manage-badge' + status.cls;
+  badge.textContent = status.text;
+  titleRow.appendChild(badge);
+  const mode = document.createElement('span');
+  mode.className = 'manage-badge' + (run.mode === 'BUILD' ? ' accent' : '');
+  mode.textContent = run.mode || 'PLAN';
+  titleRow.appendChild(mode);
+  main.appendChild(titleRow);
+
+  const task = document.createElement('div');
+  task.className = 'manage-row-task';
+  task.textContent = run.task || 'No prompt was recorded for this run';
+  task.title = task.textContent;
+  main.appendChild(task);
+
+  const meta = document.createElement('div');
+  meta.className = 'manage-row-meta agents-meta';
+  meta.textContent = [
+    run.finished_at ? `ended ${formatWhen(run.finished_at)}` : 'ended',
+    run.round > 0 ? `${run.round} round${run.round === 1 ? '' : 's'}` : '',
+  ].filter(Boolean).join(' · ');
+  main.appendChild(meta);
+  row.appendChild(main);
+
+  const actions = document.createElement('div');
+  actions.className = 'manage-row-actions';
+
+  const openBtn = document.createElement('button');
+  openBtn.type = 'button';
+  openBtn.className = 'manage-icon-btn';
+  openBtn.title = 'Open the result (clears this entry)';
+  openBtn.innerHTML = '<i class="bi bi-box-arrow-in-right"></i>';
+  openBtn.addEventListener('click', () => openChatFromRun(run));
+  actions.appendChild(openBtn);
+
+  const dismissBtn = document.createElement('button');
+  dismissBtn.type = 'button';
+  dismissBtn.className = 'manage-icon-btn';
+  dismissBtn.title = 'Clear this entry without opening the chat';
+  dismissBtn.innerHTML = '<i class="bi bi-x-lg"></i>';
+  dismissBtn.addEventListener('click', () => {
+    dismissFinishedRun(run.session_id);
+    renderAgentsList();
+  });
+  actions.appendChild(dismissBtn);
+
+  row.appendChild(actions);
+  return row;
+}
+
 function elapsedSince(iso) {
   const ts = Date.parse(iso);
   if (!Number.isFinite(ts)) return '';
@@ -4943,7 +5105,10 @@ async function openChatFromRun(run) {
       renderTabs();
     }
     if (agentsModal) agentsModal.hide();
+    // Opening the chat is what clears the finished entry, so it stays listed
+    // until the result has actually been looked at.
     await loadSession(run.session_id);
+    dismissFinishedRun(run.session_id);
   } catch (err) {
     toast(err.message || 'Could not open that chat', 'error');
   }

@@ -196,7 +196,8 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Admission: at most one BUILD agent per project, any number of PLAN agents.
-	rn, err := s.runs.start(session, project, s.maxConcurrentRuns())
+	rn, err := s.runs.start(session, project, s.maxConcurrentRuns(),
+		runTaskLabel(body.Content, body.Attachments, body.Continue))
 	if err != nil {
 		apiError(w, http.StatusConflict, err.Error())
 		return
@@ -1179,6 +1180,28 @@ func buildFinalPlanNote(reason string, planRounds, planToolCalls, usedRounds, us
 No raw code blocks, no SQL queries, no verbose inline signatures, no raw tool output.
 Do not try to research further; if something is missing, state the assumption instead.`)
 	return b.String()
+}
+
+// runTaskLabel summarizes the request that started a run, so the agents modal
+// can say what a finished agent worked on without the chat being open.
+func runTaskLabel(content string, attachments []string, isContinue bool) string {
+	source := content
+	if strings.TrimSpace(source) == "" && len(attachments) > 0 {
+		source = "Attach " + strings.Join(attachments, ", ")
+	}
+	if isContinue && strings.TrimSpace(content) == continuePrompt {
+		// The synthetic continuation prompt is internal noise; label what it is.
+		source = "Continue from where you left off"
+	}
+	flat := strings.Join(strings.Fields(source), " ")
+	if flat == "" {
+		return "Empty request"
+	}
+	r := []rune(flat)
+	if len(r) > runTaskRunes {
+		return string(r[:runTaskRunes]) + "…"
+	}
+	return flat
 }
 
 func deriveTitle(content string) string {

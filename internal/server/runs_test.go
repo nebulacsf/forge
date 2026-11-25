@@ -355,3 +355,189 @@ func TestSessionGuardsWhileRunActive(t *testing.T) {
 	waitFor(t, "run completion", func() bool { return srv.runs.liveRun(session.ID) == nil })
 	_ = resp.Body.Close()
 }
+
+// runsList reads GET /api/runs and returns the entries keyed by session id.
+func runsList(t *testing.T, app *httptest.Server) map[int64]map[string]any {
+	t.Helper()
+	status, out := getJSON(t, app.URL+"/api/runs")
+	if status != http.StatusOK {
+		t.Fatalf("list runs: %d %v", status, out)
+	}
+	raw, _ := out["runs"].([]any)
+	bySession := make(map[int64]map[string]any, len(raw))
+	for _, item := range raw {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := entry["session_id"].(float64)
+		bySession[int64(id)] = entry
+	}
+	return bySession
+}
+
+// A finished agent must stay listed with the task it worked on: the completion
+// toast disappears, and the developer still needs to know what just ended.
+func TestFinishedRunStaysListedWithTask(t *testing.T) {
+	mock := newStreamMock(0, "done")
+	app, srv, _, session := runsFixture(t, "BUILD", mock)
+
+	resp, closeBody := startChat(t, app, session.ID)
+	defer closeBody()
+	_ = readEvents(t, resp.Body)
+	waitFor(t, "run completion", func() bool { return srv.runs.liveRun(session.ID) == nil })
+
+	entry, ok := runsList(t, app)[session.ID]
+	if !ok {
+		t.Fatal("finished run is missing from /api/runs")
+	}
+	if entry["state"] != "done" {
+		t.Errorf("state = %v, want done", entry["state"])
+	}
+	if entry["task"] != "work" {
+		t.Errorf("task = %v, want the prompt that started the run", entry["task"])
+	}
+	if entry["finished_at"] == "" || entry["finished_at"] == nil {
+		t.Error("finished run has no finished_at")
+	}
+	if entry["stopped"] == true || entry["failed"] == true {
+		t.Errorf("a clean run must not report stopped/failed: %v", entry)
+	}
+
+	// Opening the chat is what clears it, both in the list and on the server.
+	dismiss, err := http.Post(app.URL+fmt.Sprintf("/api/sessions/%d/run/dismiss", session.ID), "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dismiss.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(dismiss.Body).Decode(&out)
+	if dismiss.StatusCode != http.StatusOK || out["dismissed"] != true {
+		t.Fatalf("dismiss endpoint did not clear the entry: %d %v", dismiss.StatusCode, out)
+	}
+	if _, ok := runsList(t, app)[session.ID]; ok {
+		t.Fatal("dismissed run is still listed")
+	}
+	// The replay of the turn it produced is untouched.
+	if status, run := getJSON(t, app.URL+fmt.Sprintf("/api/sessions/%d/run", session.ID)); status != http.StatusOK || run["state"] != "done" {
+		t.Fatalf("dismissing broke replay: %d %v", status, run)
+	}
+
+	// Dismissing twice is harmless: the UI fires it whenever a chat is opened.
+	again, err := http.Post(app.URL+fmt.Sprintf("/api/sessions/%d/run/dismiss", session.ID), "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Body.Close()
+	if again.StatusCode != http.StatusOK {
+		t.Fatalf("second dismiss should be idempotent, got %d", again.StatusCode)
+	}
+}
+
+// A stopped run is listed as stopped, not as a clean finish.
+func TestStoppedRunIsListedAsStopped(t *testing.T) {
+	mock := newStreamMock(1, "partial")
+	app, srv, _, session := runsFixture(t, "BUILD", mock)
+
+	resp, closeBody := startChat(t, app, session.ID)
+	defer closeBody()
+	waitFor(t, "first delta", func() bool {
+		rn := srv.runs.get(session.ID)
+		if rn == nil {
+			return false
+		}
+		events, _, _, _ := rn.snapshot(0)
+		for _, e := range events {
+			if e.Ev.Type == "content" {
+				return true
+			}
+		}
+		return false
+	})
+	stopResp, err := http.Post(app.URL+fmt.Sprintf("/api/sessions/%d/stop", session.ID), "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stopResp.Body.Close()
+	waitFor(t, "run stop", func() bool { return srv.runs.liveRun(session.ID) == nil })
+	_ = resp.Body.Close()
+
+	entry, ok := runsList(t, app)[session.ID]
+	if !ok {
+		t.Fatal("stopped run is missing from /api/runs")
+	}
+	if entry["stopped"] != true {
+		t.Errorf("stopped = %v, want true (%v)", entry["stopped"], entry)
+	}
+	if entry["task"] != "work" {
+		t.Errorf("task = %v, want the prompt that started the run", entry["task"])
+	}
+}
+
+// A new run of the same chat replaces its finished entry instead of piling up.
+func TestNewRunReplacesFinishedEntry(t *testing.T) {
+	mock := newStreamMock(0, "first")
+	app, srv, _, session := runsFixture(t, "PLAN", mock)
+
+	first, closeFirst := startChat(t, app, session.ID)
+	_ = readEvents(t, first.Body)
+	closeFirst()
+	waitFor(t, "first run completion", func() bool { return srv.runs.liveRun(session.ID) == nil })
+
+	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "second task"})
+	second, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	_ = readEvents(t, second.Body)
+	waitFor(t, "second run completion", func() bool { return srv.runs.liveRun(session.ID) == nil })
+
+	runs := runsList(t, app)
+	entry, ok := runs[session.ID]
+	if !ok {
+		t.Fatal("second run is missing from /api/runs")
+	}
+	if entry["task"] != "second task" {
+		t.Errorf("task = %v, want the newest prompt", entry["task"])
+	}
+	count := 0
+	for id := range runs {
+		if id == session.ID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected one entry per chat, got %d", count)
+	}
+}
+
+// Deleting the chat must not leave a finished entry pointing at a missing chat.
+func TestDeleteSessionForgetsFinishedEntry(t *testing.T) {
+	mock := newStreamMock(0, "done")
+	app, srv, _, session := runsFixture(t, "BUILD", mock)
+
+	resp, closeBody := startChat(t, app, session.ID)
+	_ = readEvents(t, resp.Body)
+	closeBody()
+	waitFor(t, "run completion", func() bool { return srv.runs.liveRun(session.ID) == nil })
+	if _, ok := runsList(t, app)[session.ID]; !ok {
+		t.Fatal("finished run is missing from /api/runs")
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, app.URL+fmt.Sprintf("/api/sessions/%d", session.ID), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	del, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer del.Body.Close()
+	if del.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete session: %d", del.StatusCode)
+	}
+	if entry, ok := runsList(t, app)[session.ID]; ok {
+		t.Fatalf("deleted chat still listed as a finished run: %v", entry)
+	}
+}

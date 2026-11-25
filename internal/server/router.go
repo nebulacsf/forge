@@ -106,6 +106,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{id}/stream", s.handleResumeSessionStream)
 	mux.HandleFunc("POST /api/sessions/{id}/stop", s.handleStopSession)
 	mux.HandleFunc("GET /api/sessions/{id}/run", s.handleSessionRun)
+	mux.HandleFunc("POST /api/sessions/{id}/run/dismiss", s.handleDismissRun)
 	mux.HandleFunc("GET /api/runs", s.handleListRuns)
 
 	mux.HandleFunc("POST /api/checklist", s.handleCreateChecklist)
@@ -930,6 +931,9 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The chat is gone, so its finished-run entry in the agents modal must not
+	// linger and offer to open a missing chat.
+	s.runs.forget(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
