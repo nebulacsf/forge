@@ -23,6 +23,9 @@ func TestDefaultShipsFiniteLimits(t *testing.T) {
 	if d.MaxTurnCostUSD != 0 {
 		t.Errorf("max_turn_cost_usd = %v, want 0 (no limit)", d.MaxTurnCostUSD)
 	}
+	if d.BuildVerifyRounds != 2 {
+		t.Errorf("build_verify_rounds = %d, want 2", d.BuildVerifyRounds)
+	}
 }
 
 func TestNormalizeKeepsZeroLimitsAsUnlimited(t *testing.T) {
@@ -66,6 +69,8 @@ func limitKnobs() []limitKnob {
 			func(c DefaultsConfig) int { return c.PlanRounds }, d.PlanRounds},
 		{"plan_tool_calls", func(c *DefaultsConfig, v int) { c.PlanToolCalls = v },
 			func(c DefaultsConfig) int { return c.PlanToolCalls }, d.PlanToolCalls},
+		{"build_verify_rounds", func(c *DefaultsConfig, v int) { c.BuildVerifyRounds = v },
+			func(c DefaultsConfig) int { return c.BuildVerifyRounds }, d.BuildVerifyRounds},
 		{"history_prune_max_tokens", func(c *DefaultsConfig, v int) { c.HistoryPruneMaxTokens = v },
 			func(c DefaultsConfig) int { return c.HistoryPruneMaxTokens }, d.HistoryPruneMaxTokens},
 		{"history_max_result_chars", func(c *DefaultsConfig, v int) { c.HistoryMaxResult = v },

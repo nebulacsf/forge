@@ -49,8 +49,8 @@ type OpenRouterConfig struct {
 // means "not configured" and falls back to the shipped default. There is no
 // upper bound: how far a turn may go is the developer's decision alone.
 type DefaultsConfig struct {
-	Model  string `json:"model"`
-	Mode   string `json:"mode"`
+	Model string `json:"model"`
+	Mode  string `json:"mode"`
 	// MaxFileReadChars caps the characters read_file returns per call.
 	// 0 returns every requested line.
 	MaxFileReadChars int `json:"max_file_read_chars"`
@@ -71,6 +71,13 @@ type DefaultsConfig struct {
 	PlanToolCalls  int     `json:"plan_tool_calls"`
 	AutoContinue   *bool   `json:"auto_continue"`
 	MaxTurnCostUSD float64 `json:"max_turn_cost_usd"`
+	// BuildVerifyRounds bounds the BUILD verification gate. When the model
+	// tries to close a turn that wrote files without running any bash or
+	// git_diff call since the last write, the harness rejects the close and
+	// forces up to this many verification rounds; once they are spent the
+	// turn may only close by disclosing that verification did not run. A
+	// configured 0 disables the gate entirely.
+	BuildVerifyRounds int `json:"build_verify_rounds"`
 	// MaxConcurrentRuns is a global safety valve for parallel agents. It never
 	// shortens a turn: it only rejects a new run while that many are already
 	// executing. Within a project a BUILD run is always exclusive, while PLAN
@@ -85,13 +92,13 @@ type DefaultsConfig struct {
 	// min(model context length * HistoryPrunePercent, HistoryPruneMaxTokens)
 	// tokens. The round-based knobs below stay available but are disabled (0)
 	// unless the token budget itself is disabled.
-	HistoryPrunePercent   int `json:"history_prune_percent"`
-	HistoryPruneMaxTokens int `json:"history_prune_max_tokens"`
-	HistoryKeepRecent     int `json:"history_keep_recent_rounds"`
-	HistoryMaxResult      int `json:"history_max_result_chars"`
-	HistoryMaxArg         int `json:"history_max_arg_chars"`
-	HistoryPruneChunk       int `json:"history_prune_chunk_rounds"`
-	BrowserNotifications  bool  `json:"browser_notifications"`
+	HistoryPrunePercent   int  `json:"history_prune_percent"`
+	HistoryPruneMaxTokens int  `json:"history_prune_max_tokens"`
+	HistoryKeepRecent     int  `json:"history_keep_recent_rounds"`
+	HistoryMaxResult      int  `json:"history_max_result_chars"`
+	HistoryMaxArg         int  `json:"history_max_arg_chars"`
+	HistoryPruneChunk     int  `json:"history_prune_chunk_rounds"`
+	BrowserNotifications  bool `json:"browser_notifications"`
 }
 
 // Default returns the shipped configuration.
@@ -119,6 +126,9 @@ func Default() Config {
 			PlanToolCalls:    32,
 			AutoContinue:     boolPtr(true),
 			MaxTurnCostUSD:   0,
+			// The BUILD verification gate ships on: two forced verification
+			// rounds before an unverified close is accepted, then disclosure.
+			BuildVerifyRounds: 2,
 			// Parallel agents: several projects (and several PLAN chats) can
 			// run at once; this only bounds the machine, never a single turn.
 			MaxConcurrentRuns: 6,
@@ -127,10 +137,10 @@ func Default() Config {
 			HistoryPrunePercent:   70,
 			HistoryPruneMaxTokens: 120000,
 			// Round-based pruning stays available but is off by default.
-			HistoryKeepRecent: 0,
-			HistoryMaxResult:  16000,
-			HistoryMaxArg:     4000,
-			HistoryPruneChunk:      0,
+			HistoryKeepRecent:    0,
+			HistoryMaxResult:     16000,
+			HistoryMaxArg:        4000,
+			HistoryPruneChunk:    0,
 			BrowserNotifications: false,
 		},
 	}
@@ -313,6 +323,11 @@ func normalize(c Config) Config {
 	}
 	if c.Defaults.PlanToolCalls < 0 {
 		c.Defaults.PlanToolCalls = d.Defaults.PlanToolCalls
+	}
+	// The BUILD verification gate shares the limit contract: 0 keeps the gate
+	// off, a negative value restores the shipped default.
+	if c.Defaults.BuildVerifyRounds < 0 {
+		c.Defaults.BuildVerifyRounds = d.Defaults.BuildVerifyRounds
 	}
 	if c.Defaults.AutoContinue == nil {
 		c.Defaults.AutoContinue = d.Defaults.AutoContinue

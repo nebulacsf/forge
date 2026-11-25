@@ -4275,6 +4275,7 @@ function openSettings() {
   $('maxTurnCost').value = cfg.defaults.max_turn_cost_usd ?? 0;
   $('planRounds').value = cfg.defaults.plan_rounds ?? 16;
   $('planToolCalls').value = cfg.defaults.plan_tool_calls ?? 32;
+  $('buildVerifyRounds').value = cfg.defaults.build_verify_rounds ?? 2;
   $('historyPrunePercent').value = cfg.defaults.history_prune_percent ?? 70;
   $('historyPruneMaxTokens').value = cfg.defaults.history_prune_max_tokens ?? 120000;
   $('historyKeepRecent').value = cfg.defaults.history_keep_recent_rounds ?? 0;
@@ -4344,6 +4345,7 @@ async function saveSettings(e) {
   cfg.defaults.max_turn_cost_usd = numOr('maxTurnCost', 0);
   cfg.defaults.plan_rounds = numOr('planRounds', 16);
   cfg.defaults.plan_tool_calls = numOr('planToolCalls', 32);
+  cfg.defaults.build_verify_rounds = numOr('buildVerifyRounds', 2);
   cfg.defaults.history_prune_percent = numOr('historyPrunePercent', 70);
   cfg.defaults.history_prune_max_tokens = numOr('historyPruneMaxTokens', 120000);
   cfg.defaults.history_keep_recent_rounds = numOr('historyKeepRecent', 0);

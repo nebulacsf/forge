@@ -88,6 +88,7 @@ Read the anchor before changing behavior; do not re-derive it.
 | History pruning / cache prefix | `internal/server/history.go` (`buildHistory`) |
 | Loop guard | `internal/server/guard.go` (`loopGuard.observe`) |
 | PLAN budget + ledger | `internal/server/research.go` |
+| BUILD verification gate | close branch of the round loop, `internal/server/stream.go` (`buildVerifyNote`, `buildDisclosureNote`) |
 | Background runs | `internal/server/runs.go` (`runRegistry`) |
 | Project instructions snapshot | `internal/tools/instructions.go`, `internal/server/instructions.go` |
 | Schema + migrations | `migrate`, `internal/store/sqlite.go:280`; `ensureColumn`, `:437` |
@@ -168,7 +169,10 @@ instructions once per session → build the system prompt once → load and prun
 history → round loop. Each round streams reasoning/content, executes allowed tool
 calls, records guard fingerprints, persists messages, and stops when the model
 answers without tool calls. BUILD checkpoints every `max_tool_rounds` and
-auto-continues up to `max_turn_rounds`; PLAN is one bounded research turn
+auto-continues up to `max_turn_rounds`; a BUILD close is rejected up to
+`build_verify_rounds` times when the turn wrote files and no bash/git_diff call
+ran since the last write, and after that it only closes by disclosing that
+verification did not run. PLAN is one bounded research turn
 (`plan_rounds` / `plan_tool_calls`) that never auto-continues and is forced to
 produce a final plan when the budget is spent. `ask_user` persists a question
 batch, emits a `questions` event and ends the turn.

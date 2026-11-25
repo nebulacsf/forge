@@ -305,6 +305,10 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 	planToolCalls := cfg.Defaults.PlanToolCalls
 	autoContinue := cfg.Defaults.AutoContinue == nil || *cfg.Defaults.AutoContinue
 	turnCostLimit := cfg.Defaults.MaxTurnCostUSD
+	// The BUILD verification gate: how many times an unverified close is
+	// rejected before the harness accepts it with a forced disclosure. A
+	// configured 0 disables the gate for every BUILD turn.
+	verifyRounds := cfg.Defaults.BuildVerifyRounds
 
 	// PLAN is a single bounded research turn. It never auto-continues: when the
 	// research budget is spent, tools are disabled and the model must answer.
@@ -330,6 +334,7 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 		turnLimit:     turnLimit,
 		planRounds:    planRounds,
 		planToolCalls: planToolCalls,
+		verifyRounds:  verifyRounds,
 		instructions:  instructions,
 	})
 
@@ -341,9 +346,18 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 	finalizing := false
 	finalAttempts := 0
 	finalReason := ""
-	var continueNote, guardNote string
+	var continueNote, guardNote, verifyNote string
 	ledger := newResearchLedger()
 	guard := newLoopGuard()
+	// BUILD verification gate state. wroteFiles records a successful file
+	// write this turn; verifiedSinceWrite is cleared by every write and set
+	// again by any executed bash or git_diff call; verifyAttempts counts the
+	// rejected closes; disclosureSent marks the retry budget as spent, after
+	// which the next close is accepted unconditionally.
+	wroteFiles := false
+	verifiedSinceWrite := false
+	verifyAttempts := 0
+	disclosureSent := false
 
 	for {
 		var abortReason, abortMessage string
@@ -431,6 +445,10 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 			if guardNote != "" {
 				tail = append(tail, guardNote)
 				guardNote = ""
+			}
+			if verifyNote != "" {
+				tail = append(tail, verifyNote)
+				verifyNote = ""
 			}
 			noTools := finalizing && finalAttempts > planFinalRetries
 			if finalizing {
@@ -663,6 +681,37 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 					finish(false)
 					return
 				}
+				// BUILD verification gate: reject a close after writes that
+				// were never inspected. The rejected answer is persisted as a
+				// normal assistant message so the transcript stays honest, and
+				// the corrective note forces one more round. Once the retry
+				// budget is spent a single disclosure round runs; the close
+				// after it is accepted unconditionally. The last round of the
+				// turn budget is never rejected because no round would remain.
+				if session.Mode == "BUILD" && verifyRounds > 0 && wroteFiles &&
+					!verifiedSinceWrite && !disclosureSent && totalRounds < turnRounds {
+					verifyAttempts++
+					if verifyAttempts <= verifyRounds {
+						verifyNote = buildVerifyNote(verifyRounds - verifyAttempts)
+						logx.Info("build verification gate rejected close",
+							"session", session.ID, "round", totalRounds,
+							"attempt", verifyAttempts, "verify_rounds", verifyRounds)
+					} else {
+						disclosureSent = true
+						verifyNote = buildDisclosureNote()
+						logx.Warn("build verification gate exhausted, disclosure required",
+							"session", session.ID, "round", totalRounds, "attempts", verifyAttempts)
+					}
+					if msg, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, ""); err != nil {
+						logx.Error("persist rejected close failed", "session", session.ID, "error", err)
+						stream.fail("Could not save response: " + err.Error())
+						saveTurnTiming()
+						return
+					} else {
+						lastAssistantID = msg.ID
+					}
+					continue
+				}
 				msg, err := s.store.AddMessage(session.ID, "assistant", result.Reasoning, result.Content, "")
 				if err != nil {
 					logx.Error("persist assistant response failed", "session", session.ID, "error", err)
@@ -747,6 +796,15 @@ func (s *Server) runTurn(rn *run, session store.Session, project store.Project, 
 				}
 				elapsed := time.Since(started).Milliseconds()
 				ledger.observe(*call, toolResult)
+				// Verification gate bookkeeping: a successful write recreates
+				// the obligation, and any executed bash or git_diff call after
+				// it counts as looking at the result, even when it fails.
+				if isWriteTool(call.Function.Name) && !toolResult.IsError {
+					wroteFiles = true
+					verifiedSinceWrite = false
+				} else if isVerifyTool(call.Function.Name) {
+					verifiedSinceWrite = true
+				}
 				if toolResult.IsError {
 					logx.Warn("tool failed", "session", session.ID, "round", totalRounds, "tool", call.Function.Name,
 						"duration_ms", elapsed, "error", logx.Preview(toolResult.Content, 200))
@@ -975,6 +1033,10 @@ type promptOptions struct {
 	turnLimit     int
 	planRounds    int
 	planToolCalls int
+	// verifyRounds is the BUILD verification gate budget: how many times the
+	// harness rejects an unverified close before accepting it with a forced
+	// disclosure. 0 means the gate is off and the prompt stays silent about it.
+	verifyRounds int
 	// instructions is the session instruction snapshot built by
 	// buildInstructionBlock. Empty means the project ships no artifacts.
 	instructions string
@@ -1003,6 +1065,9 @@ func buildSystemPrompt(opts promptOptions) string {
 		b.WriteString("BUILD mode allows reading, writing, patching, and running shell commands. Make the requested changes directly, then verify them. Action-first rule in BUILD: when a plan already exists in the conversation, do not re-explore the codebase. Read only the exact line ranges cited in the plan, apply patch_file/write_file within your first 1–2 rounds, and verify immediately.\n")
 		b.WriteString("Exploration budget in BUILD: explore only as far as the next edit requires. After 3 consecutive read/search rounds without an edit or a verification command, either make the edit or state in one line which fact you still need and why it blocks the change. Do not keep re-reading the same area with different arguments.\n")
 		b.WriteString("Use ask_user only when you are genuinely blocked by a decision only the user can make; do not ask for cosmetic preferences.\n")
+		if opts.verifyRounds > 0 {
+			fmt.Fprintf(&b, "Verification gate: a turn that wrote files may not close until at least one bash or git_diff call runs after the last write. The harness rejects an unverified close and forces up to %d verification rounds; after that it only accepts a close whose final message explicitly discloses that verification did not run or failed. Never describe an unverified change as verified.\n", opts.verifyRounds)
+		}
 	}
 	if block := strings.TrimSpace(opts.instructions); block != "" {
 		b.WriteString("\n")
@@ -1179,6 +1244,49 @@ func buildFinalPlanNote(reason string, planRounds, planToolCalls, usedRounds, us
 - Then the line exactly: "Ready to implement — switch to BUILD to apply this plan."
 No raw code blocks, no SQL queries, no verbose inline signatures, no raw tool output.
 Do not try to research further; if something is missing, state the assumption instead.`)
+	return b.String()
+}
+
+// isWriteTool reports whether a tool directly mutates project files. bash can
+// also mutate files (redirections, sed -i), but tracking shell side effects per
+// file would be speculative, so a bash-only edit is not flagged here; that
+// same bash still satisfies the gate as a verify call, which keeps the check
+// cheap and errs in the model's favor.
+func isWriteTool(name string) bool {
+	return name == "patch_file" || name == "write_file"
+}
+
+// isVerifyTool reports whether an executed call counts as inspecting the
+// result of the writes: any shell command or a git diff. A failing command
+// still counts — the obligation is to check, not to pass.
+func isVerifyTool(name string) bool {
+	return name == "bash" || name == "git_diff"
+}
+
+// buildVerifyNote is the ephemeral corrective note of the BUILD verification
+// gate, injected after the harness rejected a close because the turn wrote
+// files and nothing inspected them afterwards. Like buildFinalPlanNote it is
+// deliberately blunt: the model must call verification tools before answering.
+func buildVerifyNote(remaining int) string {
+	var b strings.Builder
+	b.WriteString("[CLOSE REJECTED — VERIFICATION REQUIRED]\n")
+	b.WriteString("This turn wrote project files, and no bash or git_diff call has run since the last write, so the changes were never checked.\n")
+	fmt.Fprintf(&b, "The rejected answer was saved and the turn continues; %d verification round(s) remain before the harness accepts a close that discloses the missing verification.\n", remaining)
+	b.WriteString(`Run the verification now: review the complete diff with git_diff and run the project's real check (focused tests, build, vet — whatever applies). A failing check still counts as verification: fix it and re-run, or report it.
+Do not repeat the rejected answer. Call the verification tools first, then write the final message with the real outcome.`)
+	return b.String()
+}
+
+// buildDisclosureNote is the last ephemeral note of the BUILD verification
+// gate. The retry budget is spent, so the next close is accepted — but the
+// verification tools stay available, and a model that verifies now reports a
+// real outcome instead of a disclosure.
+func buildDisclosureNote() string {
+	var b strings.Builder
+	b.WriteString("[FINAL ANSWER REQUIRED — VERIFICATION MISSING]\n")
+	b.WriteString("The verification budget is spent and this turn still wrote files that no bash or git_diff call inspected.\n")
+	b.WriteString(`You may still verify now: review the diff with git_diff and run the project's check command, then write the final message with the real outcome.
+Otherwise close now, and the final message MUST: (1) list the files changed; (2) state explicitly that verification was not run or failed, and why; (3) never describe the change as tested, verified, or passing.`)
 	return b.String()
 }
 

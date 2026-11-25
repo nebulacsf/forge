@@ -571,6 +571,15 @@
                 </div>
                 <input id="maxTurnCost" type="number" min="0" step="0.01" class="form-control">
               </div>
+              <div class="col-md-4">
+                <div class="setting-label">
+                  <label for="buildVerifyRounds" class="form-label">Verification gate (BUILD)</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the BUILD verification gate"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="Times Forge rejects a BUILD close that wrote files but ran no bash or git_diff call after the last write. Each rejection forces one verification round; once the retries are spent the turn only closes by disclosing that verification did not run. 0 disables the gate. Default 2."></i>
+                </div>
+                <input id="buildVerifyRounds" type="number" min="0" class="form-control">
+              </div>
               <div class="col-12">
                 <div class="form-check form-switch setting-switch">
                   <input id="autoContinue" class="form-check-input" type="checkbox">

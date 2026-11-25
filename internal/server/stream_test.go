@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -514,6 +515,219 @@ func TestChatStreamBuildTools(t *testing.T) {
 	final, _ := st.GetSession(session.ID)
 	if final.Mode != "BUILD" || final.TokensIn != 90 {
 		t.Errorf("session state = %+v", final)
+	}
+}
+
+// verifyGateMock drives the BUILD verification gate through a fixed script:
+// round 1 writes a file, then `closes` plain closes without any bash or
+// git_diff call, an optional bash round, and a final close.
+type verifyGateMock struct {
+	requests atomic.Int32
+	closes   int  // scripted closes without verification
+	verify   bool // run one bash call after the rejected closes
+	mu       sync.Mutex
+	lastUser []string // last user-role message per request, for note assertions
+}
+
+func (m *verifyGateMock) lastUserAt(i int) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastUser[i]
+}
+
+func (m *verifyGateMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n := int(m.requests.Add(1))
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var lastUser string
+	for _, msg := range req.Messages {
+		if msg.Role == "user" {
+			lastUser = msg.Content
+		}
+	}
+	m.mu.Lock()
+	m.lastUser = append(m.lastUser, lastUser)
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	sendTool := func(id, name, args string) {
+		send(map[string]any{"id": "gen-gate", "choices": []any{
+			map[string]any{"delta": map[string]any{"tool_calls": []any{
+				map[string]any{"index": 0, "id": id, "type": "function", "function": map[string]any{
+					"name": name, "arguments": args,
+				}},
+			}}},
+		}})
+		send(map[string]any{"id": "gen-gate", "choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+		}})
+	}
+	sendClose := func(content string) {
+		send(map[string]any{"id": "gen-gate", "choices": []any{
+			map[string]any{"delta": map[string]any{"content": content}},
+		}})
+		send(map[string]any{"id": "gen-gate", "choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": "stop"},
+		}})
+	}
+	switch {
+	case n == 1:
+		sendTool("call_gate_write", "write_file", `{"path":"gate.txt","content":"written\n"}`)
+	case n <= 1+m.closes:
+		sendClose("Done without checking.")
+	case m.verify && n == 2+m.closes:
+		sendTool("call_gate_bash", "bash", `{"command":"cat gate.txt"}`)
+	default:
+		sendClose("All done.")
+	}
+	send(map[string]any{"id": "gen-gate", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "cost": 0.0001,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// runGateTurn runs one BUILD chat turn against verifyGateMock and drains the
+// stream, so the caller can assert on requests, injected notes, and persisted
+// messages.
+func runGateTurn(t *testing.T, mock *verifyGateMock, verifyRounds int) (*store.Store, store.Session, string) {
+	t.Helper()
+	cfg, st, _ := modelsFixture(t)
+	projectDir := t.TempDir()
+	upstream := httptest.NewServer(mock)
+	defer upstream.Close()
+	c := cfg.Get()
+	c.Providers.OpenRouter.APIKey = "test-key"
+	c.Providers.OpenRouter.BaseURL = upstream.URL
+	c.Defaults.BuildVerifyRounds = verifyRounds
+	if err := cfg.Update(c); err != nil {
+		t.Fatal(err)
+	}
+	project, err := st.CreateProject("Gate", projectDir, "#22c55e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := st.CreateSession(project.ID, "New Chat", "mock/model", "BUILD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	defer app.Close()
+	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Write a file"})
+	resp, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	for _, ev := range readEvents(t, resp.Body) {
+		if ev["type"] == "error" {
+			t.Errorf("stream error event: %v", ev["message"])
+		}
+	}
+	return st, session, projectDir
+}
+
+// TestChatStreamBuildVerifyGateForcesVerification covers the gate's purpose:
+// a close after writes with no bash/git_diff behind it is rejected, the
+// corrective note drives one more round, and the verification satisfies it.
+func TestChatStreamBuildVerifyGateForcesVerification(t *testing.T) {
+	mock := &verifyGateMock{closes: 1, verify: true}
+	st, session, projectDir := runGateTurn(t, mock, 2)
+
+	if got := mock.requests.Load(); got != 4 {
+		t.Fatalf("provider requests = %d, want 4 (write, rejected close, verification, close)", got)
+	}
+	if !strings.Contains(mock.lastUserAt(2), "[CLOSE REJECTED — VERIFICATION REQUIRED]") {
+		t.Errorf("round 3 request missing the corrective note: %q", mock.lastUserAt(2))
+	}
+	if note := mock.lastUserAt(3); strings.Contains(note, "CLOSE REJECTED") {
+		t.Errorf("round 4 still carries a gate note after bash ran: %q", note)
+	}
+	if _, err := os.Stat(filepath.Join(projectDir, "gate.txt")); err != nil {
+		t.Fatalf("gate.txt was not written: %v", err)
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %d, want 5 (user, write round, rejected close, bash round, final)", len(msgs))
+	}
+	if msgs[2].Content != "Done without checking." {
+		t.Errorf("rejected close not persisted verbatim: %q", msgs[2].Content)
+	}
+	if msgs[4].Content != "All done." {
+		t.Errorf("final close content = %q", msgs[4].Content)
+	}
+}
+
+// TestChatStreamBuildVerifyGateEndsWithDisclosure covers the exhaustion path:
+// both retries are spent, the disclosure round runs, and the next close is
+// accepted unconditionally.
+func TestChatStreamBuildVerifyGateEndsWithDisclosure(t *testing.T) {
+	mock := &verifyGateMock{closes: 3, verify: false}
+	st, session, _ := runGateTurn(t, mock, 2)
+
+	if got := mock.requests.Load(); got != 5 {
+		t.Fatalf("provider requests = %d, want 5 (write, 2 rejected closes, disclosure close, final close)", got)
+	}
+	for _, i := range []int{2, 3} {
+		if !strings.Contains(mock.lastUserAt(i), "[CLOSE REJECTED — VERIFICATION REQUIRED]") {
+			t.Errorf("request %d missing the corrective note: %q", i+1, mock.lastUserAt(i))
+		}
+	}
+	if !strings.Contains(mock.lastUserAt(4), "[FINAL ANSWER REQUIRED — VERIFICATION MISSING]") {
+		t.Errorf("disclosure note missing from the last forced round: %q", mock.lastUserAt(4))
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 6 {
+		t.Fatalf("messages = %d, want 6 (user, write, three persisted closes, final)", len(msgs))
+	}
+	if msgs[5].Content != "All done." {
+		t.Errorf("final close content = %q", msgs[5].Content)
+	}
+}
+
+// TestChatStreamBuildVerifyGateDisabled pins the 0 contract: with the knob
+// off, the first close after a write is accepted with no forced round.
+func TestChatStreamBuildVerifyGateDisabled(t *testing.T) {
+	mock := &verifyGateMock{closes: 1, verify: false}
+	st, session, _ := runGateTurn(t, mock, 0)
+
+	if got := mock.requests.Load(); got != 2 {
+		t.Fatalf("provider requests = %d, want 2; a disabled gate must accept the first close", got)
+	}
+	if note := mock.lastUserAt(1); strings.Contains(note, "CLOSE REJECTED") || strings.Contains(note, "VERIFICATION MISSING") {
+		t.Errorf("disabled gate still injected a note: %q", note)
+	}
+	msgs, err := st.ListMessages(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %d, want 3 (user, write round, accepted close)", len(msgs))
 	}
 }
 
@@ -1452,7 +1666,7 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 			t.Errorf("PLAN system prompt missing %q", want)
 		}
 	}
-	for _, unwanted := range []string{"## Open Questions", "at most 7 one-line items", "BUILD final message", "## Decisions & assumptions", "## Findings", "Definition of done (BUILD)"} {
+	for _, unwanted := range []string{"## Open Questions", "at most 7 one-line items", "BUILD final message", "## Decisions & assumptions", "## Findings", "Definition of done (BUILD)", "Verification gate"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Errorf("PLAN system prompt still contains %q", unwanted)
 		}
@@ -1463,7 +1677,13 @@ func TestBuildSystemPromptPLANFinalDetail(t *testing.T) {
 // upgrade is PLAN-only.
 func TestBuildSystemPromptBUILDStaysTerse(t *testing.T) {
 	project := store.Project{Name: "demo", Path: "/tmp/demo"}
-	prompt := buildSystemPrompt(promptOptions{project: project, session: store.Session{Mode: "BUILD"}, segmentSize: 12, turnLimit: 96, planRounds: 8, planToolCalls: 24})
+	prompt := buildSystemPrompt(promptOptions{project: project, session: store.Session{Mode: "BUILD"}, segmentSize: 12, turnLimit: 96, planRounds: 8, planToolCalls: 24, verifyRounds: 2})
+	if !strings.Contains(prompt, "Verification gate") {
+		t.Error("BUILD system prompt missing the verification gate contract")
+	}
+	if off := buildSystemPrompt(promptOptions{project: project, session: store.Session{Mode: "BUILD"}, verifyRounds: 0}); strings.Contains(off, "Verification gate") {
+		t.Error("BUILD system prompt mentions the verification gate when the knob is 0 (disabled)")
+	}
 	if !strings.Contains(prompt, "concise, factual summary") {
 		t.Error("BUILD system prompt is missing the expanded final-message rule")
 	}
