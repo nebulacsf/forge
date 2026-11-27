@@ -47,7 +47,7 @@ func TestProvidersCRUDAndMasking(t *testing.T) {
 	if err := cfg.Update(c); err != nil {
 		t.Fatal(err)
 	}
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	resp, data := providerTestRequest(t, http.MethodGet, app.URL+"/api/providers", nil)
@@ -131,7 +131,7 @@ func TestProvidersCRUDAndMasking(t *testing.T) {
 
 func TestProviderTestEndpoint(t *testing.T) {
 	cfg, st, _ := modelsFixture(t)
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +223,7 @@ func TestModelsUsesRequestedProvider(t *testing.T) {
 	if err := cfg.Update(c); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, st, os.DirFS("."))
+	srv := New(cfg, st, os.DirFS("."), "test")
 	if _, err := st.CreateProvider(store.ProviderProfile{
 		ID: "second", Name: "Second", BaseURL: second.URL + "/v1",
 	}); err != nil {
@@ -283,7 +283,7 @@ func TestChatUsesPinnedAndActiveProvidersWithoutRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Seed the legacy OpenRouter profile first, then add the second provider.
-	srv := New(cfg, st, os.DirFS("."))
+	srv := New(cfg, st, os.DirFS("."), "test")
 	if _, err := st.CreateProvider(store.ProviderProfile{
 		ID: "second", Name: "Second", BaseURL: second.URL, DefaultModel: "mock/model",
 	}); err != nil {

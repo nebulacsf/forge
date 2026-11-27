@@ -1,5 +1,9 @@
 BINARY      ?= forge
-VERSION     ?= dev
+# The build stamp comes from git describe so `--version` reports the release tag
+# plus the extra commits and the dirty flag when the tree is not pristine:
+# v1.2.3, v1.2.3-4-gabc1234, v1.2.3-4-gabc1234-dirty. No git, or no tag, falls
+# back to the short commit and finally to "dev". Override with `make VERSION=...`.
+VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GO          ?= go
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 BUILD_FLAGS := -trimpath -buildvcs=false

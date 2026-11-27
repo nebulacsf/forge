@@ -16,7 +16,7 @@ func TestStaticAssetsAreLocalAndCached(t *testing.T) {
 	cfg, st, _ := modelsFixture(t)
 
 	webRoot := os.DirFS("../../web")
-	srv := httptest.NewServer(New(cfg, st, webRoot).Handler())
+	srv := httptest.NewServer(New(cfg, st, webRoot, "test").Handler())
 	defer srv.Close()
 
 	cases := []struct {

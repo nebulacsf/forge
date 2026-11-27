@@ -124,7 +124,7 @@ func TestListProjectFilesEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	get := func(url string) (*http.Response, map[string]any) {

@@ -1426,6 +1426,11 @@ kbd {
 .btn-send:hover:not(:disabled) { filter: brightness(1.1); }
 .btn-send:disabled { opacity: .35; cursor: default; }
 .composer-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   max-width: 900px;
   margin-top: 4px;
   color: var(--muted-2);
@@ -1433,6 +1438,17 @@ kbd {
   text-align: center;
   letter-spacing: .02em;
 }
+/* Status segments stack with a separator; the first one (the build stamp) is
+   dimmer so the mode sentence stays the prominent part of the strip. */
+.composer-foot-seg { white-space: nowrap; }
+.composer-foot-seg + .composer-foot-seg::before {
+  content: '·';
+  margin-right: 6px;
+  opacity: .5;
+}
+.composer-foot-seg:empty { display: none; }
+.composer-foot-seg:empty + .composer-foot-seg::before { content: none; }
+#hintVersion { color: var(--muted); opacity: .85; font-variant-numeric: tabular-nums; }
 
 /* Attached-file chips inside the composer */
 .composer-chips {

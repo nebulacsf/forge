@@ -57,7 +57,7 @@ func TestModelsEndpointUsesProviderCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	fetch := func(query string) ([]llm.ModelInfo, string) {
@@ -120,7 +120,7 @@ func TestModelsEndpointFallsBackToBuiltin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	resp, err := http.Get(app.URL + "/api/models")

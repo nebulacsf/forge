@@ -8,6 +8,8 @@ const state = {
   config: null,
   configPath: '',
   logPath: '',
+  // Build stamp served by /api/config; shown in the composer footer.
+  appVersion: '',
   debugActive: false,
   llmDebugActive: false,
   apiKeySet: false,
@@ -318,7 +320,8 @@ async function init() {
   applyTheme(localStorage.getItem('forge.theme') || 'dark', { persist: false });
   initFilesCard();
   initUsageCard();
-  setPanelHidden(localStorage.getItem('forge.panelHidden') === '1', { persist: false });
+  // The Inspector is opt-in: only an explicit "shown" choice reopens it.
+  setPanelHidden(localStorage.getItem('forge.panelHidden') !== '0', { persist: false });
   bindEvents();
   if (window.bootstrap) {
     projectModal = new bootstrap.Modal($('projectModal'));
@@ -384,6 +387,9 @@ async function loadConfig() {
   state.debugActive = !!data.debug;
   state.llmDebugActive = !!data.llm_debug;
   state.apiKeySet = !!data.api_key_set;
+  state.appVersion = data.version || '';
+  // The footer can mount before the config arrives, so repaint it here too.
+  renderModeHint();
 }
 
 async function loadModels(providerId = '', { refresh = false } = {}) {
@@ -3116,11 +3122,51 @@ function setModeUI(mode) {
   for (const btn of $('modeToggle').querySelectorAll('button')) {
     btn.classList.toggle('active', btn.dataset.mode === current);
   }
-  $('modeHint').textContent =
+  renderModeHint(current);
+  if (current === 'BUILD') removePlanReadyCard();
+}
+
+// renderModeHint fills the status strip under the composer. It always leads with
+// the build stamp, then the active mode, and it adds the PLAN research budget
+// because that budget is what actually bounds a PLAN turn. The full sentence
+// lives in the title so the strip stays one line at every width.
+function renderModeHint(mode = state.session?.mode || 'PLAN') {
+  const strip = $('modeHint');
+  if (!strip) return;
+  const current = mode === 'BUILD' ? 'BUILD' : 'PLAN';
+  const parts = [];
+  const version = state.appVersion || '';
+  const versionEl = $('hintVersion');
+  if (versionEl) {
+    versionEl.textContent = version;
+    versionEl.classList.toggle('d-none', !version);
+  }
+  if (version) parts.push(`forge ${version}`);
+  const detailed =
     current === 'PLAN'
       ? 'PLAN mode is read-only — inspect files, search, and diff'
       : 'BUILD mode can edit files and run commands';
-  if (current === 'BUILD') removePlanReadyCard();
+  parts.push(detailed);
+  const modeEl = $('hintMode');
+  if (current === 'PLAN') {
+    const roundText = formatPlanLimit('round', state.config?.defaults?.plan_rounds);
+    const callText = formatPlanLimit('tool call', state.config?.defaults?.plan_tool_calls);
+    const budget = roundText && callText ? `${roundText}, ${callText}` : roundText || callText;
+    if (modeEl) modeEl.textContent = budget ? `PLAN mode — ${budget}` : 'PLAN mode is read-only';
+    if (budget) parts.push(`research budget ${budget}`);
+  } else if (modeEl) {
+    modeEl.textContent = 'BUILD mode — edits and commands';
+  }
+  strip.title = parts.join(' · ');
+}
+
+// formatPlanLimit renders one PLAN budget knob. An explicit 0 means "no limit"
+// in the config contract, so it must read as unlimited instead of "0".
+function formatPlanLimit(noun, value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return '';
+  if (n === 0) return `no ${noun} limit`;
+  return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }
 
 // busySessions counts the chats with a live agent, on screen or in background.

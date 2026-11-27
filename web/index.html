@@ -189,12 +189,20 @@
               </button>
             </div>
           </div>
-          <div id="modeHint" class="composer-foot mx-auto">PLAN mode is read-only</div>
+          <!-- Status strip under the composer: the build stamp plus whatever the
+               current mode needs to be legible. It is assembled by
+               renderModeHint so a new segment never means new markup here. -->
+          <div id="modeHint" class="composer-foot mx-auto">
+            <span id="hintVersion" class="composer-foot-seg"></span>
+            <span id="hintMode" class="composer-foot-seg"></span>
+          </div>
         </div>
       </main>
 
       <!-- Right sidebar -->
-      <aside id="contextPanel" class="context-panel d-none d-xl-flex flex-column flex-shrink-0">
+      <!-- The Inspector starts hidden: panel-hidden is in the markup so the panel
+           never flashes before init() reads the stored preference. -->
+      <aside id="contextPanel" class="context-panel d-none d-xl-flex panel-hidden flex-column flex-shrink-0">
         <div class="panel-top">
           <span class="panel-title">Inspector</span>
           <button id="collapsePanelBtn" class="panel-icon-btn" type="button" title="Hide inspector panel" aria-label="Hide inspector panel">

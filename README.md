@@ -29,6 +29,8 @@ Or directly:
 ```
 
 Flags: `--host`, `--port`, `--no-browser`, `--debug`, `--debug-llm`, `--log-file`, `--version`.
+`--version` prints the build stamp (`git describe --tags --always --dirty`, so
+commits after the tag and an unclean tree are included; `dev` without git).
 Configured host/port are used when the flags are omitted.
 
 ## Files

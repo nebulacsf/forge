@@ -104,7 +104,7 @@ func runsFixture(t *testing.T, mode string, mock http.Handler) (*httptest.Server
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, st, os.DirFS("."))
+	srv := New(cfg, st, os.DirFS("."), "test")
 	app := httptest.NewServer(srv.Handler())
 	t.Cleanup(app.Close)
 	return app, srv, st, session

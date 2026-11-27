@@ -28,6 +28,8 @@ import (
 //go:embed web
 var webFiles embed.FS
 
+// version is stamped at build time with -X main.version=<git describe output>.
+// It stays "dev" for `go run` and untagged checkouts.
 var version = "dev"
 
 func main() {
@@ -50,7 +52,7 @@ func main() {
 	flag.Parse()
 
 	if showVer {
-		fmt.Println("forge", version)
+		fmt.Println("forge", buildVersion())
 		return
 	}
 
@@ -122,7 +124,7 @@ func main() {
 	if err != nil {
 		logx.Fatalf("embedded web assets: %v", err)
 	}
-	srvApp := server.New(cfgMgr, st, webRoot)
+	srvApp := server.New(cfgMgr, st, webRoot, buildVersion())
 	handler := srvApp.Handler()
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
@@ -182,6 +184,17 @@ func main() {
 			logx.Fatalf("%v", err)
 		}
 	}
+}
+
+// buildVersion normalizes the stamped version. A build without the ldflag leaves
+// the variable untouched, so an empty or "unknown" stamp degrades to "dev"
+// instead of printing a blank line from --version.
+func buildVersion() string {
+	v := strings.TrimSpace(version)
+	if v == "" || v == "unknown" {
+		return "dev"
+	}
+	return v
 }
 
 func isLoopback(host string) bool {

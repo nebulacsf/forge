@@ -176,7 +176,7 @@ func TestChatStreamToolLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Explain main.go"})
@@ -439,7 +439,7 @@ func TestChatStreamBuildTools(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Write a note"})
@@ -626,7 +626,7 @@ func runGateTurn(t *testing.T, mock *verifyGateMock, verifyRounds int) (*store.S
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Write a file"})
 	resp, err := http.Post(app.URL+"/api/chat/stream", "application/json", bytes.NewReader(payload))
@@ -811,7 +811,7 @@ func TestChatStreamBlocksToolBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Create a file"})
@@ -932,7 +932,7 @@ func TestCompactSession(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	resp, err := http.Post(app.URL+"/api/sessions/"+strconv.FormatInt(session.ID, 10)+"/compact", "application/json", nil)
@@ -1044,7 +1044,7 @@ func TestCompactSessionKeepsHistoryAcrossCompactions(t *testing.T) {
 	}
 	add([2]string{"user", "First question"}, [2]string{"assistant", "First answer"},
 		[2]string{"user", "Second question"}, [2]string{"assistant", "Second answer"})
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 	url := app.URL + "/api/sessions/" + strconv.FormatInt(session.ID, 10) + "/compact"
 
@@ -1145,7 +1145,7 @@ func TestChatStreamReasoningOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	payload, _ := json.Marshal(map[string]any{"session_id": session.ID, "content": "Plan the change"})
@@ -1412,7 +1412,7 @@ func chatBudgetFixture(t *testing.T, mode string, mock http.Handler, tweak func(
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	t.Cleanup(app.Close)
 	return app, st, session
 }

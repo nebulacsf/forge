@@ -41,6 +41,9 @@ type Server struct {
 	// runs owns the agent turns. They are independent of any HTTP connection,
 	// so switching project or closing the browser no longer stops an agent.
 	runs *runRegistry
+	// version is the build stamp injected by main. It is read once at startup
+	// and served to the UI so the footer can show what is running.
+	version string
 
 	modelsMu    sync.Mutex
 	modelsCache map[string]modelCacheEntry
@@ -55,12 +58,13 @@ type modelCacheEntry struct {
 	fetchedAt time.Time
 }
 
-func New(cfg *config.Manager, st *store.Store, web fs.FS) *Server {
+func New(cfg *config.Manager, st *store.Store, web fs.FS, version string) *Server {
 	s := &Server{
 		cfg:         cfg,
 		store:       st,
 		web:         web,
 		runs:        newRunRegistry(),
+		version:     version,
 		modelsCache: map[string]modelCacheEntry{},
 	}
 	s.seedProviders()
@@ -274,6 +278,7 @@ func (s *Server) publicConfig() map[string]any {
 		"path":        s.cfg.Path(),
 		"api_key_set": set,
 		"log_path":    logPath,
+		"version":     s.version,
 		"debug":       logx.DebugEnabled(),
 		"llm_debug":   logx.LLMEnabled(),
 	}

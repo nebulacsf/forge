@@ -28,7 +28,7 @@ func TestPatchAndDeleteProject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	patch := func(body map[string]any) (*http.Response, map[string]any) {
@@ -115,7 +115,7 @@ func TestProjectGitEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := httptest.NewServer(New(cfg, st, os.DirFS(".")).Handler())
+	app := httptest.NewServer(New(cfg, st, os.DirFS("."), "test").Handler())
 	defer app.Close()
 
 	get := func(id string) (*http.Response, gitPayload) {
