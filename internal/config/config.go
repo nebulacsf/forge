@@ -99,6 +99,17 @@ type DefaultsConfig struct {
 	HistoryMaxArg         int  `json:"history_max_arg_chars"`
 	HistoryPruneChunk     int  `json:"history_prune_chunk_rounds"`
 	BrowserNotifications  bool `json:"browser_notifications"`
+	// OpenRouterCatalogFallback lets Forge read the public OpenRouter catalog to
+	// fill in context windows the active provider does not publish. Providers
+	// such as OpenCode Go report the window as `limit.context`; gateways that
+	// report nothing at all end up here. It only ever supplies metadata.
+	OpenRouterCatalogFallback *bool `json:"openrouter_catalog_fallback"`
+}
+
+// OpenRouterCatalogEnabled reports whether the OpenRouter catalog may be used to
+// fill in missing context windows. A nil pointer means the shipped default (on).
+func (d DefaultsConfig) OpenRouterCatalogEnabled() bool {
+	return d.OpenRouterCatalogFallback == nil || *d.OpenRouterCatalogFallback
 }
 
 // Default returns the shipped configuration.
@@ -142,6 +153,9 @@ func Default() Config {
 			HistoryMaxArg:        4000,
 			HistoryPruneChunk:    0,
 			BrowserNotifications: false,
+			// OpenRouter's public catalog is the only cross-provider source of
+			// context windows Forge can consult, so it ships enabled.
+			OpenRouterCatalogFallback: boolPtr(true),
 		},
 	}
 }
@@ -331,6 +345,9 @@ func normalize(c Config) Config {
 	}
 	if c.Defaults.AutoContinue == nil {
 		c.Defaults.AutoContinue = d.Defaults.AutoContinue
+	}
+	if c.Defaults.OpenRouterCatalogFallback == nil {
+		c.Defaults.OpenRouterCatalogFallback = d.Defaults.OpenRouterCatalogFallback
 	}
 	if c.Defaults.MaxTurnCostUSD < 0 {
 		c.Defaults.MaxTurnCostUSD = 0

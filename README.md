@@ -370,12 +370,27 @@ win over the config file like `--debug` does.
 ## Model context windows
 
 `GET /api/models?provider_id=…` proxies the selected provider's model catalog
-and caches it per provider for six hours. The UI uses the real `context_length`
-for the context-window gauge and the model picker labels, so switching providers
-or models updates the denominator immediately. If the catalog is unreachable,
-OpenRouter falls back to the built-in table; other providers fall back to their
-configured default model. The model field stays free-text so local models that
-are not listed can still be used.
+and caches it per provider for six hours. The UI uses the real window size for
+the context-window gauge and the model picker labels, so switching providers or
+models updates the denominator immediately. Two spellings are understood: the
+OpenAI/OpenRouter flat `context_length` and the nested `limit.context` that
+subscription gateways such as OpenCode Go publish. The flat field wins when both
+appear.
+
+When a provider publishes no window at all, **Settings → Context & history →
+Fill missing context windows from the OpenRouter catalog** (on by default) reads
+the public OpenRouter `/models` list to complete the row. It is metadata only:
+inference still goes to the selected provider, no prompt is ever sent to
+OpenRouter, and no API key is needed. The list is cached for six hours and
+refreshed in the background.
+
+If neither source knows the model, Forge reports the window as unknown instead of
+guessing: the gauge shows no percentage and the panel explains why. Pruning keeps
+working in that case, bounded only by `history_prune_max_tokens`. If the provider
+catalog is unreachable, OpenRouter falls back to the built-in table and every
+other provider falls back to its configured default model; the UI shows the
+catalog warning next to the gauge. The model field stays free-text so local
+models that are not listed can still be used.
 
 ## Billing and prompt cache
 

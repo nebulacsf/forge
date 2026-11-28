@@ -184,8 +184,9 @@ func TestGrepListAndBash(t *testing.T) {
 	if res.IsError || !strings.Contains(res.Content, "sub/") || !strings.Contains(res.Content, "nested.txt") {
 		t.Errorf("list result = %+v", res)
 	}
-	if strings.Contains(res.Content, ".hidden") {
-		t.Errorf("hidden file should be omitted by default: %q", res.Content)
+	// Dotfiles are part of a project: a non-git directory shows them.
+	if !strings.Contains(res.Content, ".hidden") {
+		t.Errorf("list must show dotfiles: %q", res.Content)
 	}
 
 	res = run(t, m, "bash", map[string]any{"command": "printf 'ok\\n'"})
@@ -195,6 +196,59 @@ func TestGrepListAndBash(t *testing.T) {
 	res = run(t, m, "bash", map[string]any{"command": "sleep 3", "timeout_sec": 1})
 	if !res.IsError || !strings.Contains(strings.ToLower(res.Content), "timed out") {
 		t.Errorf("bash timeout result = %+v", res)
+	}
+}
+
+// TestGrepAndListFollowGitIgnore proves both discovery tools agree with git:
+// a tracked dotfile is visible, an ignored file is not, and the explicit
+// escape hatches still reach what the filter hides.
+func TestGrepAndListFollowGitIgnore(t *testing.T) {
+	root := fileSetRepo(t)
+	writeProjectFile(t, root, ".github/scripts/release.py", "def publish():\n    pass\n")
+	writeProjectFile(t, root, "ignored.py", "def publish_ignored():\n    pass\n")
+	writeProjectFile(t, root, "dist/generated.txt", "generated_marker\n")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".env\nignored.py\ndist/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".github/scripts/release.py")
+
+	m, err := NewManager(root, 25000, time.Second, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Mode = "BUILD"
+
+	res := run(t, m, "grep_search", map[string]any{"pattern": "publish"})
+	if res.IsError || !strings.Contains(res.Content, ".github/scripts/release.py") {
+		t.Errorf("tracked dotfile not searched: %+v", res)
+	}
+	if strings.Contains(res.Content, "ignored.py") {
+		t.Errorf("ignored file was searched: %+v", res)
+	}
+
+	res = run(t, m, "list_directory", map[string]any{"path": ".", "depth": 2})
+	if res.IsError {
+		t.Fatalf("list failed: %+v", res)
+	}
+	if !strings.Contains(res.Content, ".github/") || !strings.Contains(res.Content, ".gitignore") {
+		t.Errorf("list must show tracked dotfiles: %q", res.Content)
+	}
+	if strings.Contains(res.Content, ".env") || strings.Contains(res.Content, "ignored.py") {
+		t.Errorf("list must hide ignored entries: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "git-ignored") {
+		t.Errorf("list should say how many entries were hidden: %q", res.Content)
+	}
+
+	res = run(t, m, "list_directory", map[string]any{"path": ".", "depth": 2, "include_ignored": true})
+	if res.IsError || !strings.Contains(res.Content, ".env") {
+		t.Errorf("include_ignored must list ignored entries: %+v", res)
+	}
+
+	// An explicitly named ignored directory is still listed in full.
+	res = run(t, m, "grep_search", map[string]any{"pattern": "publish_ignored"})
+	if res.IsError || !strings.Contains(res.Content, "No matches") {
+		t.Errorf("ignored file must not match at the root: %+v", res)
 	}
 }
 

@@ -1095,6 +1095,147 @@ func TestCompactSessionKeepsHistoryAcrossCompactions(t *testing.T) {
 	}
 }
 
+// compactTurnMock answers a chat round with a file read and then a final
+// answer, and answers the summarization request (which carries no tools) with a
+// summary. It lets a test cross a compaction without a second provider.
+type compactTurnMock struct {
+	requests   atomic.Int32
+	sawNoTools atomic.Bool
+}
+
+func (m *compactTurnMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.requests.Add(1)
+	var req struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+		Tools []any `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	send := func(v any) {
+		data, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	answer := func(text, finish string) {
+		send(map[string]any{"id": "gen-x", "choices": []any{
+			map[string]any{"delta": map[string]any{"content": text}},
+		}})
+		send(map[string]any{"id": "gen-x", "choices": []any{
+			map[string]any{"delta": map[string]any{}, "finish_reason": finish},
+		}})
+	}
+	if len(req.Tools) == 0 {
+		m.sawNoTools.Store(true)
+		answer("Goals: inspect main.go. Files: main.go. Next: implement the handler.", "stop")
+	} else {
+		lastRole := ""
+		if n := len(req.Messages); n > 0 {
+			lastRole = req.Messages[n-1].Role
+		}
+		if lastRole == "tool" {
+			answer("main.go inspected.", "stop")
+		} else {
+			send(map[string]any{"id": "gen-x", "choices": []any{
+				map[string]any{"delta": map[string]any{
+					"tool_calls": []any{
+						map[string]any{"index": 0, "id": "call_x", "type": "function", "function": map[string]any{
+							"name": "read_file", "arguments": `{"path":"main.go","start_line":1,"end_line":40}`,
+						}},
+					},
+				}},
+			}})
+			send(map[string]any{"id": "gen-x", "choices": []any{
+				map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"},
+			}})
+		}
+	}
+	send(map[string]any{"id": "gen-x", "choices": []any{}, "usage": map[string]any{
+		"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28, "cost": 0.0001,
+	}})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// TestChatStreamReportsZeroPruningAfterCompaction is the regression for the
+// inspector replaying the pruning stats of the request that preceded a
+// compaction. The counters describe the live context window, so after
+// compacting the first usage event of the next turn must report zero rounds and
+// zero stubs explicitly: an omitted zero would leave the previous numbers on
+// screen and the pruned dots would reappear on the shrunken window.
+func TestChatStreamReportsZeroPruningAfterCompaction(t *testing.T) {
+	mock := &compactTurnMock{}
+	app, st, session := chatBudgetFixture(t, "BUILD", mock, func(c *config.Config) {
+		c.Defaults.AutoContinue = boolValue(false)
+		c.Defaults.HistoryPruneMaxTokens = 5
+	})
+
+	// Two turns build a history with tool rounds that the budget stubs away.
+	for _, prompt := range []string{"first", "second"} {
+		events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": prompt})
+		if findEvent(events, "error") != nil {
+			t.Fatalf("turn %q failed: %+v", prompt, findEvent(events, "error"))
+		}
+	}
+	var sawPruned bool
+	for _, ev := range postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "third"}) {
+		if ev["type"] == "usage" {
+			if pruned, _ := ev["pruned_rounds"].(float64); pruned > 0 {
+				sawPruned = true
+			}
+		}
+	}
+	if !sawPruned {
+		t.Fatal("no usage event reported pruned rounds before compacting")
+	}
+
+	// A plain closing exchange gives the compaction a tail that carries no tool
+	// rounds, which is the case that used to keep advertising the old stubs.
+	for _, m := range [][2]string{{"user", "wrap up"}, {"assistant", "wrapped up"}} {
+		if _, err := st.AddMessage(session.ID, m[0], "", m[1], ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resp, err := http.Post(app.URL+"/api/sessions/"+strconv.FormatInt(session.ID, 10)+"/compact", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("compact status %d: %s", resp.StatusCode, body)
+	}
+	if !mock.sawNoTools.Load() {
+		t.Fatal("the summarization request never reached the provider")
+	}
+
+	events := postChatEvents(t, app, map[string]any{"session_id": session.ID, "content": "continue"})
+	first := findEvent(events, "usage")
+	if first == nil {
+		t.Fatalf("no usage event after compacting: %+v", events)
+	}
+	rounds, ok := first["history_rounds"]
+	if !ok {
+		t.Error("usage event omitted history_rounds; a zero must travel explicitly")
+	}
+	pruned, ok := first["pruned_rounds"]
+	if !ok {
+		t.Error("usage event omitted pruned_rounds; a zero must travel explicitly")
+	}
+	if _, ok := first["pruned_chars"]; !ok {
+		t.Error("usage event omitted pruned_chars; a zero must travel explicitly")
+	}
+	if rounds != float64(0) || pruned != float64(0) {
+		t.Errorf("first usage after compaction = %v rounds / %v pruned, want 0/0", rounds, pruned)
+	}
+}
+
 // reasoningOnlyMock returns reasoning but no content, like some models do.
 type reasoningOnlyMock struct {
 	requests atomic.Int32

@@ -34,9 +34,9 @@ const (
 // The first existing file of each distinct content wins; duplicates are dropped
 // because symlinking CLAUDE.md to AGENTS.md is a common convention.
 //
-// They are stat'ed directly instead of reused through ProjectFiles: that walk
-// skips dotfiles by design (build/vendor noise), which would silently break
-// .cursorrules and .github/copilot-instructions.md.
+// They are stat'ed directly instead of going through ProjectFiles: the
+// candidate list must resolve even when the project has no git answer to build
+// a FileSet from, and a missing candidate is a normal state rather than an error.
 var instructionCandidates = []string{
 	"AGENTS.md",
 	"CLAUDE.md",

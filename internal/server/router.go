@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"forge/internal/config"
@@ -47,6 +48,12 @@ type Server struct {
 
 	modelsMu    sync.Mutex
 	modelsCache map[string]modelCacheEntry
+	// fallbackMu guards the OpenRouter catalog used to complete context windows
+	// the active provider does not publish. It has its own entry because
+	// modelsCache is held while a provider request is in flight.
+	fallbackMu      sync.Mutex
+	fallbackEntry   modelCacheEntry
+	fallbackWarming atomic.Bool
 }
 
 // modelCacheEntry is the per-provider model catalog cache. Providers can be
@@ -297,7 +304,16 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// modelCatalog returns the provider catalog plus whatever context windows Forge
+// could complete from the OpenRouter catalog. Completion happens outside
+// modelsMu so a slow public catalog never blocks the provider actually in use.
 func (s *Server) modelCatalog(ctx context.Context, providerID string, refresh bool) ([]llm.ModelInfo, string, string, string) {
+	models, source, warning, resolved := s.providerCatalog(ctx, providerID, refresh)
+	return s.withFallbackContext(models), source, warning, resolved
+}
+
+// providerCatalog proxies the selected provider's own /models endpoint.
+func (s *Server) providerCatalog(ctx context.Context, providerID string, refresh bool) ([]llm.ModelInfo, string, string, string) {
 	profile, err := s.providerByID(providerID)
 	if err != nil {
 		// Fall back to the built-in catalog when even provider resolution fails.
@@ -384,7 +400,9 @@ func (s *Server) providerByID(id string) (store.ProviderProfile, error) {
 }
 
 // modelContextLength uses the cached catalog for the active provider when
-// available, then falls back to the built-in OpenRouter-style table.
+// available, then the OpenRouter catalog, then the built-in table. A catalog
+// entry without a window never short-circuits the chain: reporting 0 because the
+// provider stayed silent would leave the pruning budget with the token cap only.
 func (s *Server) modelContextLength(providerID, model string) int {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -395,20 +413,151 @@ func (s *Server) modelContextLength(providerID, model string) int {
 		entry, ok := s.modelsCache[providerID]
 		s.modelsMu.Unlock()
 		if ok {
-			for _, m := range entry.models {
-				if strings.EqualFold(m.ID, model) {
-					return m.ContextLength
-				}
+			if length := llm.ContextLengthFor(entry.models, model); length > 0 {
+				return length
 			}
 		}
 	}
+	// The turn path never waits on the public catalog: it uses whatever is
+	// already cached, and /api/models warms it for the next round.
+	if length := llm.ContextLengthFor(s.cachedFallbackCatalog(), model); length > 0 {
+		return length
+	}
 	return llm.BuiltinContextLength(model)
+}
+
+// withFallbackContext fills in context windows the provider did not publish so
+// the UI can show a real denominator. Models are never added or removed: only the
+// ContextLength of an existing row is completed.
+func (s *Server) withFallbackContext(models []llm.ModelInfo) []llm.ModelInfo {
+	if len(models) == 0 || !s.cfg.Get().Defaults.OpenRouterCatalogEnabled() {
+		return models
+	}
+	// The public catalog is only consulted when this provider actually left a
+	// window empty. A provider that publishes every window costs no extra request.
+	missing := false
+	for _, m := range models {
+		if m.ContextLength <= 0 {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		return models
+	}
+	catalog := s.fallbackCatalog()
+	if len(catalog) == 0 {
+		return models
+	}
+	out := make([]llm.ModelInfo, len(models))
+	copy(out, models)
+	for i := range out {
+		if out[i].ContextLength > 0 {
+			continue
+		}
+		if length := llm.ContextLengthFor(catalog, out[i].ID); length > 0 {
+			out[i].ContextLength = length
+		}
+	}
+	return out
+}
+
+// fallbackFetchTimeout bounds the single blocking fetch of the public catalog.
+// Refreshes after that happen in the background, so only the very first request
+// after a restart can wait, and only briefly.
+const fallbackFetchTimeout = 3 * time.Second
+
+// fallbackBaseURL is the public catalog endpoint. It reuses the legacy OpenRouter
+// base URL so a test or a mirror can point it elsewhere, and falls back to the
+// shipped default when the section is empty.
+func (s *Server) fallbackBaseURL() string {
+	if base := strings.TrimSpace(s.cfg.Get().Providers.OpenRouter.BaseURL); base != "" {
+		return base
+	}
+	return config.Default().Providers.OpenRouter.BaseURL
+}
+
+// cachedFallbackCatalog is fallbackCatalog without the network: it returns the
+// cached list or nothing, so a turn never blocks on an unrelated endpoint.
+func (s *Server) cachedFallbackCatalog() []llm.ModelInfo {
+	if !s.cfg.Get().Defaults.OpenRouterCatalogEnabled() {
+		return nil
+	}
+	s.fallbackMu.Lock()
+	defer s.fallbackMu.Unlock()
+	return s.fallbackEntry.models
+}
+
+// fallbackCatalog returns the OpenRouter model catalog used to complete context
+// windows. It is cached separately from modelsCache and never requires an API
+// key: the list endpoint is public and only metadata is read from it.
+func (s *Server) fallbackCatalog() []llm.ModelInfo {
+	if !s.cfg.Get().Defaults.OpenRouterCatalogEnabled() {
+		return nil
+	}
+	s.fallbackMu.Lock()
+	entry := s.fallbackEntry
+	s.fallbackMu.Unlock()
+	if len(entry.models) > 0 {
+		if time.Since(entry.fetchedAt) < modelsTTL {
+			return entry.models
+		}
+		// Serve the stale list while one refresh runs, so a long-lived process
+		// never pays the round trip inside a request.
+		if s.fallbackWarming.CompareAndSwap(false, true) {
+			go func() {
+				defer s.fallbackWarming.Store(false)
+				s.refreshFallbackCatalog(context.Background(), modelsTTL)
+			}()
+		}
+		return entry.models
+	}
+	// First use: fetch once with a short deadline so the first gauge can already
+	// show a real window. Every later refresh stays off the request path.
+	if s.fallbackWarming.CompareAndSwap(false, true) {
+		defer s.fallbackWarming.Store(false)
+		s.refreshFallbackCatalog(context.Background(), fallbackFetchTimeout)
+		s.fallbackMu.Lock()
+		entry = s.fallbackEntry
+		s.fallbackMu.Unlock()
+	}
+	return entry.models
+}
+
+// refreshFallbackCatalog fetches the public OpenRouter catalog. Failures keep the
+// built-in table in place, so a machine without network loses nothing it had.
+func (s *Server) refreshFallbackCatalog(ctx context.Context, timeout time.Duration) {
+	client, err := llm.NewProvider(llm.Profile{
+		ID:      "openrouter-catalog",
+		Name:    "OpenRouter catalog",
+		BaseURL: s.fallbackBaseURL(),
+	})
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	models, err := client.FetchModels(ctx)
+	if err != nil {
+		logx.Debug("openrouter context catalog unavailable", "error", err)
+		s.fallbackMu.Lock()
+		s.fallbackEntry.fetchedAt = time.Now()
+		s.fallbackMu.Unlock()
+		return
+	}
+	logx.Debug("openrouter context catalog refreshed", "models", len(models))
+	s.fallbackMu.Lock()
+	s.fallbackEntry = modelCacheEntry{models: models, source: "openrouter", fetchedAt: time.Now()}
+	s.fallbackMu.Unlock()
 }
 
 func (s *Server) invalidateModels() {
 	s.modelsMu.Lock()
 	s.modelsCache = map[string]modelCacheEntry{}
 	s.modelsMu.Unlock()
+	s.fallbackMu.Lock()
+	s.fallbackEntry = modelCacheEntry{}
+	s.fallbackMu.Unlock()
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -584,8 +733,10 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListProjectFiles lists the project files available to the composer's
-// "@" attachment picker. Hidden entries, symlinks and vendor/build directories
-// are skipped; the query parameter q filters by case-insensitive substring.
+// "@" attachment picker. The tools.FileSet decides membership, so tracked
+// dotfiles are listed and git-ignored paths are not; symlinks and vendor/build
+// directories are still skipped. The query parameter q filters by
+// case-insensitive substring.
 func (s *Server) handleListProjectFiles(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {

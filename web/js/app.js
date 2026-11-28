@@ -17,6 +17,8 @@ const state = {
   activeProviderId: '',
   models: new Map(),
   modelsSource: '',
+  // Why the model catalog fell back to the built-in list, if it did.
+  modelsWarning: '',
   projects: [],
   activeProjectId: null,
   activeProject: null,
@@ -402,10 +404,14 @@ async function loadModels(providerId = '', { refresh = false } = {}) {
     const list = Array.isArray(data.models) ? data.models : [];
     state.models = new Map(list.map((m) => [String(m.id), m]));
     state.modelsSource = data.source || '';
+    // A builtin source means the provider catalog could not be read, so the
+    // context window may be unknown. The reason travels with the list so the
+    // usage panel can explain the gap instead of silently guessing.
+    state.modelsWarning = data.source === 'builtin' ? (data.warning || '') : '';
     renderModelOptions(list);
     updateUsageUI();
   } catch {
-    /* Keep the built-in heuristics when the catalog is unavailable. */
+    /* Keep whatever catalog is already loaded; the panel explains the gap. */
   }
 }
 
@@ -780,11 +786,15 @@ async function loadSession(id) {
       view.turnStartedAt = 0;
       view.turnElapsedMs = 0;
     }
-    const seededRounds = countToolRounds(data.messages || []);
+    // The counters describe the context window the agent actually sends, which
+    // compaction shortens. Counting the whole transcript would keep reporting
+    // rounds that no longer travel to the model.
+    const seededRounds = countToolRounds(windowMessages(data.messages || [], view.compactions));
     const prune = loadPruneState(id);
-    // The cached snapshot only applies while the history it described still
-    // exists. Compaction can drop the session below it, so ignore it then.
-    const usePrune = !!prune && prune.rounds <= seededRounds + 1;
+    // The cached snapshot only applies while the window it described is still
+    // the live one. Compaction moves the boundary, so its numbers must be
+    // discarded instead of replayed onto the shrunken window.
+    const usePrune = !!prune && (Number(prune.windowStart) || 0) === windowStartID(view.compactions);
     if (!view.streaming) {
       view.usage = {
         sessionIn: data.session.tokens_in || 0,
@@ -794,8 +804,8 @@ async function loadSession(id) {
         contextTokens: estimateContext(data.messages || [], view.compactions),
         contextExact: false,
         cached: data.session.cached_tokens || 0,
-        rounds: Math.max(seededRounds, usePrune ? prune.rounds : 0),
-        prunedRounds: usePrune ? prune.prunedRounds : 0,
+        rounds: seededRounds,
+        prunedRounds: usePrune ? Math.min(prune.prunedRounds, seededRounds) : 0,
         prunedChars: usePrune ? prune.prunedChars : 0,
       };
     }
@@ -1813,8 +1823,17 @@ async function compactConversation() {
     // The transcript is re-rendered in full: compaction only shrinks the
     // context sent to the model, the history stays readable.
     renderSession(data.messages || []);
+    // The pruning stats describe the request that produced them, and that
+    // request belonged to the previous window. The compacted window starts
+    // clean, so the dots and the pill must not keep advertising stubs that the
+    // next request will not send.
+    const windowRounds = countToolRounds(windowMessages(data.messages || [], view?.compactions || []));
+    state.usage.rounds = windowRounds;
+    state.usage.prunedRounds = 0;
+    state.usage.prunedChars = 0;
     state.usage.contextTokens = estimateContext(data.messages || [], view?.compactions || []);
     state.usage.contextExact = false;
+    savePruneState();
     updateUsageUI();
     toast(`Context compacted — ${data.removed} earlier messages summarized`, 'success');
   } catch (err) {
@@ -2585,13 +2604,18 @@ function paintUsage(view) {
   const limit = contextLimit(session?.model || state.config?.defaults?.model);
   const used = Math.max(0, usage.contextTokens || 0);
   const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+  const known = limit > 0;
   $('ctxBar').style.width = pct.toFixed(1) + '%';
-  $('contextPct').textContent = (pct < 1 && pct > 0 ? '<1' : Math.round(pct)) + '%';
+  $('contextPct').textContent = known ? (pct < 1 && pct > 0 ? '<1' : Math.round(pct)) + '%' : '—';
   $('contextMeta').textContent =
     `${usage.contextExact ? '' : 'est. '}${formatNum(used)} / ${formatLimit(limit)} tokens`;
-  $('contextMeta').title =
-    `${used} / ${limit} tokens in the current context (prompt + response). ` +
-    'Session totals in the accordion below add every model round.';
+  $('contextMeta').title = known
+    ? `${used} / ${limit} tokens in the current context (prompt + response). ` +
+      'Session totals in the accordion below add every model round.'
+    : `${used} tokens in the current context (prompt + response). The context window of this ` +
+      'model is unknown, so no percentage is shown. Session totals in the accordion below add ' +
+      'every model round.';
+  paintContextWarning(known);
   $('tokensIn').textContent = formatNum(usage.sessionIn);
   $('tokensOut').textContent = formatNum(usage.sessionOut);
   $('cachedTokens').textContent = formatNum(usage.cached);
@@ -2605,7 +2629,34 @@ function paintUsage(view) {
   $('projectCost').textContent = formatCost(usage.projectCost);
   paintPrune(usage);
   const status = $('sessionStatus');
-  if (status) status.textContent = session ? formatLimit(limit) + ' ctx' : '';
+  if (status) {
+    status.textContent = !session ? '' : (known ? `${formatLimit(limit)} ctx` : 'ctx unknown');
+    status.title = known
+      ? `Context window advertised by the provider for ${session.model}.`
+      : 'The provider catalog did not publish a context window for this model.';
+  }
+}
+
+// paintContextWarning explains why the context window is unknown. The catalog is
+// the only source of real window sizes, so a missing window almost always means
+// the provider could not be read; saying so beats showing an invented number.
+function paintContextWarning(known) {
+  const el = $('contextWarning');
+  if (!el) return;
+  if (known) {
+    el.classList.add('d-none');
+    el.textContent = '';
+    return;
+  }
+  const reason = state.modelsWarning
+    ? `Catalog unavailable: ${state.modelsWarning}`
+    : 'This model is not in the provider catalog, so its context window is unknown.';
+  el.textContent = `${reason} Pruning still uses the token cap from Settings.`;
+  el.title =
+    'Forge reads the window from the provider /models endpoint (context_length or limit.context). ' +
+    'When neither is published, the gauge shows no percentage and only the configured token cap ' +
+    'bounds the request.';
+  el.classList.remove('d-none');
 }
 
 // paintSessionTime shows the working time of the chat on screen. Its live clock
@@ -2663,9 +2714,12 @@ function applyUsage(ev) {
     state.usage.contextTokens = ev.context_tokens;
     state.usage.contextExact = true;
   }
-  if (ev.history_rounds !== undefined) state.usage.rounds = ev.history_rounds;
-  if (ev.pruned_rounds !== undefined) state.usage.prunedRounds = ev.pruned_rounds;
-  if (ev.pruned_chars !== undefined) state.usage.prunedChars = ev.pruned_chars;
+  // The server always sends these three, zero included: after a compaction the
+  // window can legitimately have no tool rounds, and a missing value must never
+  // leave the previous request's pruning stats on screen.
+  state.usage.rounds = Number(ev.history_rounds) || 0;
+  state.usage.prunedRounds = Number(ev.pruned_rounds) || 0;
+  state.usage.prunedChars = Number(ev.pruned_chars) || 0;
   // Usage belongs to the session that produced it, on screen or in background,
   // so both the totals and the project cost are attributed to the emitting view
   // and never to whatever chat happens to be open.
@@ -2711,16 +2765,20 @@ function loadPruneState(sessionID) {
 }
 
 // savePruneState caches the stats of the emitting view, so a background agent
-// never overwrites the entry of the chat on screen.
+// never overwrites the entry of the chat on screen. The context boundary is
+// stored with them: the numbers only describe the window they were measured in,
+// so a later compaction must invalidate them instead of restoring stale dots.
 function savePruneState(sessionID = currentView()?.sessionId) {
   const key = pruneStorageKey(sessionID);
   if (!key) return;
-  const usage = currentView()?.usage || EMPTY_USAGE;
+  const view = currentView();
+  const usage = view?.usage || EMPTY_USAGE;
   try {
     localStorage.setItem(key, JSON.stringify({
       rounds: usage.rounds || 0,
       prunedRounds: usage.prunedRounds || 0,
       prunedChars: usage.prunedChars || 0,
+      windowStart: windowStartID(view?.compactions || []),
     }));
   } catch { /* ignore */ }
 }
@@ -2740,26 +2798,21 @@ function countToolRounds(messages) {
   return rounds;
 }
 
+// contextLimit returns the real context window of a model, or 0 when no catalog
+// knows it. Guessing by family name is deliberately gone: it reported 128k for
+// any "deepseek*" id while the provider actually served 1M, and a wrong
+// denominator is worse than an honest "unknown".
 function contextLimit(model) {
   const id = String(model || '');
+  if (!id) return 0;
   const exact = state.models.get(id);
   if (exact && exact.context_length > 0) return exact.context_length;
-  if (id) {
-    for (const [key, value] of state.models) {
-      if (key.toLowerCase() === id.toLowerCase() && value.context_length > 0) {
-        return value.context_length;
-      }
+  for (const [key, value] of state.models) {
+    if (key.toLowerCase() === id.toLowerCase() && value.context_length > 0) {
+      return value.context_length;
     }
   }
-  const m = id.toLowerCase();
-  if (m.includes('claude')) return 200000;
-  if (m.includes('gemini')) return 1000000;
-  if (m.includes('llama-4') || m.includes('maverick')) return 1000000;
-  if (m.includes('gpt-5') || m.includes('gpt-4.1') || m.includes('o3')) return 400000;
-  if (m.includes('qwen')) return 32768;
-  if (m.includes('grok')) return 256000;
-  if (m.includes('deepseek')) return 128000;
-  return 128000;
+  return 0;
 }
 
 // updateUsageUI asks for a repaint instead of painting. Callers keep working on
@@ -2842,13 +2895,36 @@ function isCodeFile(path) {
   return /\.(go|js|ts|tsx|jsx|py|rs|rb|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|sh|bash|zsh|sql|html|css|scss|less|json|yaml|yml|toml|xml|md|lua|ex|exs|erl|hs|clj|vue|svelte)$/i.test(path);
 }
 
+// latestCompaction returns the compaction that currently defines the context
+// window, or null when the session was never compacted.
+function latestCompaction(compactions = []) {
+  const list = Array.isArray(compactions) ? compactions : [];
+  return list.length ? list[list.length - 1] : null;
+}
+
+// windowStartID is the ID of the first message the agent still sends. 0 means
+// the whole transcript is in the window.
+function windowStartID(compactions = []) {
+  const last = latestCompaction(compactions);
+  return last ? Number(last.start_message_id) || 0 : 0;
+}
+
+// windowMessages is the part of the transcript that still travels to the model.
+// The transcript itself is never trimmed: the older messages stay readable and
+// the compaction cards mark where the context boundary sits.
+function windowMessages(messages, compactions = []) {
+  const startID = windowStartID(compactions);
+  if (!startID) return messages || [];
+  return (messages || []).filter((m) => (Number(m.id) || 0) >= startID);
+}
+
 // estimateContext mirrors what the agent actually sends: after a compaction the
 // window starts at the newest start_message_id and includes its summary, while
 // the transcript keeps showing every message.
 function estimateContext(messages, compactions = []) {
   if (!messages || !messages.length) return 0;
-  const last = (compactions || [])[compactions.length - 1];
-  const startID = last ? Number(last.start_message_id) || 0 : 0;
+  const last = latestCompaction(compactions);
+  const startID = windowStartID(compactions);
   let chars = 1800;
   if (last && startID > 0) chars += String(last.summary || '').length;
   for (const m of messages) {
@@ -3662,10 +3738,14 @@ function formatNum(n) {
   return String(Math.round(num));
 }
 
+// formatLimit renders a context window size. A missing or zero window prints as
+// an em dash so no caller can present an invented number as a real ceiling.
 function formatLimit(n) {
-  if (n >= 1e6) return n / 1e6 + 'M';
-  if (n >= 1e3) return Math.round(n / 1e3) + 'k';
-  return String(n);
+  const num = Number(n || 0);
+  if (!(num > 0)) return '—';
+  if (num >= 1e6) return num / 1e6 + 'M';
+  if (num >= 1e3) return Math.round(num / 1e3) + 'k';
+  return String(num);
 }
 
 function formatCost(n) {
@@ -4328,6 +4408,7 @@ function openSettings() {
   $('historyMaxResult').value = cfg.defaults.history_max_result_chars ?? 16000;
   $('historyMaxArg').value = cfg.defaults.history_max_arg_chars ?? 4000;
   $('historyPruneChunk').value = cfg.defaults.history_prune_chunk_rounds ?? 0;
+  $('openrouterCatalogFallback').checked = cfg.defaults.openrouter_catalog_fallback !== false;
   $('autoContinue').checked = cfg.defaults.auto_continue !== false;
   $('serverHost').value = cfg.server.host || '127.0.0.1';
   $('serverPort').value = cfg.server.port || 7890;
@@ -4359,9 +4440,11 @@ function renderEffectiveBudget() {
   if (fromContext > 0 && (limit === 0 || fromContext < limit)) limit = fromContext;
   const parts = [];
   parts.push(`<strong>${formatLimit(limit)} tokens</strong> per request`);
+  // An unknown window must not be described as a percentage of something: say
+  // plainly that the cap alone is doing the work.
   const pctLabel = fromContext > 0
     ? `${pct}% of ${formatLimit(ctx)}`
-    : `${pct}% of the context window`;
+    : (ctx > 0 ? `${pct}% of the context window` : `context window unknown, ${pct}% not applied`);
   parts.push(cap > 0 && fromContext > 0
     ? `min(${pctLabel}, ${formatLimit(cap)} cap)`
     : (cap > 0 ? `${formatLimit(cap)} cap` : pctLabel));
@@ -4398,6 +4481,7 @@ async function saveSettings(e) {
   cfg.defaults.history_max_result_chars = numOr('historyMaxResult', 16000);
   cfg.defaults.history_max_arg_chars = numOr('historyMaxArg', 4000);
   cfg.defaults.history_prune_chunk_rounds = numOr('historyPruneChunk', 0);
+  cfg.defaults.openrouter_catalog_fallback = $('openrouterCatalogFallback').checked;
   cfg.defaults.auto_continue = $('autoContinue').checked;
   cfg.server.host = $('serverHost').value.trim();
   cfg.server.port = Number($('serverPort').value) || 7890;

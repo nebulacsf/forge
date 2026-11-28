@@ -1,31 +1,38 @@
 package tools
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestProjectFilesSkipsHiddenAndBinary(t *testing.T) {
-	m, root := newTestManager(t, "BUILD", 4096)
-	m.Mode = "BUILD"
-
-	files, err := ProjectFiles(root, 0)
+func projectFilePaths(t *testing.T, root string, limit int) map[string]ProjectFile {
+	t.Helper()
+	files, err := ProjectFiles(root, limit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := map[string]ProjectFile{}
+	got := make(map[string]ProjectFile, len(files))
 	for _, f := range files {
 		got[f.Path] = f
 	}
-	for _, want := range []string{"hello.go", "sub/nested.txt"} {
-		if _, ok := got[want]; !ok {
-			t.Errorf("ProjectFiles missing %q (got %v)", want, files)
-		}
+	return got
+}
+
+func TestProjectFilesWithoutGitShowsDotfiles(t *testing.T) {
+	m, root := newTestManager(t, "BUILD", 4096)
+	m.Mode = "BUILD"
+	if LoadFileSet(context.Background(), root).Loaded() {
+		t.Skip("the temporary directory lives inside a repository")
 	}
-	if _, ok := got[".hidden"]; ok {
-		t.Error("ProjectFiles must skip hidden files")
+
+	got := projectFilePaths(t, root, 0)
+	for _, want := range []string{"hello.go", "sub/nested.txt", ".hidden"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("ProjectFiles missing %q (got %v)", want, got)
+		}
 	}
 	if lang := got["hello.go"].Language; lang != "go" {
 		t.Errorf("hello.go language = %q, want go", lang)
@@ -34,20 +41,16 @@ func TestProjectFilesSkipsHiddenAndBinary(t *testing.T) {
 		t.Errorf("hello.go size = %d, want > 0", got["hello.go"].SizeBytes)
 	}
 
-	// Hidden directories are pruned as well.
+	// The git directory is never offered as a project file.
 	if err := os.MkdirAll(filepath.Join(root, ".git", "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	files, err = ProjectFiles(root, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range files {
-		if strings.HasPrefix(f.Path, ".git/") {
-			t.Fatalf("hidden directory not pruned: %s", f.Path)
+	for path := range projectFilePaths(t, root, 0) {
+		if strings.HasPrefix(path, ".git/") {
+			t.Fatalf("noise directory not pruned: %s", path)
 		}
 	}
 
@@ -58,6 +61,25 @@ func TestProjectFilesSkipsHiddenAndBinary(t *testing.T) {
 	}
 	if len(limited) != 1 {
 		t.Errorf("limit 1 returned %d files", len(limited))
+	}
+}
+
+func TestProjectFilesFollowGitIgnore(t *testing.T) {
+	root := fileSetRepo(t)
+
+	got := projectFilePaths(t, root, 0)
+	for _, want := range []string{".github/workflows/ci.yml", "main.go"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("ProjectFiles missing tracked %q (got %v)", want, got)
+		}
+	}
+	for _, notWant := range []string{".env", "vendor/dep/dep.go"} {
+		if _, ok := got[notWant]; ok {
+			t.Errorf("ProjectFiles must not list %q", notWant)
+		}
+	}
+	if lang := got[".github/workflows/ci.yml"].Language; lang != "" {
+		t.Errorf("yml should have no indexed language, got %q", lang)
 	}
 }
 

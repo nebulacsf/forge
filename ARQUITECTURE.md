@@ -166,8 +166,23 @@ with one row per declaration and exact start/end lines for `symbol_lookup`:
   structs, interfaces, types, functions, and methods with declaration lines.
 - Other languages: fast regex/line scanners for JS/TS, Python, Rust, Java,
   Ruby, PHP, and HTML.
-- The walk skips vendor/build/hidden directories, binary files, and files
-  larger than 512 KB; only files whose mtime/size changed are reparsed.
+- File discovery is git's answer, not a dotfile heuristic: `tools.LoadFileSet`
+  (`tools/fileset.go`) runs `git ls-files -z --cached --others --exclude-standard`
+  so every tracked file — including `cmd/.keep` or a `.github/workflows/ci.yml` —
+  is indexed while anything an ignore rule covers is not, honoring nested
+  `.gitignore` files, negations, `.git/info/exclude` and `core.excludesFile`.
+  A tracked file stays listed even when an ignore rule matches it, exactly as git
+  behaves, and the long-standing `skipDirs` noise list (vendor/build/
+  node_modules…) still applies on top. The four discovery surfaces — the
+  repository outline, `grep_search`, `list_directory` and the `@` picker — all
+  consume that one set, so they cannot disagree.
+- Without git (plain directory, no binary, timeout) the file set is *not loaded*
+  and each surface falls back to a filesystem walk that now shows dotfiles too
+  and only prunes the noise directories. `read_file` is unaffected: an ignored
+  file is still readable when the agent knows its path, and `list_directory`
+  takes `include_ignored` as the explicit escape hatch.
+- Binary files and files larger than 512 KB are skipped; only files whose
+  mtime/size changed are reparsed.
 - The rendered outline is capped at ~2,000 runes (~450–500 tokens). It is
   refreshed on project creation and on each chat turn; `write_file`/`patch_file`
   refresh just the affected file.
@@ -188,8 +203,9 @@ Forge injects them without the user attaching anything:
   `AGENTS.md`) are dropped by normalized content. `README.md` is used only when
   no agent file exists, and is labeled as background documentation.
 - They are read through `ReadAttachment`, so the symlink/root escape checks and
-  binary rejection are shared with the `@` picker. The candidate list is *not*
-  routed through `ProjectFiles`, whose walk skips dotfiles by design.
+  binary rejection are shared with the `@` picker. The candidate list is stat'ed
+  directly instead of going through `ProjectFiles`, because `.cursorrules` must
+  be found even when no git answer exists for the project.
 - Budgets: 24,000 runes for agent files, 8,000 for the README fallback, 30,000
   total. Truncation is flagged in the block, which tells the model to `read_file`
   for the rest.

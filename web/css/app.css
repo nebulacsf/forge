@@ -1662,6 +1662,9 @@ kbd {
 .progress { height: 5px; background: var(--progress-track); border-radius: 99px; overflow: hidden; }
 .progress-bar { background: var(--accent); width: 0; transition: width .35s ease; }
 .usage-sub { margin-top: 4px; color: var(--muted-2); font-family: var(--mono); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+/* Explains an unknown context window. It is prose, not a number, so it drops the
+   mono treatment and wraps instead of overflowing the card. */
+.usage-warning { font-family: inherit; font-size: 10px; line-height: 1.35; color: var(--amber); white-space: normal; }
 
 /* Totals live in a nested accordion so the card only shows the context gauge
    and the pruning pill by default. */

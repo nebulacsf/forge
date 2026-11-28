@@ -136,6 +136,23 @@ func TestNormalizeRoundBudgetsWithoutCeilings(t *testing.T) {
 	}
 }
 
+func TestNormalizeOpenRouterCatalogFallback(t *testing.T) {
+	// The fallback ships on, so a config file written before the knob existed
+	// (nil) must resolve to enabled instead of silently turning it off.
+	if !Default().Defaults.OpenRouterCatalogEnabled() {
+		t.Error("openrouter_catalog_fallback should ship enabled")
+	}
+	c := Default()
+	c.Defaults.OpenRouterCatalogFallback = nil
+	if !normalize(c).Defaults.OpenRouterCatalogEnabled() {
+		t.Error("a nil openrouter_catalog_fallback should normalize to enabled")
+	}
+	c.Defaults.OpenRouterCatalogFallback = boolValue(false)
+	if normalize(c).Defaults.OpenRouterCatalogEnabled() {
+		t.Error("an explicit openrouter_catalog_fallback=false was lost")
+	}
+}
+
 func TestNormalizeKeepsExplicitAutoContinueFalse(t *testing.T) {
 	c := Default()
 	c.Defaults.AutoContinue = boolValue(false)

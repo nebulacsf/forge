@@ -197,11 +197,11 @@ func Specs(mode string) []llm.Tool {
 			Type: "function",
 			Function: llm.ToolFunctionSpec{
 				Name:        "list_directory",
-				Description: "List a directory tree inside the project, with sizes and directory markers.",
+				Description: "List a directory tree inside the project, with sizes and directory markers. The listing follows git: tracked files, including dotfiles such as .github/, are shown and ignored paths are hidden unless include_ignored is set.",
 				Parameters: objectSchema(map[string]any{
-					"path":           stringProp("Optional directory relative to the project root (default root)."),
-					"depth":          integerProp("Recursion depth, 1-5 (default 2)."),
-					"include_hidden": booleanProp("Include dotfiles (default false)."),
+					"path":            stringProp("Optional directory relative to the project root (default root)."),
+					"depth":           integerProp("Recursion depth, 1-5 (default 2)."),
+					"include_ignored": booleanProp("Include entries git ignores, such as build output (default false). Tracked dotfiles are always listed."),
 				}),
 			},
 		},
@@ -375,14 +375,14 @@ func (m *Manager) ExecuteCall(ctx context.Context, name string, rawArgs json.Raw
 		return m.symbolLookup(ctx, a.Query, a.Kind)
 	case "list_directory":
 		var a struct {
-			Path          string `json:"path"`
-			Depth         int    `json:"depth"`
-			IncludeHidden bool   `json:"include_hidden"`
+			Path           string `json:"path"`
+			Depth          int    `json:"depth"`
+			IncludeIgnored bool   `json:"include_ignored"`
 		}
 		if err := json.Unmarshal(rawArgs, &a); err != nil {
 			return fail("invalid arguments: " + err.Error())
 		}
-		return m.listDirectory(a.Path, a.Depth, a.IncludeHidden)
+		return m.listDirectory(a.Path, a.Depth, a.IncludeIgnored)
 	case "git_diff":
 		var a struct {
 			Path   string `json:"path"`
@@ -703,34 +703,68 @@ func (m *Manager) grepSearch(ctx context.Context, pattern, rel, glob string, cas
 	}
 
 	if info.IsDir() {
-		err = filepath.WalkDir(abs, func(p string, d os.DirEntry, err error) error {
-			if err != nil {
-				return nil
+		// The git-aware set decides which files belong to the project, so
+		// tracked dotfiles are searched and ignored paths are not. A directory
+		// that git ignores and the agent named explicitly is still searched,
+		// otherwise an explicit "grep in dist/" would silently return nothing.
+		set := projectFileSet(m.Root)
+		dirRel, rerr := filepath.Rel(m.Root, abs)
+		if rerr != nil {
+			return fail("grep_search: " + rerr.Error())
+		}
+		dirRel = strings.TrimSuffix(filepath.ToSlash(dirRel), "/")
+		if dirRel == "." {
+			dirRel = ""
+		}
+		if set.Loaded() && (dirRel == "" || set.HasDir(dirRel)) {
+			prefix := ""
+			if dirRel != "" {
+				prefix = dirRel + "/"
 			}
-			if err := ctx.Err(); err != nil {
-				return err
+			for _, fileRel := range set.Files() {
+				if err := ctx.Err(); err != nil {
+					return fail("grep_search: " + err.Error())
+				}
+				if prefix != "" && !strings.HasPrefix(fileRel, prefix) {
+					continue
+				}
+				if err := searchFile(fileSetPath(m.Root, fileRel), fileRel); err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					return fail("grep_search: " + err.Error())
+				}
 			}
-			if d.IsDir() {
-				if p != abs && skipDirs[d.Name()] {
-					return filepath.SkipDir
+		} else {
+			err = filepath.WalkDir(abs, func(p string, d os.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if d.IsDir() {
+					if p != abs && skipDirs[d.Name()] {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				fileRel, rerr := filepath.Rel(m.Root, p)
+				if rerr != nil {
+					return nil
+				}
+				fileRel = filepath.ToSlash(fileRel)
+				if err := searchFile(p, fileRel); err != nil {
+					if errors.Is(err, io.EOF) {
+						return io.EOF
+					}
+					return err
 				}
 				return nil
+			})
+			if err != nil && !errors.Is(err, io.EOF) {
+				return fail("grep_search: " + err.Error())
 			}
-			fileRel, rerr := filepath.Rel(m.Root, p)
-			if rerr != nil {
-				return nil
-			}
-			fileRel = filepath.ToSlash(fileRel)
-			if err := searchFile(p, fileRel); err != nil {
-				if errors.Is(err, io.EOF) {
-					return io.EOF
-				}
-				return err
-			}
-			return nil
-		})
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fail("grep_search: " + err.Error())
 		}
 	} else {
 		if err := searchFile(abs, shown); err != nil && !errors.Is(err, io.EOF) {
@@ -755,7 +789,12 @@ func (m *Manager) grepSearch(ctx context.Context, pattern, rel, glob string, cas
 // ---------------------------------------------------------------------------
 // list_directory
 
-func (m *Manager) listDirectory(rel string, depth int, includeHidden bool) Result {
+// listDirectory renders a bounded tree. Entries that git ignores are omitted
+// unless include_ignored is set: the file set is what makes a tracked dotfile
+// such as .github/workflows/ci.yml visible while node_modules/ or dist/ noise
+// stays out. A directory that git ignores but the caller named explicitly is
+// listed in full, so the tool keeps working on paths the agent already knows.
+func (m *Manager) listDirectory(rel string, depth int, includeIgnored bool) Result {
 	abs, shown, err := m.resolve(rel)
 	if err != nil {
 		return fail(err.Error())
@@ -773,6 +812,20 @@ func (m *Manager) listDirectory(rel string, depth int, includeHidden bool) Resul
 	if !info.IsDir() {
 		return Result{Content: fmt.Sprintf("%s (%s)", shown, humanSize(info.Size()))}
 	}
+	// Filtering only applies when git answered and the requested directory is
+	// itself part of the project: list_directory dist/ must not return an empty
+	// tree just because dist/ is ignored.
+	set := projectFileSet(m.Root)
+	baseRel := ""
+	if r, err := filepath.Rel(m.Root, abs); err == nil {
+		baseRel = strings.TrimSuffix(filepath.ToSlash(r), "/")
+		if baseRel == "." {
+			baseRel = ""
+		}
+	}
+	filtered := set.Loaded() && !includeIgnored && set.HasDir(baseRel)
+	ignored := 0
+
 	lines := []string{relLabel(shown) + "/"}
 	count := 0
 	var walk func(dir string, level int) bool
@@ -793,17 +846,25 @@ func (m *Manager) listDirectory(rel string, depth int, includeHidden bool) Resul
 				return false
 			}
 			name := e.Name()
-			if !includeHidden && strings.HasPrefix(name, ".") {
-				continue
-			}
 			if e.IsDir() && skipDirs[name] {
 				continue
+			}
+			entryAbs := filepath.Join(dir, name)
+			if filtered {
+				entryRel := name
+				if r, err := filepath.Rel(m.Root, entryAbs); err == nil {
+					entryRel = filepath.ToSlash(r)
+				}
+				if !set.Has(entryRel) && !set.HasDir(entryRel) {
+					ignored++
+					continue
+				}
 			}
 			indent := strings.Repeat("  ", level)
 			if e.IsDir() {
 				lines = append(lines, indent+name+"/")
 				count++
-				if level < depth && !walk(filepath.Join(dir, name), level+1) {
+				if level < depth && !walk(entryAbs, level+1) {
 					return false
 				}
 			} else {
@@ -818,7 +879,20 @@ func (m *Manager) listDirectory(rel string, depth int, includeHidden bool) Resul
 		return true
 	}
 	walk(abs, 1)
+	if ignored > 0 {
+		lines = append(lines, fmt.Sprintf("[%d git-ignored entr%s hidden; pass include_ignored=true to list them]",
+			ignored, plural(ignored, "y", "ies")))
+	}
 	return Result{Content: strings.Join(lines, "\n")}
+}
+
+// plural picks the singular or plural suffix for a count, so a footer never
+// reads "1 entries".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // ---------------------------------------------------------------------------

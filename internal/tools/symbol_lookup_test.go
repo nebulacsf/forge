@@ -170,6 +170,48 @@ func TestEnsureProjectIndexSkipsUnchangedFiles(t *testing.T) {
 	}
 }
 
+func TestEnsureProjectIndexFollowsGit(t *testing.T) {
+	root := fileSetRepo(t)
+	st, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	project, err := st.CreateProject("Git", root, "#6c8cff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeProjectFile(t, root, ".github/scripts/release.py", "def publish():\n    pass\n")
+	writeProjectFile(t, root, "ignored.py", "def hidden_by_git():\n    pass\n")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".env\nignored.py\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".github/scripts/release.py")
+
+	m, err := NewManager(root, 25000, time.Second, st, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.ProjectID = project.ID
+	m.Mode = "PLAN"
+
+	outline, err := EnsureProjectIndex(context.Background(), st, project.ID, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(outline, ".github/scripts/release.py") {
+		t.Errorf("tracked dotfile missing from the outline: %q", outline)
+	}
+	if strings.Contains(outline, "ignored.py") {
+		t.Errorf("git-ignored file leaked into the outline: %q", outline)
+	}
+
+	res := run(t, m, "symbol_lookup", map[string]any{"query": "publish"})
+	if res.IsError || !strings.Contains(res.Content, ".github/scripts/release.py") {
+		t.Errorf("tracked dotfile not in the symbol index: %+v", res)
+	}
+}
+
 func BenchmarkEnsureProjectIndexWarm(b *testing.B) {
 	root := b.TempDir()
 	st, err := store.Open(filepath.Join(b.TempDir(), "forge.db"))

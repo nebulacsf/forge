@@ -54,6 +54,68 @@ func BuiltinContextLength(modelID string) int {
 	return 0
 }
 
+// modelEntry is the wire shape of one catalog row. ModelInfo stays clean
+// (context_length) while gateways such as OpenCode Go nest the window under
+// limit.context, so the transport struct accepts both spellings.
+type modelEntry struct {
+	ModelInfo
+	Limit struct {
+		Context int `json:"context"`
+	} `json:"limit"`
+}
+
+// contextLength reports the window advertised for this row. The flat
+// context_length wins when present because it is the OpenAI/OpenRouter standard;
+// limit.context is what subscription gateways publish instead.
+func (e modelEntry) contextLength() int {
+	if e.ModelInfo.ContextLength > 0 {
+		return e.ModelInfo.ContextLength
+	}
+	if e.Limit.Context > 0 {
+		return e.Limit.Context
+	}
+	return 0
+}
+
+// ContextLengthFor looks up a model in an arbitrary catalog and returns the
+// context window it advertises, or 0 when the catalog cannot answer. The exact
+// id wins; failing that, a vendor prefix is ignored so a gateway that lists
+// "claude-sonnet-4.5" still matches "anthropic/claude-sonnet-4.5". No fuzzy
+// matching happens here on purpose: a wrong window is worse than an unknown one.
+func ContextLengthFor(models []ModelInfo, model string) int {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return 0
+	}
+	want := strings.ToLower(model)
+	for _, m := range models {
+		if strings.ToLower(strings.TrimSpace(m.ID)) == want && m.ContextLength > 0 {
+			return m.ContextLength
+		}
+	}
+	// Compare the basenames only: matching a bare slug against a prefixed id is
+	// unambiguous, while two different vendors may legitimately share a slug.
+	base := bareModelName(model)
+	if base == "" {
+		return 0
+	}
+	for _, m := range models {
+		if bareModelName(m.ID) == base && m.ContextLength > 0 {
+			return m.ContextLength
+		}
+	}
+	return 0
+}
+
+// bareModelName returns the lower-cased last path segment of a model id.
+func bareModelName(model string) string {
+	model = strings.TrimSpace(model)
+	if i := strings.LastIndex(model, "/"); i >= 0 {
+		model = model[i+1:]
+	}
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
 // FetchModels lists the models advertised by the configured provider. It
 // accepts both the OpenAI `{data:[...]}` envelope and the simpler
 // `{models:[...]}` shape some local gateways return.
@@ -85,8 +147,8 @@ func (c *OpenAICompatibleProvider) FetchModels(ctx context.Context) ([]ModelInfo
 	}
 
 	var payload struct {
-		Data   []ModelInfo `json:"data"`
-		Models []ModelInfo `json:"models"`
+		Data   []modelEntry `json:"data"`
+		Models []modelEntry `json:"models"`
 	}
 	dec := json.NewDecoder(io.LimitReader(resp.Body, 8<<20))
 	if err := dec.Decode(&payload); err != nil {
@@ -108,10 +170,8 @@ func (c *OpenAICompatibleProvider) FetchModels(ctx context.Context) ([]ModelInfo
 		if strings.TrimSpace(m.Name) == "" {
 			m.Name = id
 		}
-		if m.ContextLength < 0 {
-			m.ContextLength = 0
-		}
-		out = append(out, m)
+		m.ContextLength = m.contextLength()
+		out = append(out, m.ModelInfo)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%s returned no models", c.displayName())

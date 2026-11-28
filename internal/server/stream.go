@@ -63,11 +63,14 @@ type chatEvent struct {
 	SessionCostUSD      float64 `json:"session_cost_usd,omitempty"`
 	ProjectCostUSD      float64 `json:"project_cost_usd,omitempty"`
 	// History pruning snapshot for the request that produced this usage
-	// event: total tool rounds in the session history, how many were stubbed,
-	// and how many characters the stubs/clipping saved.
-	HistoryRounds int `json:"history_rounds,omitempty"`
-	PrunedRounds  int `json:"pruned_rounds,omitempty"`
-	PrunedChars   int `json:"pruned_chars,omitempty"`
+	// event: total tool rounds in the context window that was sent, how many
+	// were stubbed, and how many characters the stubs/clipping saved.
+	// These three are never omitted: a compaction can legitimately leave the
+	// window with zero rounds, and a dropped zero would make the UI keep the
+	// previous request's numbers instead of clearing them.
+	HistoryRounds int `json:"history_rounds"`
+	PrunedRounds  int `json:"pruned_rounds"`
+	PrunedChars   int `json:"pruned_chars"`
 
 	Checklist     *[]store.ChecklistItem `json:"checklist,omitempty"`
 	QuestionBatch *store.QuestionBatch   `json:"question_batch,omitempty"`

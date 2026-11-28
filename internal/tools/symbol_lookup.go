@@ -88,49 +88,20 @@ func EnsureProjectIndex(ctx context.Context, st *store.Store, projectID int64, r
 	symbols := make([]store.ProjectSymbol, 0)
 	truncated := false
 
-	walkErr := filepath.WalkDir(absRoot, func(p string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if p == absRoot {
-				return nil
-			}
-			name := d.Name()
-			if skipDirs[name] || strings.HasPrefix(name, ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil // never follow symlinked files out of the project
-		}
-		name := d.Name()
-		if strings.HasPrefix(name, ".") {
-			return nil
-		}
-		rel, relErr := filepath.Rel(absRoot, p)
-		if relErr != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
+	// visit indexes one candidate file. Both drivers below funnel into it so the
+	// git-driven listing and the filesystem fallback cannot diverge. It reports
+	// false when the file budget is spent.
+	visit := func(p, rel string, info os.FileInfo) bool {
 		lang, ok := outlineLanguage(rel)
-		if !ok {
-			return nil
-		}
-		info, infoErr := d.Info()
-		if infoErr != nil || info.IsDir() || info.Size() > outlineMaxFileSize {
-			return nil
+		if !ok || info.IsDir() || info.Size() > outlineMaxFileSize {
+			return true
 		}
 		if seen[rel] {
-			return nil
+			return true
 		}
 		if len(seen) >= outlineMaxFiles {
 			truncated = true
-			return fs.SkipAll
+			return false
 		}
 		seen[rel] = true
 
@@ -145,12 +116,12 @@ func EnsureProjectIndex(ctx context.Context, st *store.Store, projectID int64, r
 			cachedSymbolFile.SizeBytes != info.Size())
 
 		if !needOutline && !needSymbols {
-			return nil
+			return true
 		}
 		data, readErr := os.ReadFile(p)
 		if readErr != nil || isBinary(data) {
 			drop[rel] = true
-			return nil
+			return true
 		}
 		fileSymbols := scanFileSymbols(lang, p, data)
 
@@ -176,8 +147,62 @@ func EnsureProjectIndex(ctx context.Context, st *store.Store, projectID int64, r
 			})
 			symbols = append(symbols, projectSymbolsFrom(projectID, rel, fileSymbols)...)
 		}
-		return nil
-	})
+		return true
+	}
+
+	var walkErr error
+	if set := projectFileSet(absRoot); set.Loaded() {
+		// git answered: index exactly what it considers part of the project, so
+		// tracked dotfiles (.github/, .cursorrules…) are indexed and ignored
+		// paths are not.
+		for _, rel := range set.Files() {
+			if err := ctx.Err(); err != nil {
+				walkErr = err
+				break
+			}
+			abs := fileSetPath(absRoot, rel)
+			info, infoErr := os.Lstat(abs)
+			if infoErr != nil || info.Mode()&os.ModeSymlink != 0 {
+				continue // deleted from disk, or never followed out of the root
+			}
+			if !visit(abs, rel, info) {
+				break
+			}
+		}
+	} else {
+		walkErr = filepath.WalkDir(absRoot, func(p string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if d.IsDir() {
+				if p == absRoot {
+					return nil
+				}
+				if skipDirs[d.Name()] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return nil // never follow symlinked files out of the project
+			}
+			rel, relErr := filepath.Rel(absRoot, p)
+			if relErr != nil {
+				return nil
+			}
+			info, infoErr := d.Info()
+			if infoErr != nil {
+				return nil
+			}
+			if !visit(p, filepath.ToSlash(rel), info) {
+				return fs.SkipAll
+			}
+			return nil
+		})
+	}
 	if walkErr != nil {
 		return "", walkErr
 	}

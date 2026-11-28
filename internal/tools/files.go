@@ -5,7 +5,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"unicode/utf8"
 )
 
@@ -22,9 +21,11 @@ type ProjectFile struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
-// ProjectFiles lists the project files that can be attached to a message. It
-// walks the project root, skipping hidden entries, symlinks and the usual
-// build/vendor directories, and stops after limit entries (0 uses the default).
+// ProjectFiles lists the project files that can be attached to a message. The
+// git-aware FileSet decides what belongs to the project, so tracked dotfiles
+// such as .github/workflows/ci.yml are listed while ignored paths are not.
+// Symlinks, oversized files and the usual build/vendor directories are still
+// dropped, and the listing stops after limit entries (0 uses the default).
 func ProjectFiles(root string, limit int) ([]ProjectFile, error) {
 	absRoot, err := outlineRoot(root)
 	if err != nil {
@@ -42,6 +43,23 @@ func ProjectFiles(root string, limit int) ([]ProjectFile, error) {
 	}
 
 	out := make([]ProjectFile, 0, 256)
+	if set := projectFileSet(absRoot); set.Loaded() {
+		for _, rel := range set.Files() {
+			fileInfo, infoErr := os.Lstat(fileSetPath(absRoot, rel))
+			if infoErr != nil || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.IsDir() || fileInfo.Size() > maxFileSize {
+				continue
+			}
+			lang, _ := outlineLanguage(rel)
+			out = append(out, ProjectFile{Path: rel, Language: lang, SizeBytes: fileInfo.Size()})
+			if len(out) >= limit {
+				break
+			}
+		}
+		return out, nil
+	}
+
+	// No git answer: walk the tree, which now also shows dotfiles, and only
+	// prune the well-known noise directories.
 	walkErr := filepath.WalkDir(absRoot, func(p string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -51,12 +69,9 @@ func ProjectFiles(root string, limit int) ([]ProjectFile, error) {
 			if p == absRoot {
 				return nil
 			}
-			if skipDirs[name] || strings.HasPrefix(name, ".") {
+			if skipDirs[name] {
 				return filepath.SkipDir
 			}
-			return nil
-		}
-		if strings.HasPrefix(name, ".") {
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {

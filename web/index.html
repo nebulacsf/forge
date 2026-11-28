@@ -226,7 +226,8 @@
             <div class="progress context-progress" role="progressbar" aria-label="Context usage">
               <div id="ctxBar" class="progress-bar"></div>
             </div>
-            <div id="contextMeta" class="usage-sub" title="Tokens in the current context: the prompt sent to the model plus the response it just generated.">0 / 128k tokens</div>
+            <div id="contextMeta" class="usage-sub" title="Tokens in the current context: the prompt sent to the model plus the response it just generated.">0 / — tokens</div>
+            <div id="contextWarning" class="usage-sub usage-warning d-none"></div>
 
             <details id="usageDetails" class="usage-details">
               <summary class="usage-details-head">
@@ -681,6 +682,16 @@
               </div>
               <div class="col-12">
                 <div id="effectiveBudget" class="settings-hint"></div>
+              </div>
+              <div class="col-12">
+                <div class="form-check form-switch setting-switch">
+                  <input id="openrouterCatalogFallback" class="form-check-input" type="checkbox">
+                  <label class="form-check-label" for="openrouterCatalogFallback">Fill missing context windows from the OpenRouter catalog</label>
+                  <i class="bi bi-info-circle setting-tip" tabindex="0" role="img" aria-label="About the OpenRouter catalog fallback"
+                     data-bs-toggle="tooltip" data-bs-placement="top" data-bs-container="body"
+                     title="The OpenRouter /models list is public, so Forge reads it to complete the context window of models the active provider does not publish. It only supplies metadata: no prompt is ever sent there and the request still goes to your provider. Applies to the gauge and to the history budget. On by default."></i>
+                </div>
+                <div class="form-text">Only context-window metadata is read; inference always stays on the selected provider.</div>
               </div>
               <div class="col-md-4">
                 <div class="setting-label">

@@ -175,9 +175,16 @@ func TestFetchModelsAcceptsBothEnvelopes(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
+		want int
 	}{
-		{"openai data", `{"data":[{"id":"a/model","name":"A","context_length":4096}]}`},
-		{"local models", `{"models":[{"id":"a/model","name":"A","context_length":4096}]}`},
+		{"openai data", `{"data":[{"id":"a/model","name":"A","context_length":4096}]}`, 4096},
+		{"local models", `{"models":[{"id":"a/model","name":"A","context_length":4096}]}`, 4096},
+		// OpenCode Go and other subscription gateways nest the window instead of
+		// publishing a flat context_length, which used to be dropped entirely.
+		{"nested limit", `{"data":[{"id":"a/model","limit":{"context":1000000,"output":384000}}]}`, 1000000},
+		// The OpenAI/OpenRouter spelling wins when both are present.
+		{"both shapes", `{"data":[{"id":"a/model","context_length":8192,"limit":{"context":1000000}}]}`, 8192},
+		{"no window", `{"data":[{"id":"a/model","name":"A"}]}`, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -195,8 +202,8 @@ func TestFetchModelsAcceptsBothEnvelopes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("FetchModels: %v", err)
 			}
-			if len(models) != 1 || models[0].ID != "a/model" || models[0].ContextLength != 4096 {
-				t.Fatalf("models = %+v", models)
+			if len(models) != 1 || models[0].ID != "a/model" || models[0].ContextLength != c.want {
+				t.Fatalf("models = %+v, want context %d", models, c.want)
 			}
 		})
 	}

@@ -83,6 +83,7 @@ Read the anchor before changing behavior; do not re-derive it.
 | Tool specs / mode gating | `tools.Specs`, `tools.Allowed`, `internal/tools/tools.go:126` |
 | Tool execution | `Manager.ExecuteCall`, `internal/tools/tools.go:331` |
 | Path confinement | `Manager.resolve`, `internal/tools/tools.go:451` |
+| Which files belong to the project | `LoadFileSet`, `internal/tools/fileset.go` (git `ls-files`, walk fallback) |
 | System prompt | `buildSystemPrompt`, `internal/server/stream.go:980` (`promptOptions`) |
 | SSE turn loop | `handleChatStream`, `internal/server/stream.go:101` |
 | History pruning / cache prefix | `internal/server/history.go` (`buildHistory`) |
